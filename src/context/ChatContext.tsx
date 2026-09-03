@@ -100,6 +100,8 @@ export interface ChatContextType {
   provideRoomSecret: (input: string) => void;
   inviteUrl: string;
   switchConversation: (newId: string, newSecret?: string) => void;
+  refreshRelays: () => void;
+  reconnectRelays: () => Promise<void>;
 
   // Comic Strip Zoom Level
   zoomLevel: number;
@@ -799,6 +801,20 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [joinPublicRoomTab]
   );
 
+  const refreshRelays = useCallback(() => {
+    if (activeSession) {
+      activeSession.refreshRelayStatuses();
+      refreshActiveSessionView();
+    }
+  }, [activeSession, refreshActiveSessionView]);
+
+  const reconnectRelays = useCallback(async () => {
+    if (activeSession) {
+      await activeSession.reconnectSignaling();
+      refreshActiveSessionView();
+    }
+  }, [activeSession, refreshActiveSessionView]);
+
   const value: ChatContextType = {
     profile,
     friends,
@@ -829,6 +845,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     connectionStatus,
     connectedPeersCount,
     relayStatuses,
+    refreshRelays,
+    reconnectRelays,
     participantsMap,
     participants,
     messages,

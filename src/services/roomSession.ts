@@ -298,8 +298,25 @@ export class RoomSession {
     this.trysteroService.setOnControl((envelope, peerId) => this.handleIncomingControl(envelope, peerId));
     this.trysteroService.setOnChat((envelope, peerId) => this.handleIncomingChat(envelope, peerId));
 
+    this.trysteroService.setOnRelayStatusChange((statuses) => {
+      this.relayStatuses = statuses;
+      const anyConnected = statuses.some((s) => s.status === 'connected');
+      const allDisconnectedOrError =
+        statuses.length > 0 &&
+        statuses.every((s) => s.status === 'disconnected' || s.status === 'error');
+
+      if (anyConnected) {
+        this.connectionStatus = 'connected';
+      } else if (allDisconnectedOrError) {
+        this.connectionStatus = 'disconnected';
+      } else {
+        this.connectionStatus = 'connecting';
+      }
+      this.notifyChange();
+    });
+
+    this.connectionStatus = 'connecting';
     this.trysteroService.connect();
-    this.connectionStatus = 'connected';
     this.relayStatuses = this.trysteroService.getRelayStatuses();
   }
 
@@ -950,6 +967,31 @@ export class RoomSession {
       }
       await this.init(this.profile, this.privateKey, this.signingPrivateKey);
     }
+  }
+
+  public refreshRelayStatuses(): RelaySocketStatus[] {
+    if (this.trysteroService) {
+      this.relayStatuses = this.trysteroService.getRelayStatuses();
+      const anyConnected = this.relayStatuses.some((s) => s.status === 'connected');
+      const allDisconnectedOrError =
+        this.relayStatuses.length > 0 &&
+        this.relayStatuses.every((s) => s.status === 'disconnected' || s.status === 'error');
+
+      if (anyConnected) {
+        this.connectionStatus = 'connected';
+      } else if (allDisconnectedOrError) {
+        this.connectionStatus = 'disconnected';
+      } else {
+        this.connectionStatus = 'connecting';
+      }
+      this.notifyChange();
+    }
+    return this.relayStatuses;
+  }
+
+  public async reconnectSignaling(): Promise<void> {
+    await this.connectTrystero();
+    this.notifyChange();
   }
 
   public destroy(): void {

@@ -32,6 +32,13 @@ export class TrysteroService {
   private onStateSummaryCb: ((packet: StateSummaryPacket, peerId: string) => void) | null = null;
   private onStateRequestCb: ((packet: StateRequestPacket, peerId: string) => void) | null = null;
   private onStateChunkCb: ((packet: StateChunkPacket, peerId: string) => void) | null = null;
+  private onRelayStatusChangeCb: ((statuses: RelaySocketStatus[]) => void) | null = null;
+
+  // Relay monitoring state
+  private relayMonitorInterval: any = null;
+  private socketErrorUrls: Set<string> = new Set();
+  private monitoredSockets: WeakSet<any> = new WeakSet();
+  private lastStatusesKey: string = '';
 
   constructor(convId: string, signalingPassword: string, customRelays?: string[]) {
     this.selfPeerId = selfId;
@@ -105,6 +112,18 @@ export class TrysteroService {
       this.room.onPeerLeave = (peerId: string) => {
         if (this.onPeerLeaveCb) this.onPeerLeaveCb(peerId);
       };
+
+      // Setup relay listeners and start monitoring
+      this.attachRelaySocketListeners();
+      this.notifyRelayStatuses();
+
+      if (this.relayMonitorInterval) {
+        clearInterval(this.relayMonitorInterval);
+      }
+      this.relayMonitorInterval = setInterval(() => {
+        this.attachRelaySocketListeners();
+        this.notifyRelayStatuses();
+      }, 1000);
     } catch (err) {
       console.error('Failed to initialize Trystero room:', err);
     }
@@ -180,6 +199,45 @@ export class TrysteroService {
     this.onStateChunkCb = cb;
   }
 
+  public setOnRelayStatusChange(cb: (statuses: RelaySocketStatus[]) => void) {
+    this.onRelayStatusChangeCb = cb;
+  }
+
+  private attachRelaySocketListeners() {
+    try {
+      const sockets = typeof getRelaySockets === 'function' ? getRelaySockets() : {};
+      for (const [url, ws] of Object.entries(sockets as Record<string, any>)) {
+        if (ws && typeof ws.addEventListener === 'function' && !this.monitoredSockets.has(ws)) {
+          this.monitoredSockets.add(ws);
+          ws.addEventListener('open', () => {
+            this.socketErrorUrls.delete(url);
+            this.notifyRelayStatuses();
+          });
+          ws.addEventListener('close', () => {
+            this.notifyRelayStatuses();
+          });
+          ws.addEventListener('error', () => {
+            this.socketErrorUrls.add(url);
+            this.notifyRelayStatuses();
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to attach relay socket listeners:', err);
+    }
+  }
+
+  public notifyRelayStatuses() {
+    const statuses = this.getRelayStatuses();
+    const key = statuses.map((s) => `${s.url}:${s.status}`).join('|');
+    if (key !== this.lastStatusesKey) {
+      this.lastStatusesKey = key;
+      if (this.onRelayStatusChangeCb) {
+        this.onRelayStatusChangeCb(statuses);
+      }
+    }
+  }
+
   public getConnectedPeers(): string[] {
     if (!this.room || !this.room.getPeers) return [];
     try {
@@ -191,14 +249,20 @@ export class TrysteroService {
 
   public getRelayStatuses(): RelaySocketStatus[] {
     try {
-      const sockets = getRelaySockets ? getRelaySockets() : {};
+      const sockets = typeof getRelaySockets === 'function' ? getRelaySockets() : {};
       const results: RelaySocketStatus[] = [];
       for (const [url, ws] of Object.entries(sockets as Record<string, any>)) {
         let status: 'connected' | 'connecting' | 'disconnected' | 'error' = 'disconnected';
         if (ws && typeof ws.readyState === 'number') {
-          if (ws.readyState === 1) status = 'connected';
-          else if (ws.readyState === 0) status = 'connecting';
-          else status = 'disconnected';
+          if (ws.readyState === 1) {
+            status = 'connected';
+          } else if (ws.readyState === 0) {
+            status = 'connecting';
+          } else if (this.socketErrorUrls.has(url)) {
+            status = 'error';
+          } else {
+            status = 'disconnected';
+          }
         }
         results.push({ url, status });
       }
@@ -209,6 +273,12 @@ export class TrysteroService {
   }
 
   public disconnect() {
+    if (this.relayMonitorInterval) {
+      clearInterval(this.relayMonitorInterval);
+      this.relayMonitorInterval = null;
+    }
+    this.socketErrorUrls.clear();
+
     if (this.room) {
       try {
         if (typeof this.room.leave === 'function') {

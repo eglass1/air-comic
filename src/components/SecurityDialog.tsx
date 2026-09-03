@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -19,6 +19,8 @@ import {
   AccordionDetails,
   CircularProgress,
   Snackbar,
+  IconButton,
+  Tooltip,
 } from '@mui/material';
 import SecurityIcon from '@mui/icons-material/Security';
 import KeyIcon from '@mui/icons-material/Key';
@@ -50,12 +52,33 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
     participants,
     connectedPeersCount,
     relayStatuses,
+    refreshRelays,
+    reconnectRelays,
     rekeyConversation,
     rootFingerprint,
     profile,
   } = useChat();
 
   const [snack, setSnack] = useState<string | null>(null);
+  const [isReconnectingRelays, setIsReconnectingRelays] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      refreshRelays();
+    }
+  }, [open, refreshRelays]);
+
+  const handleReconnectRelays = async () => {
+    setIsReconnectingRelays(true);
+    try {
+      await reconnectRelays();
+      setSnack('Reconnected to Nostr signaling relays.');
+    } catch {
+      setSnack('Failed to reconnect to relays.');
+    } finally {
+      setIsReconnectingRelays(false);
+    }
+  };
 
   const handleRekey = async () => {
     const success = await rekeyConversation();
@@ -189,9 +212,32 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
 
           {/* Nostr Relay Statuses */}
           <Box>
-            <Typography variant="subtitle2" color="primary" sx={{ fontWeight: 600, mb: 1 }}>
-              NOSTR SIGNALING RELAYS ({relayStatuses.length})
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+              <Typography variant="subtitle2" color="primary" sx={{ fontWeight: 600 }}>
+                NOSTR SIGNALING RELAYS ({relayStatuses.filter((r) => r.status === 'connected').length}/{relayStatuses.length} CONNECTED)
+              </Typography>
+              <Tooltip title="Reconnect signaling relays">
+                <span>
+                  <IconButton
+                    size="small"
+                    onClick={handleReconnectRelays}
+                    disabled={isReconnectingRelays}
+                    color="primary"
+                  >
+                    <AutorenewIcon
+                      fontSize="small"
+                      sx={{
+                        animation: isReconnectingRelays ? 'spin 1s linear infinite' : 'none',
+                        '@keyframes spin': {
+                          '0%': { transform: 'rotate(0deg)' },
+                          '100%': { transform: 'rotate(360deg)' },
+                        },
+                      }}
+                    />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Box>
             <List dense sx={{ bgcolor: 'background.paper', borderRadius: 2, border: '1px solid', borderColor: 'divider', maxHeight: 160, overflowY: 'auto' }}>
               {relayStatuses.length === 0 ? (
                 <ListItem>
@@ -203,7 +249,15 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
                     <Chip
                       size="small"
                       label={r.status.toUpperCase()}
-                      color={r.status === 'connected' ? 'success' : r.status === 'connecting' ? 'warning' : 'default'}
+                      color={
+                        r.status === 'connected'
+                          ? 'success'
+                          : r.status === 'connecting'
+                          ? 'warning'
+                          : r.status === 'error'
+                          ? 'error'
+                          : 'default'
+                      }
                       variant="outlined"
                       sx={{ fontSize: '0.65rem', height: 20 }}
                     />
