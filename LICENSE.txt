@@ -1,0 +1,8 @@
+This project includes code derived from Microsoft Comic Chat:
+
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. See THIRD-PARTY-NOTICES.txt.
+
+Modifications and original code:
+Copyright (c) 2026 Eric Glass.
+Licensed under the MIT License.
