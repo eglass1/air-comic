@@ -21,6 +21,9 @@ export interface LayoutOptions {
   participants?: Participant[];
 }
 
+export const COMIC_FONT_FAMILY =
+  '"Comic Sans MS", "Comic Relief", "Comic Neue", "Chalkboard SE", sans-serif';
+
 export class ComicLayoutEngine {
   static readonly DEFAULT_WIDTH = 420;
   static readonly DEFAULT_HEIGHT = 360;
@@ -709,7 +712,7 @@ export class ComicLayoutEngine {
     ctx.textBaseline = 'middle';
 
     // Measure and format title text
-    ctx.font = 'bold 22px "Comic Sans MS", "Bangers", cursive, sans-serif';
+    ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
     const titleMetrics = ctx.measureText(episodeTitle);
     if (titleMetrics.width > boxW - 20) {
       // Wrap into 2 lines if long
@@ -717,7 +720,7 @@ export class ComicLayoutEngine {
       const mid = Math.ceil(words.length / 2);
       const line1 = words.slice(0, mid).join(' ');
       const line2 = words.slice(mid).join(' ');
-      ctx.font = 'bold 17px "Comic Sans MS", cursive, sans-serif';
+      ctx.font = `bold 17px ${COMIC_FONT_FAMILY}`;
       ctx.fillText(line1, width / 2, boxY + boxH * 0.32);
       ctx.fillText(line2, width / 2, boxY + boxH * 0.70);
     } else {
@@ -725,7 +728,7 @@ export class ComicLayoutEngine {
     }
 
     // 2. STARRING Subtitle
-    ctx.font = 'bold 16px "Comic Sans MS", sans-serif';
+    ctx.font = `bold 16px ${COMIC_FONT_FAMILY}`;
     ctx.fillStyle = '#000000';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
@@ -758,7 +761,7 @@ export class ComicLayoutEngine {
           if (testIconSize > maxIconHeight) break;
           const testFontSize = Math.max(14, Math.round(15 * s));
           const testGap = Math.round(14 * s);
-          ctx.font = `bold ${testFontSize}px "Comic Sans MS", cursive, sans-serif`;
+          ctx.font = `bold ${testFontSize}px ${COMIC_FONT_FAMILY}`;
           const nameW = ctx.measureText(member.screenName).width;
           if (testIconSize + testGap + nameW <= availWidth) {
             bestScale = s;
@@ -770,7 +773,7 @@ export class ComicLayoutEngine {
         const iconSize = Math.round(minIconSize * bestScale);
         const fontSize = Math.max(14, Math.round(15 * bestScale));
         const gap = Math.round(14 * bestScale);
-        ctx.font = `bold ${fontSize}px "Comic Sans MS", cursive, sans-serif`;
+        ctx.font = `bold ${fontSize}px ${COMIC_FONT_FAMILY}`;
         const nameW = ctx.measureText(member.screenName).width;
         const totalW = iconSize + gap + nameW;
 
@@ -792,7 +795,7 @@ export class ComicLayoutEngine {
           if (testIconSize > maxIconHeight) break;
           const testFontSize = Math.max(14, Math.round(15 * s));
           const testGap = Math.round(14 * s);
-          ctx.font = `bold ${testFontSize}px "Comic Sans MS", cursive, sans-serif`;
+          ctx.font = `bold ${testFontSize}px ${COMIC_FONT_FAMILY}`;
           const w1 = testIconSize + testGap + ctx.measureText(starring[0].screenName).width;
           const w2 = testIconSize + testGap + ctx.measureText(starring[1].screenName).width;
           if (Math.max(w1, w2) <= availWidth) {
@@ -805,7 +808,7 @@ export class ComicLayoutEngine {
         const iconSize = Math.round(minIconSize * bestScale);
         const fontSize = Math.max(14, Math.round(15 * bestScale));
         const gap = Math.round(14 * bestScale);
-        ctx.font = `bold ${fontSize}px "Comic Sans MS", cursive, sans-serif`;
+        ctx.font = `bold ${fontSize}px ${COMIC_FONT_FAMILY}`;
         const w1 = iconSize + gap + ctx.measureText(starring[0].screenName).width;
         const w2 = iconSize + gap + ctx.measureText(starring[1].screenName).width;
         const maxW = Math.max(w1, w2);
@@ -888,7 +891,7 @@ export class ComicLayoutEngine {
     }
 
     // Screen Name with truncation if needed
-    ctx.font = `bold ${fontSize}px "Comic Sans MS", cursive, sans-serif`;
+    ctx.font = `bold ${fontSize}px ${COMIC_FONT_FAMILY}`;
     ctx.fillStyle = '#000000';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
@@ -948,7 +951,7 @@ export class ComicLayoutEngine {
       ctx.strokeRect(x, y, width, height);
 
       ctx.fillStyle = '#1a1a1a';
-      ctx.font = 'italic bold 12px "Comic Sans MS", sans-serif';
+      ctx.font = `italic bold 12px ${COMIC_FONT_FAMILY}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       this.drawWrappedText(
@@ -967,8 +970,8 @@ export class ComicLayoutEngine {
     // Set font for line measurement and rendering
     ctx.font =
       mode === 'whisper'
-        ? 'italic bold 12px "Comic Sans MS", cursive, sans-serif'
-        : 'bold 12px "Comic Sans MS", cursive, sans-serif';
+        ? `italic bold 12px ${COMIC_FONT_FAMILY}`
+        : `bold 12px ${COMIC_FONT_FAMILY}`;
 
     const maxTextWidth = Math.max(60, width - 24);
     const lines = this.getWrappedLines(ctx, text, maxTextWidth);

@@ -30,6 +30,7 @@ import {
   AvatarData,
 } from './types';
 import { AvatarManager } from './avatarManager';
+import { COMIC_FONT_FAMILY } from './comicLayout';
 
 interface EmotionWheelProps {
   avatarName: string;
@@ -139,7 +140,7 @@ export const EmotionWheel: React.FC<EmotionWheelProps> = ({
 
     // Sector Labels
     const labelNames = ['Happy', 'Coy', 'Bored', 'Scared', 'Sad', 'Angry', 'Shout', 'Laugh'];
-    ctx.font = 'bold 8.5px "Comic Sans MS", sans-serif';
+    ctx.font = `bold 8.5px ${COMIC_FONT_FAMILY}`;
     ctx.fillStyle = '#222222';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';

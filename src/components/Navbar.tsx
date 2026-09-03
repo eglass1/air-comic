@@ -159,7 +159,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <span
                   style={{
                     color: themeMode === 'dark' ? '#ffffff' : '#000000',
-                    fontFamily: '"Comic Sans MS", "Comic Sans", "Chalkboard SE", "Comic Neue", cursive, sans-serif',
+                    fontFamily: '"Comic Sans MS", "Comic Relief", "Comic Neue", "Chalkboard SE", sans-serif',
                     fontWeight: 700,
                   }}
                 >

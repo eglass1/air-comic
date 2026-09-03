@@ -47,6 +47,17 @@ const ComicPanelItem: React.FC<{
   } | null>(null);
   const [tooltipVisible, setTooltipVisible] = useState<boolean>(false);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [fontsReady, setFontsReady] = useState<boolean>(() => {
+    return typeof document !== 'undefined' && 'fonts' in document && document.fonts.status === 'loaded';
+  });
+
+  useEffect(() => {
+    if (typeof document !== 'undefined' && 'fonts' in document) {
+      document.fonts.ready.then(() => {
+        setFontsReady(true);
+      });
+    }
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -78,7 +89,7 @@ const ComicPanelItem: React.FC<{
       avatarManager,
       backdropData?.canvas || null
     );
-  }, [panel, panelWidth, panelHeight, loadedAvatars, backdropData, avatarManager]);
+  }, [panel, panelWidth, panelHeight, loadedAvatars, backdropData, avatarManager, fontsReady]);
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;

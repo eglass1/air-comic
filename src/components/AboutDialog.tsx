@@ -305,7 +305,7 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({ open, onClose }) => {
                     <span
                       style={{
                         color: '#000000',
-                        fontFamily: '"Comic Sans MS", "Comic Sans", "Chalkboard SE", "Comic Neue", cursive, sans-serif',
+                        fontFamily: '"Comic Sans MS", "Comic Relief", "Comic Neue", "Chalkboard SE", sans-serif',
                         fontWeight: 700,
                       }}
                     >
