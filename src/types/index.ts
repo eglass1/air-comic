@@ -287,9 +287,28 @@ export interface KeyRecord {
   key: CryptoKey;
   rawBase64Url?: string;
   isRoot?: boolean;
+  parentKeyId?: string;
   signerId?: string;
   signerScreenName?: string;
   members: string[]; // participantIds
+}
+
+/**
+ * An epoch key held on disk so a reload does not drop the room back to the root
+ * key. The message log is already stored as plaintext, so keeping these costs no
+ * secrecy at rest that the history has not already given up.
+ */
+export interface StoredConversationKey {
+  /** `${convId}::${keyId}` */
+  id: string;
+  convId: string;
+  keyId: string;
+  epoch: number;
+  parentKeyId?: string;
+  rawBase64Url: string;
+  signerId?: string;
+  members: string[];
+  savedAt: number;
 }
 
 export interface PendingJoinRequest {
@@ -452,6 +471,22 @@ export interface PendingInviteRecord {
   lastAttemptAt?: number;
 }
 
+/**
+ * A person we asked into a specific room, kept so their entry request is still
+ * granted without prompting after a reload. Distinct from PendingInviteRecord,
+ * which is a delivery queue and is cleared the moment they answer — the
+ * pre-authorisation has to outlive the answer, because the join handshake only
+ * starts once they accept.
+ */
+export interface RoomPreapprovalRecord {
+  /** `${convId}::${participantId}` */
+  id: string;
+  convId: string;
+  participantId: string;
+  screenName?: string;
+  createdAt: number;
+}
+
 export interface QuickMessagePayload {
   type: 'quick_message';
   id: string;
@@ -465,4 +500,15 @@ export interface QuickMessagePayload {
   emotion: number;
   intensity: number;
   timestamp: number;
+}
+
+/**
+ * A quick message the user has already dealt with. Relays hold a quick message
+ * after it is delivered, so this is what stops an acknowledged one from popping
+ * up again the next time the app reconnects.
+ */
+export interface QuickMessageAckRecord {
+  id: string;
+  senderParticipantId?: string;
+  ackedAt: number;
 }

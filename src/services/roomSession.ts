@@ -19,6 +19,7 @@ import type {
   RosterGossipPacket,
   JoinDecisionPacket,
   QuickMessagePayload,
+  StoredConversationKey,
 } from '../types';
 import {
   generateRandomRoomSecret,
@@ -45,6 +46,7 @@ import {
   decryptEnvelope,
   normalizePublicKey,
   getPublicKeyFingerprint,
+  importRawAesKey,
 } from './crypto';
 import { getOrInitChannelTitle, getRandomChannelTitle } from '../utils/channelNameGenerator';
 import { dbService } from './db';
@@ -62,6 +64,8 @@ const PRESENCE_SWEEP_MS = 15000;
 /** Retry cadence for an unapproved peer waiting to be let into a private room. */
 const JOIN_REQUEST_RETRY_MS = 8000;
 const JOIN_REQUEST_MAX_ATTEMPTS = 24;
+/** Floor on how often we will re-hand the epoch key to the same stranded member. */
+const KEY_RESHARE_MIN_INTERVAL_MS = 10000;
 /** Bounds on the gossip dedup ledger and the re-serve cache. */
 const MAX_TRACKED_PACKET_IDS = 4000;
 const MAX_SEEN_HELLO_NONCES = 2000;
@@ -134,6 +138,8 @@ export class RoomSession {
   private declinedRequesters: Set<string> = new Set();
   private autoApproveIds: Set<string> = new Set();
   private joinRequestAttempts: number = 0;
+  /** participantId -> when we last re-sent them the epoch key, to bound repairs. */
+  private keyResharedAt: Map<string, number> = new Map();
 
   // History re-serve cache (packetId -> original wire envelope)
   private envelopeCache: Map<string, EncryptedNetworkEnvelope> = new Map();
@@ -263,6 +269,12 @@ export class RoomSession {
         this.isSecretMissing = true;
         this.isApproved = false;
       }
+
+      // Before the roster is built: this can flip isApproved, which is stamped
+      // onto our own participant entry immediately below.
+      if (!this.isSecretMissing) {
+        await this.restoreStoredKeys(profile.participantId);
+      }
     }
 
     // Add self to participants
@@ -296,6 +308,83 @@ export class RoomSession {
       this.startJoinRetryTimer();
     }
     this.notifyChange();
+  }
+
+  /**
+   * Writes an epoch key to disk so a reload does not silently fall back to the
+   * root key. Root and public transport keys are skipped: both are re-derivable
+   * from the secret or join token the user already holds.
+   */
+  private persistEpochKey(record: KeyRecord) {
+    if (this.roomMode !== 'private' || record.isRoot || !record.rawBase64Url) return;
+    dbService
+      .saveConversationKey({
+        convId: this.convId,
+        keyId: record.keyId,
+        epoch: record.epoch,
+        parentKeyId: record.parentKeyId,
+        rawBase64Url: record.rawBase64Url,
+        signerId: record.signerId,
+        members: record.members || [],
+      })
+      .catch((err) => console.warn('Failed to persist conversation key:', err));
+  }
+
+  /** Keeps the stored epoch/keyId in step with what we are actually using. */
+  private persistActiveKeyState() {
+    if (this.roomMode !== 'private' || !this.roomSecret) return;
+    dbService
+      .saveConversationMetadata(this.convId, this.roomSecret, this.activeEpoch, this.activeKeyId)
+      .catch((err) => console.warn('Failed to persist conversation metadata:', err));
+  }
+
+  /**
+   * Reloads the epoch keys from a previous session. Without this a reload drops
+   * the room to the root key: live traffic from peers still on the current epoch
+   * fails to decrypt and is dropped with only a console warning, backfilled
+   * history under an older epoch is unreadable, and the next rekey numbers itself
+   * from zero. The newest key we hold also carries the last membership snapshot
+   * we were part of, which is what restores our own approval and the member list.
+   */
+  private async restoreStoredKeys(myParticipantId: string): Promise<void> {
+    let stored: StoredConversationKey[];
+    try {
+      stored = await dbService.getConversationKeys(this.convId);
+    } catch (err) {
+      console.warn('Failed to load stored conversation keys:', err);
+      return;
+    }
+
+    let newest: KeyRecord | null = null;
+    for (const record of stored) {
+      if (record.keyId === 'root-v2' || !record.rawBase64Url) continue;
+      try {
+        const keyRec: KeyRecord = {
+          keyId: record.keyId,
+          epoch: record.epoch,
+          createdAt: record.savedAt,
+          key: await importRawAesKey(record.rawBase64Url),
+          rawBase64Url: record.rawBase64Url,
+          parentKeyId: record.parentKeyId,
+          signerId: record.signerId,
+          members: record.members || [],
+        };
+        this.keysMap.set(keyRec.keyId, keyRec);
+        if (!newest || keyRec.epoch >= newest.epoch) newest = keyRec;
+      } catch (err) {
+        console.warn('Failed to import stored conversation key:', record.keyId, err);
+      }
+    }
+
+    if (!newest || newest.epoch <= this.activeEpoch) return;
+
+    this.activeKeyId = newest.keyId;
+    this.activeEpoch = newest.epoch;
+
+    newest.members.forEach((memberId) => this.approvedMembers.add(memberId));
+    // Holding a key that names us as a member is the same proof of entry that
+    // accepting a live rekey packet gives, so there is no need to re-handshake.
+    if (newest.members.includes(myParticipantId)) this.isApproved = true;
   }
 
   /** Pre-authorises a participant we invited ourselves, so their join request is granted on arrival. */
@@ -442,6 +531,10 @@ export class RoomSession {
     await this.sendStateSummaryTo(peerId);
 
     if (!this.isApproved && this.roomMode === 'private') {
+      // Whoever just arrived may be the member that can let us in, so give the
+      // retry loop a fresh budget rather than staying timed out from before.
+      this.joinRequestAttempts = 0;
+      if (!this.isSecretMissing) this.startJoinRetryTimer();
       await this.sendJoinRequest(peerId);
     }
     this.notifyChange();
@@ -944,9 +1037,17 @@ export class RoomSession {
     const senderId = req.sender.participantId;
     // Still worth relaying: another member may not have a direct link to them.
     if (senderId === this.profile?.participantId) return false;
-    if (this.approvedMembers.has(senderId)) return true;
     // Only members of the room get to see (and act on) entry requests.
     if (!this.isApproved) return true;
+
+    // Already on our member list yet still asking to be let in: the rekey that
+    // admitted them never landed. Hand them the key again instead of dropping
+    // the request, which used to leave both sides stuck — us thinking they are
+    // in, them retrying against a member that silently ignores every attempt.
+    if (this.approvedMembers.has(senderId)) {
+      await this.reshareActiveKeyTo(req);
+      return true;
+    }
 
     const pending: PendingJoinRequest = {
       requestId: req.requestId,
@@ -1006,7 +1107,23 @@ export class RoomSession {
 
     // Relay it regardless: members we can reach may not reach the signer directly.
     const myEncryptedKey = rekey.keys ? rekey.keys[myParticipantId] : null;
-    if (!myEncryptedKey) return true;
+    if (!myEncryptedKey) {
+      // A newer epoch that leaves us out means we are no longer a member — most
+      // likely removed while we were away, then restored from a stored key that
+      // still named us. Step back to unapproved and ask again rather than sitting
+      // on a key nobody uses any more. If it turns out we were dropped in error,
+      // the entry request is answered with the current key and we are back in.
+      if (this.roomMode === 'private' && this.isApproved && rekey.epoch > this.activeEpoch) {
+        this.isApproved = false;
+        this.approvedMembers.delete(myParticipantId);
+        const self = this.participantsMap.get(myParticipantId);
+        if (self) this.participantsMap.set(myParticipantId, { ...self, isApproved: false });
+        this.joinRequestAttempts = 0;
+        if (!this.isSecretMissing) this.startJoinRetryTimer();
+        this.notifyChange();
+      }
+      return true;
+    }
 
     const decryptedKey = await decryptRekeyPacket(rekey, myParticipantId, this.privateKey);
     if (!decryptedKey) return true;
@@ -1016,15 +1133,20 @@ export class RoomSession {
       epoch: rekey.epoch,
       createdAt: rekey.timestamp,
       key: decryptedKey.key,
+      rawBase64Url: decryptedKey.rawBase64Url,
+      parentKeyId: rekey.parentKeyId,
+      isRoot: this.keysMap.get(rekey.keyId)?.isRoot,
       signerId: rekey.signerId,
       members: rekey.members || [],
     };
     this.keysMap.set(rekey.keyId, newKeyRec);
+    this.persistEpochKey(newKeyRec);
 
     // Gossip can deliver epochs out of order; never step backwards onto an older key.
     if (rekey.epoch >= this.activeEpoch) {
       this.activeKeyId = rekey.keyId;
       this.activeEpoch = rekey.epoch;
+      this.persistActiveKeyState();
     }
 
     this.isApproved = true;
@@ -1151,7 +1273,9 @@ export class RoomSession {
     if (this.isApproved || this.roomMode !== 'private') return false;
 
     try {
-      this.joinRequestAttempts += 1;
+      // Only the broadcast retries are budgeted. A targeted request to a peer that
+      // just appeared is a fresh opportunity, not another go at the same one.
+      if (!targetPeerId) this.joinRequestAttempts += 1;
       const req = await createSignedJoinRequest(
         this.convId,
         this.profile.participantId,
@@ -1172,6 +1296,81 @@ export class RoomSession {
       console.warn('Failed to send join request:', err);
       return false;
     }
+  }
+
+  /**
+   * Re-issues the epoch key we are already using to a member whose copy went
+   * missing. Deliberately not a rekey: re-sending the key we hold is idempotent,
+   * so several members can answer the same stranded request without racing one
+   * another into competing epochs. Broadcast rather than addressed to them, so a
+   * peer we only reach through the gossip mesh still gets it.
+   */
+  private async reshareActiveKeyTo(req: JoinRequestPacket): Promise<boolean> {
+    if (this.roomMode !== 'private') return false;
+    if (!this.profile || !this.signingPrivateKey || !this.trysteroService) return false;
+
+    const targetId = req.sender.participantId;
+    const now = Date.now();
+    if (now - (this.keyResharedAt.get(targetId) ?? 0) < KEY_RESHARE_MIN_INTERVAL_MS) return false;
+
+    const keyRec = this.keysMap.get(this.activeKeyId);
+    if (!keyRec) return false;
+
+    try {
+      const memberIds: string[] = [];
+      const participantsPubMap = new Map<string, { publicKey: string }>();
+
+      for (const [partId, part] of this.participantsMap.entries()) {
+        if (part.isApproved || this.approvedMembers.has(partId) || partId === this.profile.participantId) {
+          memberIds.push(partId);
+          participantsPubMap.set(partId, { publicKey: part.publicKey });
+        }
+      }
+
+      // Seal to the key on the signed request rather than whatever our roster
+      // holds: it is authenticated, it is current, and they may have aged off the
+      // roster entirely while we went on counting them as a member.
+      if (!participantsPubMap.has(targetId)) memberIds.push(targetId);
+      participantsPubMap.set(targetId, { publicKey: normalizePublicKey(req.sender.publicKey) });
+
+      const rawKeyBuffer = await crypto.subtle.exportKey('raw', keyRec.key);
+      const rekeyPacket = await createSignedRekeyPacket(
+        rawKeyBuffer,
+        crypto.randomUUID(),
+        keyRec.keyId,
+        keyRec.epoch,
+        keyRec.parentKeyId || 'root-v2',
+        memberIds,
+        participantsPubMap,
+        this.profile.participantId,
+        this.profile.publicKeyBase64,
+        this.profile.signingPublicKeyBase64,
+        this.signingPrivateKey,
+        this.profile.screenName,
+        this.convId,
+        'add',
+        targetId,
+        req.sender.screenName
+      );
+
+      this.keyResharedAt.set(targetId, now);
+      const sent = await this.sendControlPacket(rekeyPacket, undefined, [], rekeyPacket.packetId);
+      // Clears the entry prompt anywhere it is still showing for this person.
+      await this.broadcastJoinDecision(req.requestId, targetId, 'approved');
+      return sent;
+    } catch (err) {
+      console.warn('Failed to re-share conversation key:', err);
+      return false;
+    }
+  }
+
+  /** Manual retry from the UI: clears the attempt budget and resumes the loop. */
+  public async retryJoinRequest(): Promise<boolean> {
+    this.joinRequestAttempts = 0;
+    if (!this.isApproved && this.roomMode === 'private' && !this.isSecretMissing) {
+      this.startJoinRetryTimer();
+    }
+    return this.sendJoinRequest();
   }
 
   public async approveJoinRequest(requestId: string): Promise<boolean> {
@@ -1248,6 +1447,7 @@ export class RoomSession {
     this.knownHellos.delete(participantId);
     this.helloSeenAt.delete(participantId);
     this.autoApproveIds.delete(participantId);
+    this.keyResharedAt.delete(participantId);
     this.notifyChange();
     return this.rekeyConversation();
   }
@@ -1314,6 +1514,7 @@ export class RoomSession {
         createdAt: rekeyPacket.timestamp,
         key: newRawKey,
         rawBase64Url,
+        parentKeyId: this.activeKeyId,
         signerId: this.profile.participantId,
         members: memberIds,
       };
@@ -1322,6 +1523,8 @@ export class RoomSession {
       this.activeKeyId = newKeyId;
       this.activeEpoch = newEpoch;
       this.isApproved = true;
+      this.persistEpochKey(newKeyRec);
+      this.persistActiveKeyState();
       this.stopJoinRetryTimer();
 
       this.trysteroService.sendControl(envelope);
@@ -1583,6 +1786,7 @@ export class RoomSession {
     }
     this.participantsMap.clear();
     this.pendingRequestsMap.clear();
+    this.keyResharedAt.clear();
     this.sentHelloPeers.clear();
     this.knownHellos.clear();
     this.helloSeenAt.clear();

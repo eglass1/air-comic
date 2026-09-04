@@ -1,8 +1,37 @@
-import type { UserProfile, Friend, ChatMessage, RekeyPacket, PendingInviteRecord } from '../types';
+import type {
+  UserProfile,
+  Friend,
+  ChatMessage,
+  RekeyPacket,
+  PendingInviteRecord,
+  QuickMessageAckRecord,
+  RoomPreapprovalRecord,
+  StoredConversationKey,
+} from '../types';
 import { generateUserKeyPair, getParticipantId } from './crypto';
 
 const DB_NAME = 'AirComicDB_v2';
-const DB_VERSION = 2;
+const DB_VERSION = 5;
+
+/**
+ * How long an acknowledged quick message stays on the suppression list. The
+ * relays only hold a quick message for an hour, so a week is comfortably longer
+ * than anything that could still be replayed at us.
+ */
+const QUICK_MESSAGE_ACK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * How long an invitation keeps pre-authorising its recipient. Matches the TTL on
+ * the published invite itself, so the pre-approval stops being honoured at the
+ * same moment the invitation it came from would have expired.
+ */
+const PREAPPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Epoch keys kept per conversation. Only the newest matter for live traffic; the
+ * rest are held so history synced from a peer under an older epoch still opens.
+ */
+const MAX_STORED_CONVERSATION_KEYS = 50;
 
 export class DatabaseService {
   private dbPromise: Promise<IDBDatabase> | null = null;
@@ -17,6 +46,7 @@ export class DatabaseService {
 
       request.onupgradeneeded = (event) => {
         const db = (event.target as IDBOpenDBRequest).result;
+        const oldVersion = event.oldVersion;
 
         // Profile store
         if (!db.objectStoreNames.contains('profile')) {
@@ -37,9 +67,14 @@ export class DatabaseService {
           msgStore.createIndex('timestamp', 'timestamp', { unique: false });
         }
 
-        // Cached keys store
+        // Cached epoch keys, keyed by conversation as well as key id. Earlier
+        // versions keyed on keyId alone but nothing ever wrote to the store, so
+        // there is no data to migrate and it can simply be rebuilt.
+        if (oldVersion < 5 && db.objectStoreNames.contains('keys')) {
+          db.deleteObjectStore('keys');
+        }
         if (!db.objectStoreNames.contains('keys')) {
-          const keyStore = db.createObjectStore('keys', { keyPath: 'keyId' });
+          const keyStore = db.createObjectStore('keys', { keyPath: 'id' });
           keyStore.createIndex('convId', 'convId', { unique: false });
         }
 
@@ -53,6 +88,22 @@ export class DatabaseService {
         // Conversations metadata store
         if (!db.objectStoreNames.contains('conversations')) {
           db.createObjectStore('conversations', { keyPath: 'convId' });
+        }
+
+        // Quick messages the user has already dismissed or replied to. Relays
+        // keep a quick message around after delivery, so without this the same
+        // one pops up again on every reconnect.
+        if (!db.objectStoreNames.contains('quickMessageAcks')) {
+          const ackStore = db.createObjectStore('quickMessageAcks', { keyPath: 'id' });
+          ackStore.createIndex('ackedAt', 'ackedAt', { unique: false });
+        }
+
+        // People we invited into a room, kept past the invitation itself so their
+        // entry request is still granted without prompting after a reload.
+        if (!db.objectStoreNames.contains('preapprovals')) {
+          const preapprovalStore = db.createObjectStore('preapprovals', { keyPath: 'id' });
+          preapprovalStore.createIndex('convId', 'convId', { unique: false });
+          preapprovalStore.createIndex('participantId', 'participantId', { unique: false });
         }
 
         // Outgoing room invites, parked until the recipient is seen online
@@ -287,39 +338,48 @@ export class DatabaseService {
   // --- Stored Conversation Keys ---
 
   async saveConversationKey(
-    convId: string,
-    keyId: string,
-    epoch: number,
-    rawBase64Url: string,
-    signerId?: string,
-    members: string[] = []
+    key: Omit<StoredConversationKey, 'id' | 'savedAt'>
   ): Promise<void> {
+    if (!key.convId || !key.keyId || !key.rawBase64Url) return;
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction('keys', 'readwrite');
       const store = transaction.objectStore('keys');
-      const request = store.put({
-        keyId,
-        convId,
-        epoch,
-        rawBase64Url,
-        signerId,
-        members,
+      const record: StoredConversationKey = {
+        ...key,
+        id: `${key.convId}::${key.keyId}`,
+        members: key.members || [],
         savedAt: Date.now(),
-      });
+      };
+      const request = store.put(record);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });
   }
 
-  async getConversationKeys(convId: string): Promise<Array<{ keyId: string; epoch: number; rawBase64Url: string; signerId?: string; members?: string[] }>> {
+  /**
+   * Stored epoch keys for a conversation, oldest first. Anything past the newest
+   * MAX_STORED_CONVERSATION_KEYS is dropped on the way past, so a long-lived room
+   * that rekeys on every membership change does not accumulate forever.
+   */
+  async getConversationKeys(convId: string): Promise<StoredConversationKey[]> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction('keys', 'readonly');
+      const transaction = db.transaction('keys', 'readwrite');
       const store = transaction.objectStore('keys');
       const index = store.index('convId');
       const request = index.getAll(convId);
-      request.onsuccess = () => resolve(request.result || []);
+
+      request.onsuccess = () => {
+        const records: StoredConversationKey[] = (request.result || []).filter((r) => r?.keyId);
+        records.sort((a, b) => a.epoch - b.epoch);
+
+        const excess = records.length - MAX_STORED_CONVERSATION_KEYS;
+        if (excess > 0) {
+          for (const stale of records.splice(0, excess)) store.delete(stale.id);
+        }
+        resolve(records);
+      };
       request.onerror = () => reject(request.error);
     });
   }
@@ -338,6 +398,107 @@ export class DatabaseService {
         activeKeyId,
         updatedAt: Date.now(),
       });
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  // --- Acknowledged Quick Messages ---
+
+  /**
+   * Ids of quick messages the user has already dismissed or replied to. Expired
+   * entries are swept on the way past so the list cannot grow without bound.
+   */
+  async getAcknowledgedQuickMessageIds(): Promise<string[]> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('quickMessageAcks', 'readwrite');
+      const store = transaction.objectStore('quickMessageAcks');
+      const request = store.getAll();
+
+      request.onsuccess = () => {
+        const records: QuickMessageAckRecord[] = request.result || [];
+        const cutoff = Date.now() - QUICK_MESSAGE_ACK_TTL_MS;
+        const live: string[] = [];
+        for (const record of records) {
+          if (!record?.id) continue;
+          if (record.ackedAt < cutoff) store.delete(record.id);
+          else live.push(record.id);
+        }
+        resolve(live);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async acknowledgeQuickMessage(id: string, senderParticipantId?: string): Promise<void> {
+    if (!id) return;
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('quickMessageAcks', 'readwrite');
+      const store = transaction.objectStore('quickMessageAcks');
+      const record: QuickMessageAckRecord = { id, senderParticipantId, ackedAt: Date.now() };
+      const request = store.put(record);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  // --- Room Pre-approvals ---
+
+  private static preapprovalId(convId: string, participantId: string): string {
+    return `${convId}::${participantId}`;
+  }
+
+  /** Live pre-approvals, sweeping out any that have aged past the TTL. */
+  async getPreapprovals(): Promise<RoomPreapprovalRecord[]> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('preapprovals', 'readwrite');
+      const store = transaction.objectStore('preapprovals');
+      const request = store.getAll();
+
+      request.onsuccess = () => {
+        const records: RoomPreapprovalRecord[] = request.result || [];
+        const cutoff = Date.now() - PREAPPROVAL_TTL_MS;
+        const live: RoomPreapprovalRecord[] = [];
+        for (const record of records) {
+          if (!record?.id) continue;
+          if (record.createdAt < cutoff) store.delete(record.id);
+          else live.push(record);
+        }
+        resolve(live);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async savePreapproval(convId: string, participantId: string, screenName?: string): Promise<void> {
+    if (!convId || !participantId) return;
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('preapprovals', 'readwrite');
+      const store = transaction.objectStore('preapprovals');
+      const record: RoomPreapprovalRecord = {
+        id: DatabaseService.preapprovalId(convId, participantId),
+        convId,
+        participantId,
+        screenName,
+        createdAt: Date.now(),
+      };
+      const request = store.put(record);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async deletePreapproval(convId: string, participantId: string): Promise<void> {
+    if (!convId || !participantId) return;
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('preapprovals', 'readwrite');
+      const store = transaction.objectStore('preapprovals');
+      const request = store.delete(DatabaseService.preapprovalId(convId, participantId));
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });

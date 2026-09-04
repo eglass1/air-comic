@@ -12,6 +12,7 @@ import type {
   PublicRoomDescriptorPacket,
   FriendPresence,
   PendingInviteRecord,
+  RoomPreapprovalRecord,
   RoomInvitePayload,
   RoomInviteResponsePayload,
   QuickMessagePayload,
@@ -182,6 +183,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [incomingInvites, setIncomingInvites] = useState<RoomInvitePayload[]>([]);
   const pendingInvitesRef = useRef<PendingInviteRecord[]>([]);
   pendingInvitesRef.current = pendingInvites;
+  /** People we invited into a room, kept after the invitation itself is cleared. */
+  const preapprovalsRef = useRef<RoomPreapprovalRecord[]>([]);
 
   const privateKeyRef = useRef<CryptoKey | null>(null);
   const signingPrivateKeyRef = useRef<CryptoKey | null>(null);
@@ -201,9 +204,22 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   } | null>(null);
   const [incomingQuickMessage, setIncomingQuickMessage] = useState<QuickMessagePayload | null>(null);
   const seenQuickMsgIdsRef = useRef<Set<string>>(new Set());
+  // Quick messages already dismissed or replied to, restored from IndexedDB.
+  // The relay keeps handing us the same message for as long as it caches it, so
+  // this is what stops it from popping up again after a reload.
+  const ackedQuickMsgIdsRef = useRef<Set<string>>(new Set());
+
+  const acknowledgeQuickMessage = useCallback((message: QuickMessagePayload | null) => {
+    if (!message?.id) return;
+    ackedQuickMsgIdsRef.current.add(message.id);
+    dbService
+      .acknowledgeQuickMessage(message.id, message.senderParticipantId)
+      .catch((err) => console.warn('Failed to record quick message acknowledgement:', err));
+  }, []);
 
   const handleIncomingQuickMessage = useCallback((message: QuickMessagePayload) => {
     if (!message || !message.id) return;
+    if (ackedQuickMsgIdsRef.current.has(message.id)) return;
     if (seenQuickMsgIdsRef.current.has(message.id)) return;
     seenQuickMsgIdsRef.current.add(message.id);
     if (seenQuickMsgIdsRef.current.size > 200) {
@@ -232,12 +248,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const dismissIncomingQuickMessage = useCallback(() => {
+    if (!incomingQuickMessage) return;
+    acknowledgeQuickMessage(incomingQuickMessage);
     setIncomingQuickMessage(null);
-  }, []);
+  }, [incomingQuickMessage, acknowledgeQuickMessage]);
 
   const replyToIncomingQuickMessage = useCallback(() => {
     if (!incomingQuickMessage) return;
     const msg = incomingQuickMessage;
+    acknowledgeQuickMessage(msg);
     setIncomingQuickMessage(null);
     setQuickMessageTarget({
       participantId: msg.senderParticipantId,
@@ -246,7 +265,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       publicKey: msg.senderPublicKey,
       signingPublicKey: msg.senderSigningPublicKey,
     });
-  }, [incomingQuickMessage]);
+  }, [incomingQuickMessage, acknowledgeQuickMessage]);
 
   const sendQuickMessage = useCallback(
     async (text: string, emotion: number, intensity: number): Promise<boolean> => {
@@ -399,6 +418,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       pendingInvitesRef.current
         .filter((invite) => invite.convId === tab.convId && invite.status !== 'declined')
         .forEach((invite) => session.setAutoApprove(invite.recipientParticipantId));
+
+      // The invite record is cleared as soon as they answer, but the handshake
+      // only begins after that, so the pre-authorisation outlives it separately.
+      preapprovalsRef.current
+        .filter((preapproval) => preapproval.convId === tab.convId)
+        .forEach((preapproval) => session.setAutoApprove(preapproval.participantId));
 
       // If keys and profile are already loaded, init session
       if (profileRef.current && privateKeyRef.current && signingPrivateKeyRef.current) {
@@ -687,6 +712,20 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         pendingInvitesRef.current = loadedInvites;
         setPendingInvites(loadedInvites);
 
+        try {
+          preapprovalsRef.current = await dbService.getPreapprovals();
+        } catch (err) {
+          console.warn('Failed to load room pre-approvals:', err);
+        }
+
+        // Load before the relays are subscribed to, otherwise a cached quick
+        // message can arrive and be shown before we know it was already handled.
+        try {
+          ackedQuickMsgIdsRef.current = new Set(await dbService.getAcknowledgedQuickMessageIds());
+        } catch (err) {
+          console.warn('Failed to load acknowledged quick messages:', err);
+        }
+
         // Parse initial room from URL params
         const params = new URLSearchParams(window.location.search);
         const urlConvId = params.get('id');
@@ -863,6 +902,33 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return invites;
   }, []);
 
+  const savePreapproval = useCallback(
+    async (convId: string, participantId: string, screenName?: string) => {
+      try {
+        await dbService.savePreapproval(convId, participantId, screenName);
+        preapprovalsRef.current = await dbService.getPreapprovals();
+      } catch (err) {
+        console.warn('Failed to record room pre-approval:', err);
+      }
+    },
+    []
+  );
+
+  /** Withdraws a pre-authorisation everywhere: on disk and in any live session. */
+  const clearPreapproval = useCallback(async (convId: string, participantId: string) => {
+    try {
+      await dbService.deletePreapproval(convId, participantId);
+      preapprovalsRef.current = preapprovalsRef.current.filter(
+        (preapproval) => !(preapproval.convId === convId && preapproval.participantId === participantId)
+      );
+    } catch (err) {
+      console.warn('Failed to clear room pre-approval:', err);
+    }
+    sessionsMapRef.current.forEach((session) => {
+      if (session.convId === convId) session.clearAutoApprove(participantId);
+    });
+  }, []);
+
   const isFriendOnline = useCallback(
     (participantId: string) => {
       const presence = friendPresence.get(participantId);
@@ -954,6 +1020,9 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         await dbService.savePendingInvite(record);
         await refreshPendingInvites();
         // Their entry request is granted on arrival because we asked for them.
+        // Recorded separately from the invite so it survives both a reload and
+        // the invite record being cleared the moment they answer.
+        await savePreapproval(session.convId, friend.participantId, friend.screenName);
         session.setAutoApprove(friend.participantId);
 
         const delivered = await dispatchInvitesFor(friend.participantId);
@@ -963,7 +1032,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return 'error';
       }
     },
-    [dispatchInvitesFor, refreshPendingInvites]
+    [dispatchInvitesFor, refreshPendingInvites, savePreapproval]
   );
 
   const cancelPendingInvite = useCallback(
@@ -973,9 +1042,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const remaining = await refreshPendingInvites();
       if (!record) return;
 
-      sessionsMapRef.current.forEach((session) => {
-        if (session.convId === record.convId) session.clearAutoApprove(record.recipientParticipantId);
-      });
+      await clearPreapproval(record.convId, record.recipientParticipantId);
 
       // Retract or shrink whatever we published for this recipient.
       const stillQueued = remaining.filter(
@@ -989,7 +1056,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         await dispatchInvitesFor(record.recipientParticipantId);
       }
     },
-    [dispatchInvitesFor, refreshPendingInvites]
+    [dispatchInvitesFor, refreshPendingInvites, clearPreapproval]
   );
 
   const acceptIncomingInvite = useCallback(
@@ -1085,8 +1152,16 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!record) return;
 
       if (response.decision === 'declined') {
+        await clearPreapproval(record.convId, record.recipientParticipantId);
+      } else {
+        // Accepting only starts the handshake — their join request still has to
+        // arrive, and the invite record is deleted just below. Restamp the
+        // pre-approval so its window runs from the acceptance rather than the
+        // invitation, then arm every session on this room, not just the one the
+        // invitation happened to be sent from.
+        await savePreapproval(record.convId, record.recipientParticipantId, record.recipientScreenName);
         sessionsMapRef.current.forEach((session) => {
-          if (session.convId === record.convId) session.clearAutoApprove(record.recipientParticipantId);
+          if (session.convId === record.convId) session.setAutoApprove(record.recipientParticipantId);
         });
       }
 
@@ -1105,7 +1180,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         await dispatchInvitesFor(record.recipientParticipantId);
       }
     },
-    [dispatchInvitesFor, refreshPendingInvites]
+    [dispatchInvitesFor, refreshPendingInvites, savePreapproval, clearPreapproval]
   );
 
   // Keep presence callbacks pointing at the latest closures.
@@ -1222,7 +1297,9 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const sendJoinRequest = useCallback(async () => {
     if (!activeSession) return false;
-    return activeSession.sendJoinRequest();
+    // Asking again by hand also restarts the automatic retries, which may have
+    // run out of attempts while nobody was around to admit us.
+    return activeSession.retryJoinRequest();
   }, [activeSession]);
 
   const approveJoinRequest = useCallback(
@@ -1244,11 +1321,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const removeParticipant = useCallback(
     async (participantId: string, screenName?: string): Promise<boolean> => {
       if (activeSession) {
+        // Otherwise the invitation that first let them in would readmit them on
+        // their next entry request, undoing the removal.
+        await clearPreapproval(activeSession.convId, participantId);
         return activeSession.removeParticipant(participantId, screenName);
       }
       return false;
     },
-    [activeSession]
+    [activeSession, clearPreapproval]
   );
 
   const rekeyConversation = useCallback(async () => {
