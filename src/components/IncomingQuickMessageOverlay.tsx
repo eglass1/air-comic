@@ -118,9 +118,32 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
           // 1. Draw character at 50% scale
           ctx.drawImage(rendered.canvas, charX, charY, charW, charH);
 
-          // 2. Draw Comic Word Balloon with tail pointing near avatar's head without covering it
+          // Find topmost opaque pixel in rendered character to find the top of the head/hair
+          let headTopY = 0;
+          try {
+            const rCtx = rendered.canvas.getContext('2d');
+            if (rCtx) {
+              const scanH = Math.min(80, rendered.canvas.height);
+              const scanW = rendered.canvas.width;
+              const imgData = rCtx.getImageData(0, 0, scanW, scanH).data;
+              outer: for (let y = 0; y < scanH; y++) {
+                for (let x = 0; x < scanW; x++) {
+                  if (imgData[(y * scanW + x) * 4 + 3] > 40) {
+                    headTopY = y;
+                    break outer;
+                  }
+                }
+              }
+            }
+          } catch {
+            headTopY = 0;
+          }
+
+          const headTopCanvasY = charY + Math.round(headTopY * scale);
+
+          // Terminate stem slightly touching/penetrating the top of the head without covering the face
           const tailX = charX + scaledHeadX;
-          const tailY = charY + scaledHeadY - 4;
+          const tailY = headTopCanvasY + 2;
 
           const balloon: ComicBalloon = {
             id: `qm-${incomingQuickMessage.id}`,
