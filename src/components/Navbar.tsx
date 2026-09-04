@@ -269,26 +269,17 @@ export const Navbar: React.FC<NavbarProps> = ({
 
         {/* Right Action Icons & Main Dropdown Menu */}
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8 }}>
-          {/* Public Rooms Directory */}
-          <Tooltip title="Public Rooms Directory">
-            <IconButton color="inherit" onClick={onOpenPublicRooms}>
-              <PublicIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* Pending Requests Badge */}
-          {isApproved && pendingJoinRequests.length > 0 && (
-            <Tooltip title={`${pendingJoinRequests.length} pending join request(s)`}>
-              <IconButton color="warning" onClick={onOpenRequests}>
-                <Badge badgeContent={pendingJoinRequests.length} color="error">
-                  <NotificationsActiveIcon />
-                </Badge>
+          {/* 1. Invite Friend */}
+          {isApproved && (
+            <Tooltip title="Invite Friend">
+              <IconButton color="inherit" onClick={onOpenAddContact}>
+                <PersonAddAlt1Icon />
               </IconButton>
             </Tooltip>
           )}
 
-          {/* Invite / Share */}
-          <Tooltip title="Invite">
+          {/* 2. Share Invite */}
+          <Tooltip title="Share Invite">
             <IconButton
               color="primary"
               onClick={onOpenInvite}
@@ -303,22 +294,40 @@ export const Navbar: React.FC<NavbarProps> = ({
             </IconButton>
           </Tooltip>
 
-          {/* Friends */}
-          <Tooltip title="Friends Directory">
+          {/* Pending Requests Badge */}
+          {isApproved && pendingJoinRequests.length > 0 && (
+            <Tooltip title={`${pendingJoinRequests.length} pending join request(s)`}>
+              <IconButton color="warning" onClick={onOpenRequests}>
+                <Badge badgeContent={pendingJoinRequests.length} color="error">
+                  <NotificationsActiveIcon />
+                </Badge>
+              </IconButton>
+            </Tooltip>
+          )}
+
+          {/* 3. Public Rooms */}
+          <Tooltip title="Public Rooms">
+            <IconButton color="inherit" onClick={onOpenPublicRooms}>
+              <PublicIcon />
+            </IconButton>
+          </Tooltip>
+
+          {/* 4. Friends (x) */}
+          <Tooltip title={`Friends (${friends.length})`}>
             <IconButton color="inherit" onClick={onOpenFriends}>
               <PeopleIcon />
             </IconButton>
           </Tooltip>
 
-          {/* Profile */}
-          <Tooltip title={`Profile (${profile?.screenName || 'User'})`}>
+          {/* 5. Profile */}
+          <Tooltip title="Profile">
             <IconButton color="inherit" onClick={onOpenProfile}>
               <AccountCircleIcon />
             </IconButton>
           </Tooltip>
 
-          {/* Theme Toggle */}
-          <Tooltip title={`Switch to ${themeMode === 'dark' ? 'Light' : 'Dark'} Mode`}>
+          {/* 6. Dark/Light Mode */}
+          <Tooltip title="Dark/Light Mode">
             <IconButton color="inherit" onClick={onToggleTheme}>
               {themeMode === 'dark' ? <LightModeIcon /> : <DarkModeIcon />}
             </IconButton>
@@ -326,38 +335,38 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {/* Main Dropdown Menu (Opened via Logo Button) */}
           <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={handleCloseMenu}>
-            {/* 1. Invite */}
-            <MenuItem onClick={() => { handleCloseMenu(); onOpenInvite(); }}>
-              <ListItemIcon>
-                <ShareIcon fontSize="small" color="primary" />
-              </ListItemIcon>
-              <ListItemText>Invite</ListItemText>
-            </MenuItem>
-
-            {/* 2. Add Contact */}
+            {/* 1. Invite Friend */}
             {isApproved && (
               <MenuItem onClick={() => { handleCloseMenu(); onOpenAddContact(); }}>
                 <ListItemIcon>
                   <PersonAddAlt1Icon fontSize="small" color="primary" />
                 </ListItemIcon>
-                <ListItemText>Add Contact</ListItemText>
+                <ListItemText>Invite Friend</ListItemText>
               </MenuItem>
             )}
 
-            {/* 3. Friends Directory */}
-            <MenuItem onClick={() => { handleCloseMenu(); onOpenFriends(); }}>
+            {/* 2. Share Invite */}
+            <MenuItem onClick={() => { handleCloseMenu(); onOpenInvite(); }}>
               <ListItemIcon>
-                <PeopleIcon fontSize="small" color="primary" />
+                <ShareIcon fontSize="small" color="primary" />
               </ListItemIcon>
-              <ListItemText>Friends Directory ({friends.length})</ListItemText>
+              <ListItemText>Share Invite</ListItemText>
             </MenuItem>
 
-            {/* 4. Public Rooms Directory */}
+            {/* 3. Public Rooms */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenPublicRooms(); }}>
               <ListItemIcon>
                 <PublicIcon fontSize="small" color="primary" />
               </ListItemIcon>
-              <ListItemText>Public Rooms Directory</ListItemText>
+              <ListItemText>Public Rooms</ListItemText>
+            </MenuItem>
+
+            {/* 4. Friends (x) */}
+            <MenuItem onClick={() => { handleCloseMenu(); onOpenFriends(); }}>
+              <ListItemIcon>
+                <PeopleIcon fontSize="small" color="primary" />
+              </ListItemIcon>
+              <ListItemText>Friends ({friends.length})</ListItemText>
             </MenuItem>
 
             {/* 5. Profile */}
@@ -368,12 +377,12 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Profile</ListItemText>
             </MenuItem>
 
-            {/* 6. Security & Communications */}
+            {/* 6. Network/Security */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenSecurity(); }}>
               <ListItemIcon>
                 <SecurityIcon fontSize="small" color="primary" />
               </ListItemIcon>
-              <ListItemText>Security & Communications</ListItemText>
+              <ListItemText>Network/Security</ListItemText>
             </MenuItem>
 
             {/* 7. Comic Zoom Control */}
@@ -421,7 +430,27 @@ export const Navbar: React.FC<NavbarProps> = ({
               </Box>
             </Box>
 
-            {/* 8. Clear Local Message History */}
+            {/* 8. Dark Mode / Light Mode Toggle */}
+            <MenuItem
+              onClick={() => {
+                handleCloseMenu();
+                onToggleTheme();
+              }}
+            >
+              <ListItemIcon>
+                {themeMode === 'light' ? (
+                  <DarkModeIcon fontSize="small" color="primary" />
+                ) : (
+                  <LightModeIcon fontSize="small" color="primary" />
+                )}
+              </ListItemIcon>
+              <ListItemText>{themeMode === 'light' ? 'Dark' : 'Light'}</ListItemText>
+            </MenuItem>
+
+            {/* Separator for Clear Local Message History */}
+            <Divider sx={{ my: 0.5 }} />
+
+            {/* 9. Clear Local Message History */}
             <MenuItem onClick={handleClearHistory} sx={{ color: 'error.main' }}>
               <ListItemIcon>
                 <DeleteSweepIcon fontSize="small" color="error" />
@@ -431,7 +460,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
             <Divider sx={{ my: 0.5 }} />
 
-            {/* 9. About... */}
+            {/* 10. About... */}
             <MenuItem
               onClick={() => {
                 handleCloseMenu();
