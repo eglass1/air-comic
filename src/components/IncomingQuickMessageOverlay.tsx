@@ -1,10 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Box, Typography } from '@mui/material';
 import ReplyIcon from '@mui/icons-material/Reply';
 import { useChat } from '../context/ChatContext';
 import { AvatarManager } from '../comic/avatarManager';
 import { ComicLayoutEngine, COMIC_FONT_FAMILY } from '../comic/comicLayout';
-import { ComicBalloon } from '../comic/types';
+import { ComicBalloon, EM_NEUTRAL } from '../comic/types';
 
 export const IncomingQuickMessageOverlay: React.FC = () => {
   const {
@@ -13,12 +13,14 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
     replyToIncomingQuickMessage,
   } = useChat();
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [dimensions, setDimensions] = useState<{ width: number; height: number }>({ width: 280, height: 260 });
+  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
 
   // Handle Escape key to dismiss
   useEffect(() => {
-    if (!incomingQuickMessage) return;
+    if (!incomingQuickMessage) {
+      setImageDataUrl(null);
+      return;
+    }
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -30,90 +32,122 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [incomingQuickMessage, dismissIncomingQuickMessage]);
 
-  // Render character & comic balloon
+  // Render character & comic balloon to an offscreen canvas and capture as image
   useEffect(() => {
-    if (!incomingQuickMessage) return;
+    if (!incomingQuickMessage) {
+      setImageDataUrl(null);
+      return;
+    }
 
     let isMounted = true;
-    const avatarName = incomingQuickMessage.senderAvatarName || 'Armando';
+    const rawAvatarName = incomingQuickMessage.senderAvatarName || 'Armando';
 
     AvatarManager.getInstance()
-      .loadAvatar(avatarName)
+      .loadAvatar(rawAvatarName)
       .then((avatarData) => {
-        if (!isMounted || !avatarData) return;
+        if (!isMounted) return;
 
-        // Render character at original resolution
-        const rendered = AvatarManager.getInstance().renderCharacter(
-          avatarData,
-          incomingQuickMessage.emotion,
-          incomingQuickMessage.intensity,
-          false
-        );
+        // Fall back to armando if avatarData failed to load
+        const finalAvatarData =
+          avatarData || AvatarManager.getInstance().getCachedAvatar('armando');
 
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        // 50% scale
-        const scale = 0.5;
-        const charW = Math.round(rendered.canvas.width * scale);
-        const charH = Math.round(rendered.canvas.height * scale);
-        const scaledHeadX = Math.round(rendered.headX * scale);
-        const scaledHeadY = Math.round(rendered.headY * scale);
-
-        // Calculate balloon text dimensions
-        ctx.font = `bold 12px ${COMIC_FONT_FAMILY}`;
-        const lines = ComicLayoutEngine.getWrappedLines(ctx, incomingQuickMessage.text, 220);
-        const lineHeight = 16;
-        let maxLineW = 60;
-        for (const line of lines) {
-          const w = ctx.measureText(line.trim()).width;
-          if (w > maxLineW) maxLineW = w;
+        if (!finalAvatarData) {
+          console.warn('Could not load avatar for quick message overlay');
+          return;
         }
 
-        const bW = Math.max(120, Math.min(260, Math.round(maxLineW + 36)));
-        const bH = Math.max(42, lines.length * lineHeight + 24);
+        try {
+          const emotion =
+            typeof incomingQuickMessage.emotion === 'number'
+              ? incomingQuickMessage.emotion
+              : EM_NEUTRAL;
+          const intensity =
+            typeof incomingQuickMessage.intensity === 'number'
+              ? incomingQuickMessage.intensity
+              : 0.0;
 
-        // Size canvas to hold both balloon above and character below
-        const canvasW = Math.max(bW + 28, charW + 40);
-        const bX = Math.round((canvasW - bW) / 2);
-        const bY = 8; // near top of canvas
+          // Render character at native resolution
+          const rendered = AvatarManager.getInstance().renderCharacter(
+            finalAvatarData,
+            emotion,
+            intensity,
+            false
+          );
 
-        const charX = Math.round((canvasW - charW) / 2);
-        const charY = bY + bH + 20; // placed cleanly below balloon to avoid covering head
-        const canvasH = charY + charH + 10;
+          // 50% scale
+          const scale = 0.5;
+          const charW = Math.round(rendered.canvas.width * scale);
+          const charH = Math.round(rendered.canvas.height * scale);
+          const scaledHeadX = Math.round(rendered.headX * scale);
+          const scaledHeadY = Math.round(rendered.headY * scale);
 
-        setDimensions({ width: canvasW, height: canvasH });
+          // Create offscreen canvas
+          const offscreen = document.createElement('canvas');
+          const ctx = offscreen.getContext('2d');
+          if (!ctx) return;
 
-        // Update canvas sizing directly
-        canvas.width = canvasW;
-        canvas.height = canvasH;
+          // Calculate balloon text dimensions
+          const safeText = (incomingQuickMessage.text || '').trim() || '...';
+          ctx.font = `bold 12px ${COMIC_FONT_FAMILY}`;
+          const lines = ComicLayoutEngine.getWrappedLines(ctx, safeText, 210);
+          const lineHeight = 16;
+          let maxLineW = 60;
+          for (const line of lines) {
+            const w = ctx.measureText(line.trim()).width;
+            if (w > maxLineW) maxLineW = w;
+          }
 
-        ctx.clearRect(0, 0, canvasW, canvasH);
+          const bW = Math.max(120, Math.min(260, Math.round(maxLineW + 36)));
+          const bH = Math.max(42, lines.length * lineHeight + 24);
 
-        // Draw avatar at 50% scale
-        ctx.drawImage(rendered.canvas, charX, charY, charW, charH);
+          // Size offscreen canvas to hold both balloon above and character below
+          const canvasW = Math.max(bW + 28, charW + 40);
+          const bX = Math.round((canvasW - bW) / 2);
+          const bY = 8; // near top of canvas
 
-        // Draw Comic Word Balloon with tail pointing near avatar's head without covering it
-        const tailX = charX + scaledHeadX;
-        const tailY = charY + scaledHeadY - 4;
+          const charX = Math.round((canvasW - charW) / 2);
+          const charY = bY + bH + 18; // placed cleanly below balloon to avoid covering head
+          const canvasH = charY + charH + 10;
 
-        const balloon: ComicBalloon = {
-          id: `qm-${incomingQuickMessage.id}`,
-          speakerParticipantId: incomingQuickMessage.senderParticipantId,
-          speakerName: incomingQuickMessage.senderScreenName,
-          text: incomingQuickMessage.text,
-          mode: 'say',
-          x: bX,
-          y: bY,
-          width: bW,
-          height: bH,
-          tailX,
-          tailY,
-        };
+          offscreen.width = canvasW;
+          offscreen.height = canvasH;
 
-        ComicLayoutEngine.drawBalloon(ctx, balloon);
+          // Clear offscreen canvas
+          ctx.clearRect(0, 0, canvasW, canvasH);
+
+          // 1. Draw character at 50% scale
+          ctx.drawImage(rendered.canvas, charX, charY, charW, charH);
+
+          // 2. Draw Comic Word Balloon with tail pointing near avatar's head without covering it
+          const tailX = charX + scaledHeadX;
+          const tailY = charY + scaledHeadY - 4;
+
+          const balloon: ComicBalloon = {
+            id: `qm-${incomingQuickMessage.id}`,
+            speakerParticipantId: incomingQuickMessage.senderParticipantId,
+            speakerName: incomingQuickMessage.senderScreenName,
+            text: safeText,
+            mode: 'say',
+            x: bX,
+            y: bY,
+            width: bW,
+            height: bH,
+            tailX,
+            tailY,
+          };
+
+          ComicLayoutEngine.drawBalloon(ctx, balloon);
+
+          const url = offscreen.toDataURL('image/png');
+          if (isMounted) {
+            setImageDataUrl(url);
+          }
+        } catch (err) {
+          console.error('Error rendering incoming quick message overlay:', err);
+        }
+      })
+      .catch((err) => {
+        console.error('Error loading avatar in incoming quick message:', err);
       });
 
     return () => {
@@ -151,16 +185,24 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
           flexDirection: 'column',
           alignItems: 'center',
           gap: 1,
-          filter: 'drop-shadow(0 6px 20px rgba(0,0,0,0.38))',
         }}
       >
-        {/* Transparent canvas with 50% scale avatar & authentic comic word balloon */}
-        <canvas
-          ref={canvasRef}
-          width={dimensions.width}
-          height={dimensions.height}
-          style={{ display: 'block', pointerEvents: 'none' }}
-        />
+        {/* Rendered 50% scale avatar & comic word balloon */}
+        {imageDataUrl && (
+          <Box
+            component="img"
+            src={imageDataUrl}
+            alt="Quick Message"
+            sx={{
+              display: 'block',
+              maxWidth: '90vw',
+              maxHeight: '65vh',
+              objectFit: 'contain',
+              pointerEvents: 'none',
+              filter: 'drop-shadow(0 6px 20px rgba(0,0,0,0.4))',
+            }}
+          />
+        )}
 
         {/* Yellow capsule box styled like comic panel title banners */}
         <Box

@@ -158,7 +158,7 @@ export class AvatarManager {
   }
 
   async loadAvatar(avatarNameOrFilename: string): Promise<AvatarData | null> {
-    const cleanKey = avatarNameOrFilename.toLowerCase().replace(/\.avb$/, '');
+    const cleanKey = (avatarNameOrFilename || 'armando').trim().toLowerCase().replace(/\.avb$/, '') || 'armando';
     if (this.avatarCache.has(cleanKey)) {
       return this.avatarCache.get(cleanKey)!;
     }
@@ -196,6 +196,9 @@ export class AvatarManager {
       const resp = await fetch(url);
       if (!resp.ok) {
         console.warn(`Failed to fetch avatar from ${url}: status ${resp.status}`);
+        if (cleanKey !== 'armando') {
+          return this.loadAvatar('armando');
+        }
         return null;
       }
       const buffer = await resp.arrayBuffer();
@@ -204,6 +207,9 @@ export class AvatarManager {
       return parsed;
     } catch (err) {
       console.error(`Error loading avatar ${avatarNameOrFilename}:`, err);
+      if (cleanKey !== 'armando') {
+        return this.loadAvatar('armando');
+      }
       return null;
     }
   }
