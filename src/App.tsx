@@ -29,6 +29,8 @@ import { IncomingInviteDialog } from './components/IncomingInviteDialog';
 import { PublicRoomsDialog } from './components/PublicRoomsDialog';
 import { CreatePublicRoomDialog } from './components/CreatePublicRoomDialog';
 import { NewRoomDialog } from './components/NewRoomDialog';
+import { QuickMessageDialog } from './components/QuickMessageDialog';
+import { IncomingQuickMessageOverlay } from './components/IncomingQuickMessageOverlay';
 
 const AppContent: React.FC = () => {
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>('light');
@@ -177,6 +179,8 @@ const AppContent: React.FC = () => {
         />
         <MissingSecretDialog />
         <IncomingInviteDialog />
+        <QuickMessageDialog />
+        <IncomingQuickMessageOverlay />
       </Box>
     </ThemeProvider>
   );

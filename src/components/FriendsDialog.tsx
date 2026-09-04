@@ -34,6 +34,7 @@ import KeyIcon from '@mui/icons-material/VpnKey';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import SendIcon from '@mui/icons-material/Send';
 import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
+import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useChat } from '../context/ChatContext';
 import { Friend } from '../types';
 import { normalizePublicKey, spkiToPem, getParticipantId } from '../services/crypto';
@@ -57,6 +58,7 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     participants,
     isApproved,
     isRekeying,
+    openQuickMessage,
   } = useChat();
 
   const [searchTerm, setSearchTerm] = useState<string>('');
@@ -358,6 +360,26 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
                                   {online ? 'Online' : 'Offline'}
                                 </Typography>
                               </Box>
+                              {online && (
+                                <Tooltip title="Quick Message">
+                                  <IconButton
+                                    size="small"
+                                    color="primary"
+                                    onClick={() => {
+                                      openQuickMessage({
+                                        participantId: f.participantId,
+                                        screenName: f.screenName,
+                                        avatarName: f.avatarName,
+                                        publicKey: f.publicKey,
+                                        signingPublicKey: f.signingPublicKey,
+                                      });
+                                    }}
+                                    sx={{ p: 0.5, border: '1px solid', borderColor: 'divider' }}
+                                  >
+                                    <ChatBubbleOutlineIcon fontSize="small" />
+                                  </IconButton>
+                                </Tooltip>
+                              )}
                               {isAlreadyIn && (
                                 <Chip
                                   icon={<CheckCircleIcon sx={{ fontSize: '13px !important' }} />}

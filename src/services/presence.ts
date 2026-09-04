@@ -7,6 +7,7 @@ import type {
   RoomInviteResponsePayload,
   SealedEnvelope,
   FriendPresence,
+  QuickMessagePayload,
 } from '../types';
 import {
   createSignedPresence,
@@ -57,6 +58,7 @@ export interface PresenceServiceCallbacks {
   onPresenceChange?: (presence: FriendPresence, previous: FriendPresence | null) => void;
   onInvite?: (invite: RoomInvitePayload) => void;
   onInviteResponse?: (response: RoomInviteResponsePayload) => void;
+  onQuickMessage?: (message: QuickMessagePayload) => void;
 }
 
 /**
@@ -78,11 +80,13 @@ export class PresenceService {
   private myPresenceTag: string = '';
   private myInboxTag: string = '';
   private myResponseTag: string = '';
+  private myQuickMsgTag: string = '';
 
   /** presence routing tag -> friend participantId */
   private watchedTags: Map<string, string> = new Map();
   private presenceByParticipant: Map<string, FriendPresence> = new Map();
   private handledInviteIds: Set<string> = new Set();
+  private handledQuickMsgIds: Set<string> = new Set();
 
   private callbacks: PresenceServiceCallbacks = {};
   private republishTimer: ReturnType<typeof setInterval> | null = null;
@@ -126,6 +130,7 @@ export class PresenceService {
     this.myPresenceTag = await derivePresenceTag(profile.participantId);
     this.myInboxTag = await deriveInboxTag(profile.participantId);
     this.myResponseTag = this.myInboxTag + '~r';
+    this.myQuickMsgTag = this.myInboxTag + '~qm';
 
     this.loadHandledInvites();
 
@@ -270,6 +275,31 @@ export class PresenceService {
     this.saveHandledInvites();
   }
 
+  public async publishQuickMessage(
+    recipientParticipantId: string,
+    recipientPublicKey: string,
+    message: QuickMessagePayload
+  ): Promise<boolean> {
+    if (!this.profile) return false;
+
+    const quickMsgTag = (await deriveInboxTag(recipientParticipantId)) + '~qm';
+    const sealed = await sealForParticipant(
+      recipientParticipantId,
+      recipientPublicKey,
+      this.profile.participantId,
+      JSON.stringify(message)
+    );
+
+    return this.publishEvent(
+      [
+        ['d', quickMsgTag],
+        ['t', 'airthread-quickmsg'],
+        ['expiration', String(Math.floor(Date.now() / 1000) + 3600)],
+      ],
+      JSON.stringify(sealed)
+    );
+  }
+
   // --------------------------------------------------------------------------
   // Relay transport
   // --------------------------------------------------------------------------
@@ -343,7 +373,7 @@ export class PresenceService {
       this.send(connection, [
         'REQ',
         'ac-inbox',
-        { kinds: [NOSTR_KIND], '#d': [this.myInboxTag, this.myResponseTag], limit: 50 },
+        { kinds: [NOSTR_KIND], '#d': [this.myInboxTag, this.myResponseTag, this.myQuickMsgTag], limit: 50 },
       ]);
     }
   }
@@ -473,6 +503,16 @@ export class PresenceService {
         if (!(await verifyInviteResponseSignature(response))) continue;
         this.callbacks.onInviteResponse?.(response);
       }
+      return;
+    }
+
+    if (body?.type === 'quick_message') {
+      const qm = body as QuickMessagePayload;
+      if (qm.recipientParticipantId !== this.profile.participantId) return;
+      if (this.handledQuickMsgIds.has(qm.id)) return;
+      this.handledQuickMsgIds.add(qm.id);
+      this.callbacks.onQuickMessage?.(qm);
+      return;
     }
   }
 

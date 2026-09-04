@@ -14,6 +14,7 @@ import type {
   PendingInviteRecord,
   RoomInvitePayload,
   RoomInviteResponsePayload,
+  QuickMessagePayload,
 } from '../types';
 import {
   generateRandomRoomSecret,
@@ -55,6 +56,29 @@ export interface ChatContextType {
   incomingInvites: RoomInvitePayload[];
   acceptIncomingInvite: (invite: RoomInvitePayload) => Promise<void>;
   declineIncomingInvite: (invite: RoomInvitePayload) => Promise<void>;
+
+  // Quick Message
+  quickMessageTarget: {
+    participantId: string;
+    screenName: string;
+    avatarName?: string;
+    publicKey?: string;
+    signingPublicKey?: string;
+    peerId?: string;
+  } | null;
+  incomingQuickMessage: QuickMessagePayload | null;
+  openQuickMessage: (target: {
+    participantId: string;
+    screenName: string;
+    avatarName?: string;
+    publicKey?: string;
+    signingPublicKey?: string;
+    peerId?: string;
+  }) => void;
+  closeQuickMessage: () => void;
+  dismissIncomingQuickMessage: () => void;
+  replyToIncomingQuickMessage: () => void;
+  sendQuickMessage: (text: string, emotion: number, intensity: number) => Promise<boolean>;
 
   // Multi-Tab Conversations
   tabs: RoomTab[];
@@ -163,6 +187,134 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const signingPrivateKeyRef = useRef<CryptoKey | null>(null);
   const profileRef = useRef<UserProfile | null>(null);
   profileRef.current = profile;
+  const friendsRef = useRef<Friend[]>([]);
+  friendsRef.current = friends;
+
+  // Quick message state
+  const [quickMessageTarget, setQuickMessageTarget] = useState<{
+    participantId: string;
+    screenName: string;
+    avatarName?: string;
+    publicKey?: string;
+    signingPublicKey?: string;
+    peerId?: string;
+  } | null>(null);
+  const [incomingQuickMessage, setIncomingQuickMessage] = useState<QuickMessagePayload | null>(null);
+  const seenQuickMsgIdsRef = useRef<Set<string>>(new Set());
+
+  const handleIncomingQuickMessage = useCallback((message: QuickMessagePayload) => {
+    if (!message || !message.id) return;
+    if (seenQuickMsgIdsRef.current.has(message.id)) return;
+    seenQuickMsgIdsRef.current.add(message.id);
+    if (seenQuickMsgIdsRef.current.size > 200) {
+      const first = seenQuickMsgIdsRef.current.values().next().value;
+      if (first) seenQuickMsgIdsRef.current.delete(first);
+    }
+    setIncomingQuickMessage(message);
+  }, []);
+
+  const openQuickMessage = useCallback(
+    (target: {
+      participantId: string;
+      screenName: string;
+      avatarName?: string;
+      publicKey?: string;
+      signingPublicKey?: string;
+      peerId?: string;
+    }) => {
+      setQuickMessageTarget(target);
+    },
+    []
+  );
+
+  const closeQuickMessage = useCallback(() => {
+    setQuickMessageTarget(null);
+  }, []);
+
+  const dismissIncomingQuickMessage = useCallback(() => {
+    setIncomingQuickMessage(null);
+  }, []);
+
+  const replyToIncomingQuickMessage = useCallback(() => {
+    if (!incomingQuickMessage) return;
+    const msg = incomingQuickMessage;
+    setIncomingQuickMessage(null);
+    setQuickMessageTarget({
+      participantId: msg.senderParticipantId,
+      screenName: msg.senderScreenName,
+      avatarName: msg.senderAvatarName,
+      publicKey: msg.senderPublicKey,
+      signingPublicKey: msg.senderSigningPublicKey,
+    });
+  }, [incomingQuickMessage]);
+
+  const sendQuickMessage = useCallback(
+    async (text: string, emotion: number, intensity: number): Promise<boolean> => {
+      if (!profileRef.current || !quickMessageTarget) return false;
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+
+      const payload: QuickMessagePayload = {
+        type: 'quick_message',
+        id:
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `qm_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        senderParticipantId: profileRef.current.participantId,
+        senderScreenName: profileRef.current.screenName,
+        senderAvatarName: profileRef.current.avatarName || 'Armando',
+        senderPublicKey: profileRef.current.publicKeyBase64,
+        senderSigningPublicKey: profileRef.current.signingPublicKeyBase64,
+        recipientParticipantId: quickMessageTarget.participantId,
+        text: trimmed,
+        emotion,
+        intensity,
+        timestamp: Date.now(),
+      };
+
+      let sent = false;
+
+      // 1. Try sending over WebRTC in any active room session containing target
+      for (const session of sessionsMapRef.current.values()) {
+        if (session.participantsMap.has(quickMessageTarget.participantId)) {
+          session.sendQuickMessage(payload, quickMessageTarget.participantId);
+          sent = true;
+        }
+      }
+
+      // 2. Also send via PresenceService over Nostr if recipient public key is known
+      let recipientPubkey = quickMessageTarget.publicKey;
+      if (!recipientPubkey) {
+        const friend = friendsRef.current.find((f) => f.participantId === quickMessageTarget.participantId);
+        if (friend?.publicKey) recipientPubkey = friend.publicKey;
+      }
+      if (!recipientPubkey) {
+        for (const session of sessionsMapRef.current.values()) {
+          const p = session.participantsMap.get(quickMessageTarget.participantId);
+          if (p?.publicKey) {
+            recipientPubkey = p.publicKey;
+            break;
+          }
+        }
+      }
+
+      if (recipientPubkey) {
+        try {
+          const nostrSent = await presenceService.publishQuickMessage(
+            quickMessageTarget.participantId,
+            recipientPubkey,
+            payload
+          );
+          if (nostrSent) sent = true;
+        } catch (err) {
+          console.warn('Failed to publish quick message via Nostr:', err);
+        }
+      }
+
+      return sent;
+    },
+    [quickMessageTarget]
+  );
 
   // Multi-tab state
   const [tabs, setTabs] = useState<RoomTab[]>([]);
@@ -238,6 +390,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       sessionsMapRef.current.set(tab.tabId, session);
 
+      session.setOnQuickMessage((payload) => {
+        handleIncomingQuickMessage(payload);
+      });
+
       // Anyone we already invited into this room is admitted without prompting,
       // including across a page reload where the queue is reloaded from IndexedDB.
       pendingInvitesRef.current
@@ -253,7 +409,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       return session;
     },
-    [refreshActiveSessionView]
+    [refreshActiveSessionView, handleIncomingQuickMessage]
   );
 
   // Switch active tab
@@ -979,6 +1135,9 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       onInviteResponse: (response) => {
         inviteResponseRef.current(response).catch(() => {});
       },
+      onQuickMessage: (message) => {
+        handleIncomingQuickMessage(message);
+      },
     });
   }, []);
 
@@ -1161,6 +1320,13 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     incomingInvites,
     acceptIncomingInvite,
     declineIncomingInvite,
+    quickMessageTarget,
+    incomingQuickMessage,
+    openQuickMessage,
+    closeQuickMessage,
+    dismissIncomingQuickMessage,
+    replyToIncomingQuickMessage,
+    sendQuickMessage,
     tabs,
     activeTabId,
     openTab,

@@ -18,6 +18,7 @@ import type {
   PublicRoomDescriptorPacket,
   RosterGossipPacket,
   JoinDecisionPacket,
+  QuickMessagePayload,
 } from '../types';
 import {
   generateRandomRoomSecret,
@@ -112,6 +113,7 @@ export class RoomSession {
   private rootKey: CryptoKey | null = null;
   private keysMap: Map<string, KeyRecord> = new Map();
   private trysteroService: TrysteroService | null = null;
+  private onQuickMessageCb: ((payload: QuickMessagePayload) => void) | null = null;
 
   private approvedMembers: Set<string> = new Set();
   private processedPacketIds: Set<string> = new Set();
@@ -183,6 +185,10 @@ export class RoomSession {
   private notifyChange() {
     if (this.isDestroyed) return;
     this.onStateChangeCb?.(this);
+  }
+
+  public setOnQuickMessage(cb: (payload: QuickMessagePayload) => void) {
+    this.onQuickMessageCb = cb;
   }
 
   public async init(profile: UserProfile, privateKey: CryptoKey, signingPrivateKey: CryptoKey) {
@@ -395,6 +401,7 @@ export class RoomSession {
     this.trysteroService.setOnStateSummary((packet, peerId) => this.handleStateSummary(packet, peerId));
     this.trysteroService.setOnStateRequest((packet, peerId) => this.handleStateRequest(packet, peerId));
     this.trysteroService.setOnStateChunk((packet, peerId) => this.handleStateChunk(packet, peerId));
+    this.trysteroService.setOnQuickMessage((payload, peerId) => this.handleIncomingQuickMessage(payload, peerId));
 
     this.trysteroService.setOnRelayStatusChange((statuses) => {
       this.relayStatuses = statuses;
@@ -1456,6 +1463,28 @@ export class RoomSession {
       console.error('Failed to send encrypted message:', err);
       return false;
     }
+  }
+
+  private handleIncomingQuickMessage(payload: QuickMessagePayload, _viaPeerId: string) {
+    if (this.isDestroyed || !this.profile) return;
+    if (payload.recipientParticipantId === this.profile.participantId) {
+      this.onQuickMessageCb?.(payload);
+    }
+  }
+
+  public sendQuickMessage(payload: QuickMessagePayload, targetPeerIdOrParticipantId?: string): boolean {
+    if (!this.trysteroService) return false;
+    let targetPeerId: string | undefined = targetPeerIdOrParticipantId;
+    if (targetPeerIdOrParticipantId) {
+      for (const [pId, partId] of this.peerIdToParticipantId.entries()) {
+        if (partId === targetPeerIdOrParticipantId) {
+          targetPeerId = pId;
+          break;
+        }
+      }
+    }
+    this.trysteroService.sendQuickMessage(payload, targetPeerId);
+    return true;
   }
 
   public async updateChannelTitle(newTitle: string): Promise<boolean> {

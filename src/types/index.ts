@@ -451,3 +451,18 @@ export interface PendingInviteRecord {
   updatedAt: number;
   lastAttemptAt?: number;
 }
+
+export interface QuickMessagePayload {
+  type: 'quick_message';
+  id: string;
+  senderParticipantId: string;
+  senderScreenName: string;
+  senderAvatarName: string;
+  senderPublicKey: string;
+  senderSigningPublicKey: string;
+  recipientParticipantId: string;
+  text: string;
+  emotion: number;
+  intensity: number;
+  timestamp: number;
+}

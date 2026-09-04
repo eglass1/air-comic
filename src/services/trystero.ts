@@ -6,6 +6,7 @@ import type {
   StateRequestPacket,
   StateChunkPacket,
   RelaySocketStatus,
+  QuickMessagePayload,
 } from '../types';
 
 export class TrysteroService {
@@ -22,6 +23,7 @@ export class TrysteroService {
   private stateSummaryAction: any = null;
   private stateRequestAction: any = null;
   private stateChunkAction: any = null;
+  private quickMessageAction: any = null;
 
   // Callbacks
   private onPeerJoinCb: ((peerId: string) => void) | null = null;
@@ -32,6 +34,7 @@ export class TrysteroService {
   private onStateSummaryCb: ((packet: StateSummaryPacket, peerId: string) => void) | null = null;
   private onStateRequestCb: ((packet: StateRequestPacket, peerId: string) => void) | null = null;
   private onStateChunkCb: ((packet: StateChunkPacket, peerId: string) => void) | null = null;
+  private onQuickMessageCb: ((payload: QuickMessagePayload, peerId: string) => void) | null = null;
   private onRelayStatusChangeCb: ((statuses: RelaySocketStatus[]) => void) | null = null;
 
   // Relay monitoring state
@@ -104,6 +107,12 @@ export class TrysteroService {
         if (this.onStateChunkCb) this.onStateChunkCb(data, peerId);
       };
 
+      this.quickMessageAction = this.room.makeAction('quick_msg');
+      this.quickMessageAction.onMessage = (data: QuickMessagePayload, meta: any) => {
+        const peerId = meta?.peerId || '';
+        if (this.onQuickMessageCb) this.onQuickMessageCb(data, peerId);
+      };
+
       // Peer lifecycle (setter properties)
       this.room.onPeerJoin = (peerId: string) => {
         if (this.onPeerJoinCb) this.onPeerJoinCb(peerId);
@@ -166,6 +175,12 @@ export class TrysteroService {
     }
   }
 
+  public sendQuickMessage(payload: QuickMessagePayload, targetPeerId?: string) {
+    if (this.quickMessageAction) {
+      this.quickMessageAction.send(payload, targetPeerId ? { target: targetPeerId } : {});
+    }
+  }
+
   // Callback setters
   public setOnPeerJoin(cb: (peerId: string) => void) {
     this.onPeerJoinCb = cb;
@@ -197,6 +212,10 @@ export class TrysteroService {
 
   public setOnStateChunk(cb: (packet: StateChunkPacket, peerId: string) => void) {
     this.onStateChunkCb = cb;
+  }
+
+  public setOnQuickMessage(cb: (payload: QuickMessagePayload, peerId: string) => void) {
+    this.onQuickMessageCb = cb;
   }
 
   public setOnRelayStatusChange(cb: (statuses: RelaySocketStatus[]) => void) {

@@ -21,6 +21,7 @@ import PersonRemoveIcon from '@mui/icons-material/PersonRemove';
 import PersonAddAlt1Icon from '@mui/icons-material/PersonAddAlt1';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import LockIcon from '@mui/icons-material/Lock';
+import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useChat } from '../context/ChatContext';
 import { Participant } from '../types';
 import { ContactCardDialog } from './ContactCardDialog';
@@ -107,6 +108,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     friends,
     connectedPeersCount,
     roomMode,
+    openQuickMessage,
   } = useChat();
 
   const [selectedParticipant, setSelectedParticipant] = useState<Participant | null>(null);
@@ -222,6 +224,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
                       {p.screenName}
                     </Typography>
+                    {!p.isSelf && (
+                      <Tooltip title="Quick Message">
+                        <IconButton
+                          size="small"
+                          sx={{ p: 0.25, color: 'text.secondary', '&:hover': { color: 'primary.main' } }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openQuickMessage({
+                              participantId: p.participantId,
+                              screenName: p.screenName,
+                              avatarName: p.avatarName,
+                              publicKey: p.publicKey,
+                              signingPublicKey: p.signingPublicKey,
+                              peerId: p.peerId,
+                            });
+                          }}
+                        >
+                          <ChatBubbleOutlineIcon sx={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Tooltip>
+                    )}
                     {p.isSelf && (
                       <Chip label="You" size="small" color="primary" sx={{ height: 16, fontSize: '0.65rem' }} />
                     )}
