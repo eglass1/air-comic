@@ -74,8 +74,8 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
             false
           );
 
-          // 50% scale
-          const scale = 0.5;
+          // Avatar scaled to ~66% of previous 50% height (one-third smaller, ~0.333 of native size)
+          const scale = 0.5 * (2 / 3);
           const charW = Math.round(rendered.canvas.width * scale);
           const charH = Math.round(rendered.canvas.height * scale);
           const scaledHeadX = Math.round(rendered.headX * scale);
