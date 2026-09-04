@@ -22,9 +22,11 @@ import {
 import PersonAddAlt1Icon from '@mui/icons-material/PersonAddAlt1';
 import SearchIcon from '@mui/icons-material/Search';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import PeopleIcon from '@mui/icons-material/People';
+import SendIcon from '@mui/icons-material/Send';
+import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
 import { useChat } from '../context/ChatContext';
 import { Friend } from '../types';
+import { PresenceDot } from './PresenceDot';
 
 interface AddContactToRoomDialogProps {
   open: boolean;
@@ -37,10 +39,17 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
   onClose,
   onOpenFriends,
 }) => {
-  const { friends, participants, proactiveAddFriend, isRekeying } = useChat();
+  const {
+    friends,
+    participants,
+    inviteFriendToRoom,
+    isFriendOnline,
+    pendingInvites,
+    isRekeying,
+  } = useChat();
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [addingFriendId, setAddingFriendId] = useState<string | null>(null);
-  const [snack, setSnack] = useState<string | null>(null);
+  const [snack, setSnack] = useState<{ message: string; severity: 'success' | 'info' | 'error' } | null>(null);
 
   const approvedIds = new Set(
     participants.filter((p) => p.isApproved).map((p) => p.participantId)
@@ -55,13 +64,23 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
     );
   });
 
-  const handleAdd = async (friend: Friend) => {
+  const invitedParticipantIds = new Set(pendingInvites.map((invite) => invite.recipientParticipantId));
+
+  const handleInvite = async (friend: Friend) => {
     setAddingFriendId(friend.id);
-    const ok = await proactiveAddFriend(friend);
+    const result = await inviteFriendToRoom(friend);
     setAddingFriendId(null);
-    if (ok) {
-      setSnack(`Added ${friend.screenName} to conversation!`);
+
+    if (result === 'sent') {
+      setSnack({ message: `Invitation sent to ${friend.screenName}.`, severity: 'success' });
       onClose();
+    } else if (result === 'queued') {
+      setSnack({
+        message: `${friend.screenName} is offline — the invitation will be delivered when they come online.`,
+        severity: 'info',
+      });
+    } else {
+      setSnack({ message: `Could not invite ${friend.screenName}.`, severity: 'error' });
     }
   };
 
@@ -71,7 +90,7 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <PersonAddAlt1Icon color="primary" />
           <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            Add Friend to Conversation
+            Invite Friend to Conversation
           </Typography>
         </DialogTitle>
 
@@ -106,6 +125,8 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
             <List sx={{ pt: 0 }}>
               {filteredFriends.map((f) => {
                 const isAlreadyIn = approvedIds.has(f.participantId);
+                const online = isFriendOnline(f.participantId);
+                const isInvited = invitedParticipantIds.has(f.participantId);
 
                 return (
                   <ListItem
@@ -119,9 +140,11 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
                     }}
                   >
                     <ListItemAvatar>
-                      <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
-                        {f.screenName.charAt(0).toUpperCase()}
-                      </Avatar>
+                      <PresenceDot online={online}>
+                        <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
+                          {f.screenName.charAt(0).toUpperCase()}
+                        </Avatar>
+                      </PresenceDot>
                     </ListItemAvatar>
 
                     <ListItemText
@@ -129,6 +152,9 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                           <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                             {f.screenName}
+                          </Typography>
+                          <Typography variant="caption" color={online ? 'success.main' : 'text.disabled'}>
+                            {online ? 'Online' : 'Offline'}
                           </Typography>
                         </Box>
                       }
@@ -147,16 +173,24 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
                         variant="outlined"
                         size="small"
                       />
+                    ) : isInvited ? (
+                      <Chip
+                        icon={<ScheduleSendIcon sx={{ fontSize: '14px !important' }} />}
+                        label={online ? 'Invitation sent' : 'Invite pending'}
+                        color="info"
+                        variant="outlined"
+                        size="small"
+                      />
                     ) : (
                       <Button
                         variant="contained"
                         size="small"
                         color="primary"
-                        onClick={() => handleAdd(f)}
+                        onClick={() => handleInvite(f)}
                         disabled={isRekeying || addingFriendId === f.id}
-                        startIcon={addingFriendId === f.id ? <CircularProgress size={14} color="inherit" /> : <PersonAddAlt1Icon />}
+                        startIcon={addingFriendId === f.id ? <CircularProgress size={14} color="inherit" /> : <SendIcon />}
                       >
-                        Add to Room
+                        Invite
                       </Button>
                     )}
                   </ListItem>
@@ -182,12 +216,12 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
 
       <Snackbar
         open={Boolean(snack)}
-        autoHideDuration={3000}
+        autoHideDuration={5000}
         onClose={() => setSnack(null)}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
       >
-        <Alert onClose={() => setSnack(null)} severity="success" sx={{ width: '100%' }}>
-          {snack}
+        <Alert onClose={() => setSnack(null)} severity={snack?.severity || 'success'} sx={{ width: '100%' }}>
+          {snack?.message}
         </Alert>
       </Snackbar>
     </>

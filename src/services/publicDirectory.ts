@@ -1,5 +1,4 @@
 import { schnorr } from '@noble/secp256k1';
-import { defaultRelayUrls } from 'trystero/nostr';
 import type {
   PublicRoomDescriptorPacket,
   PublicRoomTombstonePacket,
@@ -8,6 +7,7 @@ import {
   verifyPublicRoomDescriptorSignature,
   verifyPublicRoomTombstoneSignature,
 } from './crypto';
+import { DIRECTORY_RELAY_URLS } from './relays';
 
 const NOSTR_PUBLIC_ROOM_KIND = 30078;
 const NOSTR_TAG_IDENTIFIER = 'airthread-public-room';
@@ -40,16 +40,7 @@ export class PublicDirectoryService {
     if (customRelays && customRelays.length > 0) {
       return customRelays;
     }
-    // Preferred fast & reliable relays first, then fallback to trystero defaults
-    const preferred = [
-      'wss://nos.lol',
-      'wss://relay.damus.io',
-      'wss://purplerelay.com',
-      'wss://relay.snort.social',
-      'wss://relay.nostr.band',
-    ];
-    const combined = Array.from(new Set([...preferred, ...defaultRelayUrls]));
-    return combined.slice(0, 12); // Use top 12 relays
+    return [...DIRECTORY_RELAY_URLS];
   }
 
   /**

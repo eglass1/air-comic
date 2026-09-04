@@ -31,11 +31,13 @@ import PhoneIcon from '@mui/icons-material/Phone';
 import HomeIcon from '@mui/icons-material/Home';
 import NotesIcon from '@mui/icons-material/Notes';
 import KeyIcon from '@mui/icons-material/VpnKey';
-import PersonAddAlt1Icon from '@mui/icons-material/PersonAddAlt1';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
+import SendIcon from '@mui/icons-material/Send';
+import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
 import { useChat } from '../context/ChatContext';
 import { Friend } from '../types';
 import { normalizePublicKey, spkiToPem, getParticipantId } from '../services/crypto';
+import { PresenceDot } from './PresenceDot';
 
 interface FriendsDialogProps {
   open: boolean;
@@ -48,7 +50,10 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     addFriend,
     updateFriend,
     deleteFriend,
-    proactiveAddFriend,
+    inviteFriendToRoom,
+    isFriendOnline,
+    pendingInvites,
+    cancelPendingInvite,
     participants,
     isApproved,
     isRekeying,
@@ -70,6 +75,12 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
   const approvedIds = new Set(
     participants.filter((p) => p.isApproved).map((p) => p.participantId)
   );
+
+  const invitesByParticipant = new Map(
+    pendingInvites.map((invite) => [invite.recipientParticipantId, invite])
+  );
+
+  const onlineCount = friends.filter((f) => isFriendOnline(f.participantId)).length;
 
   const filteredFriends = friends.filter((f) => {
     const term = searchTerm.toLowerCase();
@@ -161,10 +172,14 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     setSnack(`${label} PEM copied to clipboard!`);
   };
 
-  const handleProactiveAdd = async (friend: Friend) => {
-    const ok = await proactiveAddFriend(friend);
-    if (ok) {
-      setSnack(`Proactively added ${friend.screenName} to conversation!`);
+  const handleInvite = async (friend: Friend) => {
+    const result = await inviteFriendToRoom(friend);
+    if (result === 'sent') {
+      setSnack(`Invitation sent to ${friend.screenName}.`);
+    } else if (result === 'queued') {
+      setSnack(`${friend.screenName} is offline — invitation queued until they come online.`);
+    } else {
+      setSnack(`Could not invite ${friend.screenName}.`);
     }
   };
 
@@ -177,6 +192,15 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
             <Typography variant="h6" sx={{ fontWeight: 700 }}>
               Friends Directory ({friends.length})
             </Typography>
+            {friends.length > 0 && (
+              <Chip
+                size="small"
+                variant="outlined"
+                color={onlineCount > 0 ? 'success' : 'default'}
+                label={`${onlineCount} online`}
+                sx={{ height: 22, fontSize: '0.7rem' }}
+              />
+            )}
           </Box>
           {!isAdding && !editingFriend && (
             <Button
@@ -310,18 +334,28 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
                 <Grid container spacing={2}>
                   {filteredFriends.map((f) => {
                     const isAlreadyIn = approvedIds.has(f.participantId);
+                    const online = isFriendOnline(f.participantId);
+                    const pendingInvite = invitesByParticipant.get(f.participantId);
 
                     return (
                       <Grid size={{ xs: 12, sm: 6 }} key={f.id}>
                         <Card variant="outlined" sx={{ height: '100%', display: 'flex', flexDirection: 'column', bgcolor: 'background.default' }}>
                           <CardContent sx={{ flexGrow: 1, pb: 1 }}>
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
-                              <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
-                                {f.screenName.charAt(0).toUpperCase()}
-                              </Avatar>
+                              <PresenceDot online={online}>
+                                <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
+                                  {f.screenName.charAt(0).toUpperCase()}
+                                </Avatar>
+                              </PresenceDot>
                               <Box sx={{ overflow: 'hidden', flexGrow: 1 }}>
                                 <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
                                   {f.screenName}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: online ? 'success.main' : 'text.disabled', fontWeight: 600 }}
+                                >
+                                  {online ? 'Online' : 'Offline'}
                                 </Typography>
                               </Box>
                               {isAlreadyIn && (
@@ -372,17 +406,35 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
                           </CardContent>
 
                           <CardActions sx={{ justifyContent: 'space-between', px: 2, pt: 0, pb: 1.5 }}>
-                            {isApproved && !isAlreadyIn ? (
+                            {isApproved && !isAlreadyIn && !pendingInvite ? (
                               <Button
                                 size="small"
                                 variant="outlined"
                                 color="primary"
-                                startIcon={<PersonAddAlt1Icon />}
-                                onClick={() => handleProactiveAdd(f)}
+                                startIcon={<SendIcon />}
+                                onClick={() => handleInvite(f)}
                                 disabled={isRekeying}
                               >
-                                Add to Room
+                                Invite to Room
                               </Button>
+                            ) : pendingInvite && !isAlreadyIn ? (
+                              <Tooltip
+                                title={
+                                  online
+                                    ? 'Invitation delivered — waiting for them to accept'
+                                    : 'Queued: delivered as soon as they come online'
+                                }
+                              >
+                                <Chip
+                                  icon={<ScheduleSendIcon sx={{ fontSize: '13px !important' }} />}
+                                  label={online ? 'Invite sent' : 'Invite queued'}
+                                  color="info"
+                                  size="small"
+                                  variant="outlined"
+                                  onDelete={() => cancelPendingInvite(pendingInvite.inviteId)}
+                                  sx={{ height: 24, fontSize: '0.68rem' }}
+                                />
+                              </Tooltip>
                             ) : <Box />}
 
                             <Box sx={{ display: 'flex', gap: 0.5 }}>

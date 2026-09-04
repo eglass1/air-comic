@@ -225,6 +225,7 @@ export interface StateSummaryPacket {
   controlPacketIds: string[];
   newestMessageTimestamp: number;
   messageCount: number;
+  recentMessageIds?: string[]; // ids of the most recent messages we hold
   timestamp: number;
   signature: string;
 }
@@ -275,6 +276,8 @@ export interface ChatMessage {
   emotion?: number;
   emotionIntensity?: number;
   balloonMode?: 'say' | 'whisper' | 'think' | 'action';
+  /** Original wire envelope, retained so this message can be re-served to peers syncing history. */
+  envelope?: EncryptedNetworkEnvelope;
 }
 
 export interface KeyRecord {
@@ -319,3 +322,132 @@ export interface RoomTab {
   unreadCount: number;
 }
 
+
+// ----------------------------------------------------------------------------
+// GOSSIP / ROSTER PROPAGATION
+// ----------------------------------------------------------------------------
+
+/**
+ * Carries verbatim (still signed) hello packets learned from other peers so that
+ * participants who cannot establish a direct WebRTC link still see each other.
+ */
+export interface RosterGossipPacket {
+  type: 'roster';
+  protocol: 'airthread/2';
+  convId: string;
+  hellos: IdentityHelloPacket[];
+  timestamp: number;
+}
+
+/**
+ * Announces that some approved member has resolved a pending join request, so
+ * every other member can dismiss the prompt from their screen.
+ */
+export interface JoinDecisionPacket {
+  type: 'join_decision';
+  protocol: 'airthread/2';
+  convId: string;
+  requestId: string;
+  targetParticipantId: string;
+  decision: 'approved' | 'declined';
+  deciderId: string; // participantId
+  deciderScreenName: string;
+  deciderSigningPublicKey: string; // ECDSA SPKI Base64
+  timestamp: number;
+  signature: string;
+}
+
+// ----------------------------------------------------------------------------
+// PRESENCE & DIRECT INVITES (airthread/2-presence)
+// ----------------------------------------------------------------------------
+
+export type PresenceStatus = 'online' | 'away' | 'offline';
+
+export interface PresencePacket {
+  type: 'presence';
+  protocol: 'airthread/2';
+  extension: 'airthread/2-presence';
+  participantId: string;
+  screenName: string;
+  avatarName?: string;
+  publicKey: string; // RSA-OAEP SPKI Base64
+  signingPublicKey: string; // ECDSA SPKI Base64
+  status: PresenceStatus;
+  timestamp: number;
+  signature: string;
+}
+
+export interface FriendPresence {
+  participantId: string;
+  screenName: string;
+  avatarName?: string;
+  status: PresenceStatus;
+  lastSeen: number;
+}
+
+/** Hybrid RSA-OAEP + AES-GCM sealed payload, addressed to a single participant. */
+export interface SealedEnvelope {
+  type: 'sealed';
+  protocol: 'airthread/2';
+  extension: 'airthread/2-presence';
+  recipientParticipantId: string;
+  senderParticipantId: string;
+  encryptedKey: string; // Base64URL RSA-OAEP(raw AES-256 key)
+  iv: string; // Base64URL 12 bytes
+  data: string; // Base64URL ciphertext
+  timestamp: number;
+}
+
+export interface RoomInvitePayload {
+  type: 'room_invite';
+  protocol: 'airthread/2';
+  extension: 'airthread/2-presence';
+  inviteId: string;
+  convId: string;
+  roomMode: RoomMode;
+  roomSecret?: string; // private rooms
+  publicJoinToken?: string; // public rooms
+  channelTitle: string;
+  recipientParticipantId: string;
+  inviter: {
+    participantId: string;
+    screenName: string;
+    avatarName?: string;
+    publicKey: string;
+    signingPublicKey: string;
+    contactInfo?: ContactInfo;
+  };
+  timestamp: number;
+  signature: string;
+}
+
+export interface RoomInviteResponsePayload {
+  type: 'room_invite_response';
+  protocol: 'airthread/2';
+  extension: 'airthread/2-presence';
+  inviteId: string;
+  convId: string;
+  decision: 'accepted' | 'declined';
+  responderParticipantId: string;
+  responderScreenName: string;
+  responderSigningPublicKey: string;
+  timestamp: number;
+  signature: string;
+}
+
+/** Outgoing invite parked in IndexedDB until the recipient is seen online. */
+export interface PendingInviteRecord {
+  inviteId: string;
+  recipientParticipantId: string;
+  recipientScreenName: string;
+  recipientPublicKey: string; // RSA-OAEP SPKI Base64
+  convId: string;
+  roomMode: RoomMode;
+  roomSecret?: string;
+  publicJoinToken?: string;
+  channelTitle: string;
+  status: 'queued' | 'sent' | 'accepted' | 'declined';
+  createdAt: number;
+  updatedAt: number;
+  lastAttemptAt?: number;
+}

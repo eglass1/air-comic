@@ -10,6 +10,10 @@ import type {
   RoomMode,
   RoomTab,
   PublicRoomDescriptorPacket,
+  FriendPresence,
+  PendingInviteRecord,
+  RoomInvitePayload,
+  RoomInviteResponsePayload,
 } from '../types';
 import {
   generateRandomRoomSecret,
@@ -21,10 +25,13 @@ import {
   generateUserKeyPair,
   getParticipantId,
   getPublicKeyFingerprint,
+  createSignedRoomInvite,
+  createSignedInviteResponse,
 } from '../services/crypto';
 import { getRandomChannelTitle, getOrInitChannelTitle } from '../utils/channelNameGenerator';
 import { dbService } from '../services/db';
 import { publicDirectoryService } from '../services/publicDirectory';
+import { presenceService } from '../services/presence';
 import { RoomSession } from '../services/roomSession';
 
 export interface ChatContextType {
@@ -38,6 +45,16 @@ export interface ChatContextType {
   addFriend: (friend: Omit<Friend, 'id' | 'createdAt' | 'updatedAt'>) => Promise<void>;
   updateFriend: (friend: Friend) => Promise<void>;
   deleteFriend: (id: string) => Promise<void>;
+
+  // Friend presence & direct invites
+  friendPresence: Map<string, FriendPresence>;
+  isFriendOnline: (participantId: string) => boolean;
+  pendingInvites: PendingInviteRecord[];
+  inviteFriendToRoom: (friend: Friend) => Promise<'sent' | 'queued' | 'error'>;
+  cancelPendingInvite: (inviteId: string) => Promise<void>;
+  incomingInvites: RoomInvitePayload[];
+  acceptIncomingInvite: (invite: RoomInvitePayload) => Promise<void>;
+  declineIncomingInvite: (invite: RoomInvitePayload) => Promise<void>;
 
   // Multi-Tab Conversations
   tabs: RoomTab[];
@@ -92,7 +109,6 @@ export interface ChatContextType {
   approveJoinRequest: (requestOrId: PendingJoinRequest | string) => Promise<boolean>;
   declineJoinRequest: (requestId: string) => void;
   removeParticipant: (participantId: string, screenName?: string) => Promise<boolean>;
-  proactiveAddFriend: (friend: Friend) => Promise<boolean>;
   rekeyConversation: () => Promise<boolean>;
   claimConversation: () => Promise<boolean>;
   clearHistory: () => Promise<void>;
@@ -136,6 +152,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [friends, setFriends] = useState<Friend[]>([]);
   const [publicRoomsList, setPublicRoomsList] = useState<PublicRoomDescriptorPacket[]>([]);
   const [zoomLevel, setZoomLevel] = useState<number>(1.0);
+
+  const [friendPresence, setFriendPresence] = useState<Map<string, FriendPresence>>(new Map());
+  const [pendingInvites, setPendingInvites] = useState<PendingInviteRecord[]>([]);
+  const [incomingInvites, setIncomingInvites] = useState<RoomInvitePayload[]>([]);
+  const pendingInvitesRef = useRef<PendingInviteRecord[]>([]);
+  pendingInvitesRef.current = pendingInvites;
 
   const privateKeyRef = useRef<CryptoKey | null>(null);
   const signingPrivateKeyRef = useRef<CryptoKey | null>(null);
@@ -215,6 +237,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       );
 
       sessionsMapRef.current.set(tab.tabId, session);
+
+      // Anyone we already invited into this room is admitted without prompting,
+      // including across a page reload where the queue is reloaded from IndexedDB.
+      pendingInvitesRef.current
+        .filter((invite) => invite.convId === tab.convId && invite.status !== 'declined')
+        .forEach((invite) => session.setAutoApprove(invite.recipientParticipantId));
 
       // If keys and profile are already loaded, init session
       if (profileRef.current && privateKeyRef.current && signingPrivateKeyRef.current) {
@@ -304,6 +332,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     },
     [tabs, switchTab, getOrCreateSession, syncBrowserUrl, refreshActiveSessionView]
   );
+
+  // openTab is recreated on every tab change; callbacks below reach it via this ref.
+  const openTabRef = useRef<typeof openTab | null>(null);
+  openTabRef.current = openTab;
 
   // Close a tab
   const closeTab = useCallback(
@@ -493,6 +525,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const loadedFriends = await dbService.getFriends();
         setFriends(loadedFriends);
 
+        // Restore the outgoing invite queue before any session is built, so
+        // auto-approval is re-armed for people we invited in a previous session.
+        const loadedInvites = await dbService.getPendingInvites();
+        pendingInvitesRef.current = loadedInvites;
+        setPendingInvites(loadedInvites);
+
         // Parse initial room from URL params
         const params = new URLSearchParams(window.location.search);
         const urlConvId = params.get('id');
@@ -530,6 +568,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         await session.init(loadedProfile, privKey, signPrivKey);
         refreshActiveSessionView();
+
+        presenceService
+          .start(loadedProfile, privKey, signPrivKey)
+          .catch((err) => console.warn('Failed to start presence service:', err));
       } catch (err) {
         console.error('Failed to initialize Chat context:', err);
       }
@@ -539,6 +581,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     return () => {
       isMounted = false;
+      presenceService.stop().catch(() => {});
       sessionsMapRef.current.forEach((s) => s.destroy());
       sessionsMapRef.current.clear();
     };
@@ -653,6 +696,311 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setFriends(updated);
   }, []);
 
+  // --------------------------------------------------------------------------
+  // Presence & direct room invites
+  // --------------------------------------------------------------------------
+
+  const refreshPendingInvites = useCallback(async () => {
+    const invites = await dbService.getPendingInvites();
+    pendingInvitesRef.current = invites;
+    setPendingInvites(invites);
+    return invites;
+  }, []);
+
+  const isFriendOnline = useCallback(
+    (participantId: string) => {
+      const presence = friendPresence.get(participantId);
+      return Boolean(presence && presence.status !== 'offline');
+    },
+    [friendPresence]
+  );
+
+  /**
+   * Publishes every queued invite for one recipient as a single sealed bundle.
+   * Called when we create an invite and again whenever that person comes online.
+   */
+  const dispatchInvitesFor = useCallback(
+    async (participantId: string): Promise<boolean> => {
+      const currentProfile = profileRef.current;
+      const signPrivKey = signingPrivateKeyRef.current;
+      if (!currentProfile || !signPrivKey) return false;
+      if (!presenceService.isOnline(participantId)) return false;
+
+      const queued = pendingInvitesRef.current.filter(
+        (invite) => invite.recipientParticipantId === participantId && invite.status !== 'declined'
+      );
+      if (queued.length === 0) return false;
+
+      try {
+        const payloads = await Promise.all(
+          queued.map((invite) =>
+            createSignedRoomInvite(
+              invite.inviteId,
+              invite.convId,
+              invite.roomMode,
+              invite.channelTitle,
+              invite.recipientParticipantId,
+              {
+                participantId: currentProfile.participantId,
+                screenName: currentProfile.screenName,
+                avatarName: currentProfile.avatarName,
+                publicKey: currentProfile.publicKeyBase64,
+                signingPublicKey: currentProfile.signingPublicKeyBase64,
+                contactInfo: currentProfile.contactInfo,
+              },
+              signPrivKey,
+              { roomSecret: invite.roomSecret, publicJoinToken: invite.publicJoinToken }
+            )
+          )
+        );
+
+        const delivered = await presenceService.publishInviteBundle(
+          participantId,
+          queued[0].recipientPublicKey,
+          payloads
+        );
+        if (!delivered) return false;
+
+        for (const invite of queued) {
+          await dbService.savePendingInvite({ ...invite, status: 'sent', lastAttemptAt: Date.now() });
+        }
+        await refreshPendingInvites();
+        return true;
+      } catch (err) {
+        console.warn('Failed to dispatch room invites:', err);
+        return false;
+      }
+    },
+    [refreshPendingInvites]
+  );
+
+  const inviteFriendToRoom = useCallback(
+    async (friend: Friend): Promise<'sent' | 'queued' | 'error'> => {
+      const session = sessionsMapRef.current.get(activeTabIdRef.current);
+      if (!session || !friend.participantId || !friend.publicKey) return 'error';
+
+      const record: PendingInviteRecord = {
+        inviteId: crypto.randomUUID(),
+        recipientParticipantId: friend.participantId,
+        recipientScreenName: friend.screenName,
+        recipientPublicKey: normalizePublicKey(friend.publicKey),
+        convId: session.convId,
+        roomMode: session.roomMode,
+        roomSecret: session.roomMode === 'private' ? session.roomSecret : undefined,
+        publicJoinToken: session.roomMode === 'public' ? session.publicJoinToken || undefined : undefined,
+        channelTitle: session.channelTitle,
+        status: 'queued',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      try {
+        await dbService.savePendingInvite(record);
+        await refreshPendingInvites();
+        // Their entry request is granted on arrival because we asked for them.
+        session.setAutoApprove(friend.participantId);
+
+        const delivered = await dispatchInvitesFor(friend.participantId);
+        return delivered ? 'sent' : 'queued';
+      } catch (err) {
+        console.warn('Failed to queue room invite:', err);
+        return 'error';
+      }
+    },
+    [dispatchInvitesFor, refreshPendingInvites]
+  );
+
+  const cancelPendingInvite = useCallback(
+    async (inviteId: string) => {
+      const record = pendingInvitesRef.current.find((invite) => invite.inviteId === inviteId);
+      await dbService.deletePendingInvite(inviteId);
+      const remaining = await refreshPendingInvites();
+      if (!record) return;
+
+      sessionsMapRef.current.forEach((session) => {
+        if (session.convId === record.convId) session.clearAutoApprove(record.recipientParticipantId);
+      });
+
+      // Retract or shrink whatever we published for this recipient.
+      const stillQueued = remaining.filter(
+        (invite) => invite.recipientParticipantId === record.recipientParticipantId
+      );
+      if (stillQueued.length === 0) {
+        await presenceService
+          .clearInviteBundle(record.recipientParticipantId, record.recipientPublicKey)
+          .catch(() => {});
+      } else {
+        await dispatchInvitesFor(record.recipientParticipantId);
+      }
+    },
+    [dispatchInvitesFor, refreshPendingInvites]
+  );
+
+  const acceptIncomingInvite = useCallback(
+    async (invite: RoomInvitePayload) => {
+      presenceService.markInviteHandled(invite.inviteId);
+      setIncomingInvites((prev) => prev.filter((i) => i.inviteId !== invite.inviteId));
+
+      // Opening the room performs the normal join handshake; the inviter has
+      // pre-approved us, so their side grants entry without a second prompt.
+      openTabRef.current?.({
+        convId: invite.convId,
+        roomMode: invite.roomMode,
+        roomSecret: invite.roomSecret,
+        publicJoinToken: invite.publicJoinToken,
+        channelTitle: invite.channelTitle,
+        isInitialCreator: false,
+      });
+
+      const currentProfile = profileRef.current;
+      const signPrivKey = signingPrivateKeyRef.current;
+      if (!currentProfile || !signPrivKey) return;
+
+      // Remember the inviter so they show up in the friends directory too.
+      const known = await dbService.getFriends();
+      if (!known.some((f) => f.participantId === invite.inviter.participantId)) {
+        await dbService.saveFriend({
+          id: crypto.randomUUID(),
+          participantId: invite.inviter.participantId,
+          screenName: invite.inviter.screenName,
+          avatarName: invite.inviter.avatarName,
+          publicKey: normalizePublicKey(invite.inviter.publicKey),
+          signingPublicKey: normalizePublicKey(invite.inviter.signingPublicKey),
+          contactInfo: invite.inviter.contactInfo,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        setFriends(await dbService.getFriends());
+      }
+
+      try {
+        const response = await createSignedInviteResponse(
+          invite.inviteId,
+          invite.convId,
+          'accepted',
+          currentProfile.participantId,
+          currentProfile.screenName,
+          currentProfile.signingPublicKeyBase64,
+          signPrivKey
+        );
+        await presenceService.publishInviteResponse(
+          invite.inviter.participantId,
+          invite.inviter.publicKey,
+          response
+        );
+      } catch (err) {
+        console.warn('Failed to acknowledge room invite:', err);
+      }
+    },
+    []
+  );
+
+  const declineIncomingInvite = useCallback(async (invite: RoomInvitePayload) => {
+    presenceService.markInviteHandled(invite.inviteId);
+    setIncomingInvites((prev) => prev.filter((i) => i.inviteId !== invite.inviteId));
+
+    const currentProfile = profileRef.current;
+    const signPrivKey = signingPrivateKeyRef.current;
+    if (!currentProfile || !signPrivKey) return;
+
+    try {
+      const response = await createSignedInviteResponse(
+        invite.inviteId,
+        invite.convId,
+        'declined',
+        currentProfile.participantId,
+        currentProfile.screenName,
+        currentProfile.signingPublicKeyBase64,
+        signPrivKey
+      );
+      await presenceService.publishInviteResponse(
+        invite.inviter.participantId,
+        invite.inviter.publicKey,
+        response
+      );
+    } catch (err) {
+      console.warn('Failed to decline room invite:', err);
+    }
+  }, []);
+
+  const handleInviteResponse = useCallback(
+    async (response: RoomInviteResponsePayload) => {
+      const record = pendingInvitesRef.current.find((invite) => invite.inviteId === response.inviteId);
+      if (!record) return;
+
+      if (response.decision === 'declined') {
+        sessionsMapRef.current.forEach((session) => {
+          if (session.convId === record.convId) session.clearAutoApprove(record.recipientParticipantId);
+        });
+      }
+
+      await dbService.deletePendingInvite(record.inviteId);
+      const remaining = await refreshPendingInvites();
+
+      // Replace the published bundle with whatever is still outstanding.
+      const stillQueued = remaining.filter(
+        (invite) => invite.recipientParticipantId === record.recipientParticipantId
+      );
+      if (stillQueued.length === 0) {
+        await presenceService
+          .clearInviteBundle(record.recipientParticipantId, record.recipientPublicKey)
+          .catch(() => {});
+      } else {
+        await dispatchInvitesFor(record.recipientParticipantId);
+      }
+    },
+    [dispatchInvitesFor, refreshPendingInvites]
+  );
+
+  // Keep presence callbacks pointing at the latest closures.
+  const dispatchInvitesRef = useRef(dispatchInvitesFor);
+  dispatchInvitesRef.current = dispatchInvitesFor;
+  const inviteResponseRef = useRef(handleInviteResponse);
+  inviteResponseRef.current = handleInviteResponse;
+
+  useEffect(() => {
+    presenceService.setCallbacks({
+      onPresenceChange: (presence) => {
+        setFriendPresence((prev) => {
+          const next = new Map(prev);
+          next.set(presence.participantId, presence);
+          return next;
+        });
+        // A friend just appeared: hand over anything we parked for them.
+        if (presence.status !== 'offline') {
+          dispatchInvitesRef.current(presence.participantId).catch(() => {});
+        }
+      },
+      onInvite: (invite) => {
+        setIncomingInvites((prev) =>
+          prev.some((existing) => existing.inviteId === invite.inviteId) ? prev : [...prev, invite]
+        );
+      },
+      onInviteResponse: (response) => {
+        inviteResponseRef.current(response).catch(() => {});
+      },
+    });
+  }, []);
+
+  // Track exactly the friends currently in the directory.
+  useEffect(() => {
+    presenceService.watchFriends(friends.map((f) => f.participantId)).catch(() => {});
+  }, [friends]);
+
+  // Backstop for invites queued while we ourselves were offline, or whose
+  // recipient came online before the presence callbacks were attached.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const recipients = new Set(pendingInvitesRef.current.map((i) => i.recipientParticipantId));
+      recipients.forEach((participantId) => {
+        if (presenceService.isOnline(participantId)) {
+          dispatchInvitesRef.current(participantId).catch(() => {});
+        }
+      });
+    }, 60000);
+    return () => clearInterval(timer);
+  }, []);
+
   const refreshPublicRoomsList = useCallback(async (): Promise<PublicRoomDescriptorPacket[]> => {
     try {
       const rooms = await publicDirectoryService.fetchPublicRooms();
@@ -744,26 +1092,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [activeSession]
   );
 
-  const proactiveAddFriend = useCallback(
-    async (friend: Friend): Promise<boolean> => {
-      if (!activeSession) return false;
-      activeSession.participantsMap.set(friend.participantId, {
-        participantId: friend.participantId,
-        publicKey: friend.publicKey,
-        signingPublicKey: friend.signingPublicKey,
-        screenName: friend.screenName,
-        avatarName: friend.avatarName || 'Armando',
-        contactInfo: friend.contactInfo,
-        lastSeen: Date.now(),
-        isSelf: false,
-        status: 'online',
-        isApproved: true,
-      });
-      return activeSession.rekeyConversation();
-    },
-    [activeSession]
-  );
-
   const rekeyConversation = useCallback(async () => {
     if (!activeSession) return false;
     return activeSession.rekeyConversation();
@@ -825,6 +1153,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     addFriend,
     updateFriend,
     deleteFriend,
+    friendPresence,
+    isFriendOnline,
+    pendingInvites,
+    inviteFriendToRoom,
+    cancelPendingInvite,
+    incomingInvites,
+    acceptIncomingInvite,
+    declineIncomingInvite,
     tabs,
     activeTabId,
     openTab,
@@ -862,7 +1198,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     approveJoinRequest,
     declineJoinRequest,
     removeParticipant,
-    proactiveAddFriend,
     rekeyConversation,
     claimConversation: rekeyConversation,
     clearHistory,

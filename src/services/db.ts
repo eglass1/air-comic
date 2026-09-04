@@ -1,8 +1,8 @@
-import type { UserProfile, Friend, ChatMessage, RekeyPacket } from '../types';
+import type { UserProfile, Friend, ChatMessage, RekeyPacket, PendingInviteRecord } from '../types';
 import { generateUserKeyPair, getParticipantId } from './crypto';
 
 const DB_NAME = 'AirComicDB_v2';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export class DatabaseService {
   private dbPromise: Promise<IDBDatabase> | null = null;
@@ -53,6 +53,13 @@ export class DatabaseService {
         // Conversations metadata store
         if (!db.objectStoreNames.contains('conversations')) {
           db.createObjectStore('conversations', { keyPath: 'convId' });
+        }
+
+        // Outgoing room invites, parked until the recipient is seen online
+        if (!db.objectStoreNames.contains('invites')) {
+          const inviteStore = db.createObjectStore('invites', { keyPath: 'inviteId' });
+          inviteStore.createIndex('recipientParticipantId', 'recipientParticipantId', { unique: false });
+          inviteStore.createIndex('status', 'status', { unique: false });
         }
       };
 
@@ -331,6 +338,45 @@ export class DatabaseService {
         activeKeyId,
         updatedAt: Date.now(),
       });
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  // --- Pending Outgoing Invites ---
+
+  async getPendingInvites(): Promise<PendingInviteRecord[]> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('invites', 'readonly');
+      const store = transaction.objectStore('invites');
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const invites: PendingInviteRecord[] = request.result || [];
+        invites.sort((a, b) => a.createdAt - b.createdAt);
+        resolve(invites);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async savePendingInvite(invite: PendingInviteRecord): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('invites', 'readwrite');
+      const store = transaction.objectStore('invites');
+      const request = store.put({ ...invite, updatedAt: Date.now() });
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async deletePendingInvite(inviteId: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('invites', 'readwrite');
+      const store = transaction.objectStore('invites');
+      const request = store.delete(inviteId);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });

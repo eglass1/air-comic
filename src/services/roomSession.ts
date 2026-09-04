@@ -16,6 +16,8 @@ import type {
   RelaySocketStatus,
   RoomMode,
   PublicRoomDescriptorPacket,
+  RosterGossipPacket,
+  JoinDecisionPacket,
 } from '../types';
 import {
   generateRandomRoomSecret,
@@ -34,6 +36,10 @@ import {
   createSignedRekeyPacket,
   verifyRekeyPacketSignature,
   decryptRekeyPacket,
+  createSignedJoinDecision,
+  verifyJoinDecisionSignature,
+  createSignedStateSummary,
+  verifyStateSummarySignature,
   createEncryptedEnvelope,
   decryptEnvelope,
   normalizePublicKey,
@@ -42,6 +48,28 @@ import {
 import { getOrInitChannelTitle, getRandomChannelTitle } from '../utils/channelNameGenerator';
 import { dbService } from './db';
 import { TrysteroService } from './trystero';
+import { SIGNALING_RELAY_URLS } from './relays';
+
+/** How often we re-announce our own signed hello so relayed presence stays fresh. */
+const HELLO_REANNOUNCE_MS = 25000;
+/** No proof of life within this window and a participant is shown as offline. */
+const PARTICIPANT_STALE_MS = 90000;
+/** Non-member participants are dropped from the roster entirely after this long. */
+const PARTICIPANT_EVICT_MS = 600000;
+/** Cadence of the presence sweep / hello re-announce timer. */
+const PRESENCE_SWEEP_MS = 15000;
+/** Retry cadence for an unapproved peer waiting to be let into a private room. */
+const JOIN_REQUEST_RETRY_MS = 8000;
+const JOIN_REQUEST_MAX_ATTEMPTS = 24;
+/** Bounds on the gossip dedup ledger and the re-serve cache. */
+const MAX_TRACKED_PACKET_IDS = 4000;
+const MAX_SEEN_HELLO_NONCES = 2000;
+const MAX_CACHED_ENVELOPES = 500;
+/** History sync limits. */
+const MAX_SYNC_MESSAGE_IDS = 200;
+const MAX_CHUNK_ENVELOPES = 40;
+const MAX_CHUNKS_PER_REQUEST = 5;
+const MAX_ROSTER_HELLOS = 64;
 
 export interface RoomSessionConfig {
   tabId: string;
@@ -87,10 +115,33 @@ export class RoomSession {
 
   private approvedMembers: Set<string> = new Set();
   private processedPacketIds: Set<string> = new Set();
+  private processedPacketOrder: string[] = [];
   private pendingRequestsMap: Map<string, PendingJoinRequest> = new Map();
   private peerIdToParticipantId: Map<string, string> = new Map();
   private sentHelloPeers: Set<string> = new Set();
-  private lastJoinRequestTime: number = 0;
+
+  // Roster gossip: signed hellos are relayed verbatim so participants that cannot
+  // form a direct WebRTC link still see one another.
+  private knownHellos: Map<string, IdentityHelloPacket> = new Map();
+  private helloSeenAt: Map<string, number> = new Map();
+  private seenHelloNonces: Set<string> = new Set();
+  private seenHelloNonceOrder: string[] = [];
+  private directPeerIds: Set<string> = new Set();
+
+  // Membership decisions
+  private declinedRequesters: Set<string> = new Set();
+  private autoApproveIds: Set<string> = new Set();
+  private joinRequestAttempts: number = 0;
+
+  // History re-serve cache (packetId -> original wire envelope)
+  private envelopeCache: Map<string, EncryptedNetworkEnvelope> = new Map();
+
+  // State summaries that arrived before we knew the sender's signing key.
+  private deferredSummaries: Map<string, { packet: StateSummaryPacket; peerId: string }> = new Map();
+
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  private joinRetryTimer: ReturnType<typeof setInterval> | null = null;
+  private lastHelloBroadcastAt: number = 0;
 
   private isDestroyed: boolean = false;
   private isInitialized: boolean = false;
@@ -227,9 +278,30 @@ export class RoomSession {
     this.messages = history;
     history.forEach((m) => this.processedPacketIds.add(m.id));
 
+    // Keep the newest stored envelopes around so we can re-serve history to peers.
+    history.slice(-MAX_CACHED_ENVELOPES).forEach((m) => {
+      if (m.envelope) this.envelopeCache.set(m.id, m.envelope);
+    });
+
     // Connect signaling & WebRTC
     await this.connectTrystero();
+    this.startPresenceTimer();
+    if (this.roomMode === 'private' && !this.isApproved && !this.isSecretMissing) {
+      this.startJoinRetryTimer();
+    }
     this.notifyChange();
+  }
+
+  /** Pre-authorises a participant we invited ourselves, so their join request is granted on arrival. */
+  public setAutoApprove(participantId: string) {
+    if (!participantId) return;
+    this.autoApproveIds.add(participantId);
+    this.declinedRequesters.delete(participantId);
+  }
+
+  /** Withdraws a pre-authorisation, e.g. when the invitation is cancelled or declined. */
+  public clearAutoApprove(participantId: string) {
+    this.autoApproveIds.delete(participantId);
   }
 
   public updateProfile(updated: UserProfile) {
@@ -249,8 +321,8 @@ export class RoomSession {
     this.notifyChange();
   }
 
-  public async broadcastHello(): Promise<void> {
-    if (!this.profile || !this.signingPrivateKey || !this.trysteroService) return;
+  private async buildHello(): Promise<IdentityHelloPacket | null> {
+    if (!this.profile || !this.signingPrivateKey || !this.trysteroService) return null;
     try {
       const hello = await createSignedHello(
         this.convId,
@@ -264,10 +336,28 @@ export class RoomSession {
         this.profile.avatarName || 'Armando',
         this.roomMode
       );
-      this.trysteroService.sendHello(hello);
+      // Keep our own announcement in the roster so peers relaying for us stay current.
+      this.knownHellos.set(hello.participantId, hello);
+      this.helloSeenAt.set(hello.participantId, Date.now());
+      this.rememberHelloNonce(hello.nonce);
+      return hello;
     } catch (err) {
-      console.warn('Failed to broadcast updated hello:', err);
+      console.warn('Failed to build signed hello:', err);
+      return null;
     }
+  }
+
+  public async broadcastHello(): Promise<void> {
+    const hello = await this.buildHello();
+    if (!hello || !this.trysteroService) return;
+    this.lastHelloBroadcastAt = Date.now();
+    this.trysteroService.sendHello(hello);
+  }
+
+  private async sendHelloTo(peerId: string): Promise<void> {
+    const hello = await this.buildHello();
+    if (!hello || !this.trysteroService) return;
+    this.trysteroService.sendHello(hello, peerId);
   }
 
   private async connectTrystero() {
@@ -290,13 +380,21 @@ export class RoomSession {
       this.trysteroService = null;
     }
 
-    this.trysteroService = new TrysteroService(signalingRoomId, signalingPassword);
+    // Transport peer ids do not survive a reconnect.
+    this.directPeerIds.clear();
+    this.sentHelloPeers.clear();
+    this.peerIdToParticipantId.clear();
+
+    this.trysteroService = new TrysteroService(signalingRoomId, signalingPassword, SIGNALING_RELAY_URLS);
 
     this.trysteroService.setOnPeerJoin((peerId) => this.handlePeerJoin(peerId));
     this.trysteroService.setOnPeerLeave((peerId) => this.handlePeerLeave(peerId));
     this.trysteroService.setOnHello((packet, peerId) => this.handleIncomingHello(packet, peerId));
     this.trysteroService.setOnControl((envelope, peerId) => this.handleIncomingControl(envelope, peerId));
     this.trysteroService.setOnChat((envelope, peerId) => this.handleIncomingChat(envelope, peerId));
+    this.trysteroService.setOnStateSummary((packet, peerId) => this.handleStateSummary(packet, peerId));
+    this.trysteroService.setOnStateRequest((packet, peerId) => this.handleStateRequest(packet, peerId));
+    this.trysteroService.setOnStateChunk((packet, peerId) => this.handleStateChunk(packet, peerId));
 
     this.trysteroService.setOnRelayStatusChange((statuses) => {
       this.relayStatuses = statuses;
@@ -322,138 +420,370 @@ export class RoomSession {
 
   private async handlePeerJoin(peerId: string) {
     if (!this.profile || !this.signingPrivateKey || !this.trysteroService) return;
+    this.directPeerIds.add(peerId);
     this.connectedPeersCount = this.trysteroService.getConnectedPeers().length;
     this.relayStatuses = this.trysteroService.getRelayStatuses();
 
     if (!this.sentHelloPeers.has(peerId)) {
       this.sentHelloPeers.add(peerId);
-      try {
-        const hello = await createSignedHello(
-          this.convId,
-          this.trysteroService.selfPeerId,
-          this.profile.participantId,
-          this.profile.screenName,
-          this.profile.publicKeyBase64,
-          this.profile.signingPublicKeyBase64,
-          this.signingPrivateKey,
-          this.roomMode === 'public' ? undefined : this.profile.contactInfo,
-          this.profile.avatarName || 'Armando',
-          this.roomMode
-        );
-        this.trysteroService.sendHello(hello, peerId);
-      } catch (err) {
-        console.warn('Failed to send signed hello on peer join:', err);
-      }
+      await this.sendHelloTo(peerId);
     }
 
+    // Hand the newcomer the roster and our history summary straight away, so they
+    // see everyone already in the room instead of only the peers they reach directly.
+    await this.sendRosterTo(this.freshHellos(), [peerId]);
+    await this.sendStateSummaryTo(peerId);
+
     if (!this.isApproved && this.roomMode === 'private') {
-      const now = Date.now();
-      if (now - this.lastJoinRequestTime > 4000) {
-        this.lastJoinRequestTime = now;
-        this.sendJoinRequest();
-      }
+      await this.sendJoinRequest(peerId);
     }
     this.notifyChange();
   }
 
   private handlePeerLeave(peerId: string) {
     if (!this.trysteroService) return;
+    this.directPeerIds.delete(peerId);
     this.connectedPeersCount = this.trysteroService.getConnectedPeers().length;
     this.relayStatuses = this.trysteroService.getRelayStatuses();
     this.sentHelloPeers.delete(peerId);
 
     const partId = this.peerIdToParticipantId.get(peerId);
+    this.peerIdToParticipantId.delete(peerId);
     if (partId) {
       const existing = this.participantsMap.get(partId);
       if (existing) {
         this.participantsMap.set(partId, { ...existing, status: 'offline' });
       }
+      // Drop the cached announcement: if they are still in the room behind another
+      // peer, the next relayed hello counts as fresh news and brings them back.
+      this.knownHellos.delete(partId);
+      this.helloSeenAt.delete(partId);
     }
     this.notifyChange();
   }
 
-  private async handleIncomingHello(hello: IdentityHelloPacket, rawPeerId: string) {
-    if (hello.convId !== this.convId) return;
-    const valid = await verifyHelloSignature(hello);
-    if (!valid) return;
+  // --------------------------------------------------------------------------
+  // Roster gossip
+  // --------------------------------------------------------------------------
 
-    this.peerIdToParticipantId.set(rawPeerId, hello.participantId);
-    const isApprovedParticipant = this.roomMode === 'public' || this.approvedMembers.has(hello.participantId);
+  private rememberHelloNonce(nonce: string) {
+    if (this.seenHelloNonces.has(nonce)) return;
+    this.seenHelloNonces.add(nonce);
+    this.seenHelloNonceOrder.push(nonce);
+    if (this.seenHelloNonceOrder.length > MAX_SEEN_HELLO_NONCES) {
+      const evicted = this.seenHelloNonceOrder.splice(0, this.seenHelloNonceOrder.length - MAX_SEEN_HELLO_NONCES);
+      evicted.forEach((n) => this.seenHelloNonces.delete(n));
+    }
+  }
+
+  /**
+   * Validates and records a hello that arrived either directly or via a relaying
+   * peer. Returns 'new' only for announcements we have not seen before, which is
+   * what bounds the gossip flood (every hello carries a random nonce).
+   */
+  private async ingestHello(hello: IdentityHelloPacket, viaPeerId: string): Promise<'new' | 'stale' | 'invalid'> {
+    if (!hello || hello.convId !== this.convId || !hello.nonce) return 'invalid';
+    if (this.seenHelloNonces.has(hello.nonce)) return 'stale';
+    if (!(await verifyHelloSignature(hello))) return 'invalid';
+
+    this.rememberHelloNonce(hello.nonce);
+
+    const existing = this.knownHellos.get(hello.participantId);
+    if (!existing || hello.timestamp >= existing.timestamp) {
+      this.knownHellos.set(hello.participantId, hello);
+    }
+    this.helloSeenAt.set(hello.participantId, Date.now());
+
+    if (hello.participantId === this.profile?.participantId) return 'stale';
+
+    // hello.peerId is signed by the sender, so a matching transport peer id proves
+    // this arrived over a direct link rather than through a relay.
+    if (hello.peerId === viaPeerId) {
+      this.peerIdToParticipantId.set(viaPeerId, hello.participantId);
+    }
+
+    const previous = this.participantsMap.get(hello.participantId);
+    const isApprovedParticipant =
+      this.roomMode === 'public' || this.approvedMembers.has(hello.participantId) || previous?.isApproved === true;
 
     this.participantsMap.set(hello.participantId, {
       participantId: hello.participantId,
-      peerId: rawPeerId,
+      peerId: hello.peerId,
       publicKey: normalizePublicKey(hello.publicKey),
       signingPublicKey: normalizePublicKey(hello.signingPublicKey),
       screenName: hello.screenName,
       avatarName: hello.avatarName || 'Armando',
-      contactInfo: hello.contactInfo,
+      contactInfo: hello.contactInfo ?? previous?.contactInfo,
       lastSeen: Date.now(),
-      isSelf: hello.participantId === this.profile?.participantId,
+      isSelf: false,
       status: 'online',
       isApproved: isApprovedParticipant,
     });
 
-    if (!this.sentHelloPeers.has(rawPeerId) && this.profile && this.signingPrivateKey && this.trysteroService) {
-      this.sentHelloPeers.add(rawPeerId);
-      createSignedHello(
-        this.convId,
-        this.trysteroService.selfPeerId,
-        this.profile.participantId,
-        this.profile.screenName,
-        this.profile.publicKeyBase64,
-        this.profile.signingPublicKeyBase64,
-        this.signingPrivateKey,
-        this.roomMode === 'public' ? undefined : this.profile.contactInfo,
-        this.profile.avatarName || 'Armando',
-        this.roomMode
-      ).then((h) => this.trysteroService?.sendHello(h, rawPeerId)).catch(() => {});
+    const deferred = this.deferredSummaries.get(hello.participantId);
+    if (deferred) {
+      this.deferredSummaries.delete(hello.participantId);
+      this.handleStateSummary(deferred.packet, deferred.peerId);
     }
 
-    // If we are approved / owner, synchronize channel title to newly joined peer
-    if (this.isApproved && this.profile && this.trysteroService) {
-      const titleKey = this.roomMode === 'public'
-        ? this.keysMap.get('public-v2')?.key
-        : this.rootKey;
-      const titleKeyId = this.roomMode === 'public' ? 'public-v2' : 'root-v2';
+    return 'new';
+  }
 
-      if (titleKey && this.channelTitle) {
-        const titlePacket: ChannelTitlePacket = {
-          type: 'channel_title',
-          protocol: 'airthread/2',
-          convId: this.convId,
-          title: this.channelTitle,
-          setterId: this.profile.participantId,
-          setterScreenName: this.profile.screenName,
-          timestamp: Date.now(),
-        };
-        createEncryptedEnvelope(
-          titleKey,
-          this.convId,
-          crypto.randomUUID(),
-          titleKeyId,
-          this.profile.participantId,
-          JSON.stringify(titlePacket),
-          titlePacket.timestamp
-        ).then((env) => {
-          this.trysteroService?.sendControl(env, rawPeerId);
-        }).catch((err) => {
-          console.warn('Failed to sync channel title on peer hello:', err);
-        });
+  /** Announcements we have seen recently enough to be worth passing on. */
+  private freshHellos(): IdentityHelloPacket[] {
+    const now = Date.now();
+    const result: IdentityHelloPacket[] = [];
+    for (const [participantId, hello] of this.knownHellos.entries()) {
+      const seenAt = this.helloSeenAt.get(participantId) ?? 0;
+      if (now - seenAt <= PARTICIPANT_STALE_MS) result.push(hello);
+    }
+    return result.slice(0, MAX_ROSTER_HELLOS);
+  }
+
+  private async sendRosterTo(hellos: IdentityHelloPacket[], targets?: string[], exclude: string[] = []) {
+    if (hellos.length === 0) return;
+    const packet: RosterGossipPacket = {
+      type: 'roster',
+      protocol: 'airthread/2',
+      convId: this.convId,
+      hellos: hellos.slice(0, MAX_ROSTER_HELLOS),
+      timestamp: Date.now(),
+    };
+    await this.sendControlPacket(packet, targets, exclude);
+  }
+
+  private async handleIncomingHello(hello: IdentityHelloPacket, rawPeerId: string) {
+    const result = await this.ingestHello(hello, rawPeerId);
+    if (result === 'invalid') return;
+
+    const isDirect = hello.peerId === rawPeerId;
+
+    if (isDirect && !this.sentHelloPeers.has(rawPeerId)) {
+      this.sentHelloPeers.add(rawPeerId);
+      await this.sendHelloTo(rawPeerId);
+    }
+
+    if (result === 'new') {
+      // Pass it on to everyone else we can reach; peers that already saw this
+      // nonce drop it, so the flood terminates.
+      await this.sendRosterTo([hello], undefined, [rawPeerId, hello.peerId]);
+    }
+
+    if (isDirect) {
+      await this.syncChannelTitleTo(rawPeerId);
+      await this.sendStateSummaryTo(rawPeerId);
+      if (!this.isApproved && this.roomMode === 'private') {
+        await this.sendJoinRequest(rawPeerId);
       }
     }
 
-    // If we are not approved in a private room, send join request
-    if (!this.isApproved && this.roomMode === 'private') {
-      this.sendJoinRequest();
+    if (result === 'new') this.notifyChange();
+  }
+
+  private async handleRosterPacket(packet: RosterGossipPacket, viaPeerId: string) {
+    if (packet.convId !== this.convId || !Array.isArray(packet.hellos)) return;
+
+    const learned: IdentityHelloPacket[] = [];
+    for (const hello of packet.hellos.slice(0, MAX_ROSTER_HELLOS)) {
+      if ((await this.ingestHello(hello, viaPeerId)) === 'new') learned.push(hello);
     }
 
+    if (learned.length > 0) {
+      await this.sendRosterTo(learned, undefined, [viaPeerId]);
+      this.notifyChange();
+    }
+  }
+
+  /** Mirrors our channel title to a peer that just introduced itself. */
+  private async syncChannelTitleTo(peerId: string) {
+    if (!this.isApproved || !this.profile || !this.channelTitle) return;
+    const titlePacket: ChannelTitlePacket = {
+      type: 'channel_title',
+      protocol: 'airthread/2',
+      convId: this.convId,
+      title: this.channelTitle,
+      setterId: this.profile.participantId,
+      setterScreenName: this.profile.screenName,
+      timestamp: Date.now(),
+    };
+    await this.sendControlPacket(titlePacket, [peerId]);
+  }
+
+  // --------------------------------------------------------------------------
+  // Gossip plumbing
+  // --------------------------------------------------------------------------
+
+  /** Bounded dedup ledger. Returns false when this packet has already been handled. */
+  private markProcessed(packetId: string): boolean {
+    if (!packetId || this.processedPacketIds.has(packetId)) return false;
+    this.processedPacketIds.add(packetId);
+    this.processedPacketOrder.push(packetId);
+    if (this.processedPacketOrder.length > MAX_TRACKED_PACKET_IDS) {
+      const evicted = this.processedPacketOrder.splice(0, this.processedPacketOrder.length - MAX_TRACKED_PACKET_IDS);
+      evicted.forEach((id) => this.processedPacketIds.delete(id));
+    }
+    return true;
+  }
+
+  private rememberEnvelope(envelope: EncryptedNetworkEnvelope) {
+    if (this.envelopeCache.has(envelope.packetId)) return;
+    this.envelopeCache.set(envelope.packetId, envelope);
+    while (this.envelopeCache.size > MAX_CACHED_ENVELOPES) {
+      const oldest = this.envelopeCache.keys().next();
+      if (oldest.done) break;
+      this.envelopeCache.delete(oldest.value);
+    }
+  }
+
+  private get controlKey(): CryptoKey | null {
+    return this.roomMode === 'public' ? this.keysMap.get('public-v2')?.key ?? null : this.rootKey;
+  }
+
+  private get controlKeyId(): string {
+    return this.roomMode === 'public' ? 'public-v2' : 'root-v2';
+  }
+
+  /**
+   * Encrypts and dispatches a control packet. With no explicit targets this is a
+   * room-wide broadcast; `exclude` skips individual peers when relaying.
+   */
+  private async sendControlPacket(
+    packet: { timestamp?: number },
+    targets?: string[],
+    exclude: string[] = [],
+    packetId?: string
+  ): Promise<boolean> {
+    const key = this.controlKey;
+    if (!key || !this.profile || !this.trysteroService) return false;
+
+    try {
+      const envelope = await createEncryptedEnvelope(
+        key,
+        this.convId,
+        packetId || crypto.randomUUID(),
+        this.controlKeyId,
+        this.profile.participantId,
+        JSON.stringify(packet),
+        packet.timestamp || Date.now()
+      );
+      // Claim our own packet id so a relayed copy coming back is ignored.
+      this.markProcessed(envelope.packetId);
+
+      if (!targets && exclude.length === 0) {
+        this.trysteroService.sendControl(envelope);
+        return true;
+      }
+
+      const peerIds = targets ?? this.trysteroService.getConnectedPeers();
+      for (const peerId of peerIds) {
+        if (exclude.includes(peerId)) continue;
+        this.trysteroService.sendControl(envelope, peerId);
+      }
+      return true;
+    } catch (err) {
+      console.warn('Failed to send control packet:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Re-sends a packet we just accepted to every other peer we can reach. Recipients
+   * dedupe on packet id, so the room stays consistent even when the WebRTC mesh is
+   * only partially connected — which is the normal case behind symmetric NATs.
+   */
+  private forwardEnvelope(kind: 'chat' | 'control', envelope: EncryptedNetworkEnvelope, exceptPeerId?: string) {
+    if (!this.trysteroService) return;
+    for (const peerId of this.trysteroService.getConnectedPeers()) {
+      if (peerId === exceptPeerId) continue;
+      if (kind === 'chat') this.trysteroService.sendChat(envelope, peerId);
+      else this.trysteroService.sendControl(envelope, peerId);
+    }
+  }
+
+  /** Inserts in timestamp order so back-filled history lands in the right place. */
+  private insertMessage(msg: ChatMessage, isBackfill: boolean) {
+    if (this.messages.some((m) => m.id === msg.id)) return;
+
+    let index = this.messages.length;
+    while (index > 0 && this.messages[index - 1].timestamp > msg.timestamp) index--;
+    this.messages.splice(index, 0, msg);
+
+    dbService.saveMessage(msg).catch((err) => console.warn('Failed to persist message:', err));
+    if (isBackfill) return;
+    this.onNewMessageCb?.(this, msg);
     this.notifyChange();
   }
 
-  private async handleIncomingChat(envelope: EncryptedNetworkEnvelope, rawPeerId: string) {
-    if (this.processedPacketIds.has(envelope.packetId)) return;
-    this.processedPacketIds.add(envelope.packetId);
+  // --------------------------------------------------------------------------
+  // Presence maintenance
+  // --------------------------------------------------------------------------
+
+  private startPresenceTimer() {
+    this.stopPresenceTimer();
+    this.presenceTimer = setInterval(() => {
+      if (this.isDestroyed) return;
+      if (Date.now() - this.lastHelloBroadcastAt >= HELLO_REANNOUNCE_MS) {
+        this.broadcastHello();
+      }
+      this.pruneStaleParticipants();
+    }, PRESENCE_SWEEP_MS);
+  }
+
+  private stopPresenceTimer() {
+    if (this.presenceTimer) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+  }
+
+  private pruneStaleParticipants() {
+    const now = Date.now();
+    let changed = false;
+
+    for (const [participantId, participant] of this.participantsMap.entries()) {
+      if (participant.isSelf) continue;
+      if (participant.peerId && this.directPeerIds.has(participant.peerId)) continue;
+
+      const lastProof = this.helloSeenAt.get(participantId) ?? participant.lastSeen;
+      if (now - lastProof > PARTICIPANT_EVICT_MS && !this.approvedMembers.has(participantId)) {
+        this.participantsMap.delete(participantId);
+        this.knownHellos.delete(participantId);
+        this.helloSeenAt.delete(participantId);
+        changed = true;
+      } else if (now - lastProof > PARTICIPANT_STALE_MS && participant.status !== 'offline') {
+        this.participantsMap.set(participantId, { ...participant, status: 'offline' });
+        changed = true;
+      }
+    }
+
+    if (changed) this.notifyChange();
+  }
+
+  private startJoinRetryTimer() {
+    if (this.joinRetryTimer || this.roomMode !== 'private') return;
+    this.joinRetryTimer = setInterval(() => {
+      if (this.isDestroyed || this.isApproved || this.joinRequestAttempts >= JOIN_REQUEST_MAX_ATTEMPTS) {
+        this.stopJoinRetryTimer();
+        return;
+      }
+      this.sendJoinRequest();
+    }, JOIN_REQUEST_RETRY_MS);
+  }
+
+  private stopJoinRetryTimer() {
+    if (this.joinRetryTimer) {
+      clearInterval(this.joinRetryTimer);
+      this.joinRetryTimer = null;
+    }
+  }
+
+  private async handleIncomingChat(
+    envelope: EncryptedNetworkEnvelope,
+    rawPeerId: string,
+    isBackfill: boolean = false
+  ) {
+    if (envelope.convId !== this.convId) return;
+    if (!this.markProcessed(envelope.packetId)) return;
 
     if (this.roomMode === 'public') {
       try {
@@ -485,12 +815,12 @@ export class RoomSession {
           emotion: payload.emotion,
           emotionIntensity: payload.emotionIntensity,
           balloonMode: payload.balloonMode,
+          envelope,
         };
 
-        this.messages.push(chatMsg);
-        await dbService.saveMessage(chatMsg);
-        this.onNewMessageCb?.(this, chatMsg);
-        this.notifyChange();
+        this.rememberEnvelope(envelope);
+        this.insertMessage(chatMsg, isBackfill);
+        if (!isBackfill) this.forwardEnvelope('chat', envelope, rawPeerId);
       } catch (err) {
         console.warn('Failed to parse public chat message:', err);
       }
@@ -524,20 +854,20 @@ export class RoomSession {
         emotion: payload.emotion,
         emotionIntensity: payload.emotionIntensity,
         balloonMode: payload.balloonMode,
+        envelope,
       };
 
-      this.messages.push(chatMsg);
-      await dbService.saveMessage(chatMsg);
-      this.onNewMessageCb?.(this, chatMsg);
-      this.notifyChange();
+      this.rememberEnvelope(envelope);
+      this.insertMessage(chatMsg, isBackfill);
+      if (!isBackfill) this.forwardEnvelope('chat', envelope, rawPeerId);
     } catch (err) {
       console.warn('Decryption failed for chat message:', err);
     }
   }
 
   private async handleIncomingControl(envelope: EncryptedNetworkEnvelope, rawPeerId: string) {
-    if (this.processedPacketIds.has(envelope.packetId)) return;
-    this.processedPacketIds.add(envelope.packetId);
+    if (envelope.convId !== this.convId) return;
+    if (!this.markProcessed(envelope.packetId)) return;
 
     const keyRec = this.roomMode === 'public'
       ? this.keysMap.get('public-v2')
@@ -545,85 +875,276 @@ export class RoomSession {
 
     if (!keyRec) return;
 
+    let packet: any;
     try {
-      const plaintext = await decryptEnvelope(keyRec.key, envelope);
-      const packet = JSON.parse(plaintext);
+      packet = JSON.parse(await decryptEnvelope(keyRec.key, envelope));
+    } catch (err) {
+      console.warn('Failed to decrypt control packet:', err);
+      return;
+    }
 
-      if (packet.type === 'channel_title') {
-        const titlePacket = packet as ChannelTitlePacket;
-        if (titlePacket.convId === this.convId && titlePacket.title?.trim()) {
-          const clean = titlePacket.title.trim();
-          this.channelTitle = clean;
-          if (typeof localStorage !== 'undefined') {
-            localStorage.setItem(`aircomic_channel_title_${this.convId}`, clean);
-          }
-          this.notifyChange();
-        }
-      } else if (packet.type === 'join_request') {
-        const req: JoinRequestPacket = packet as JoinRequestPacket;
-        if (req.convId !== this.convId) return;
+    // Roster gossip is regenerated locally rather than relayed verbatim; everything
+    // else is passed along so members behind a partial mesh still converge. Only
+    // packets that verified are relayed, so bad input is never amplified.
+    let shouldForward = false;
 
-        const valid = await verifyJoinRequestSignature(req);
-        if (!valid) return;
-
-        const reqSenderId = req.sender.participantId;
-        if (reqSenderId === this.profile?.participantId) return;
-        if (this.approvedMembers.has(reqSenderId)) return;
-
-        this.pendingRequestsMap.set(reqSenderId, {
-          requestId: req.requestId,
-          sender: req.sender,
-          timestamp: req.timestamp,
-          verified: true,
-        });
-        this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
-        this.notifyChange();
-      } else if (packet.type === 'key') {
-        const rekey = packet as RekeyPacket;
-        if (rekey.convId !== this.convId || !this.privateKey) return;
-        const valid = await verifyRekeyPacketSignature(rekey);
-        if (!valid) return;
-
-        const myParticipantId = this.profile?.participantId;
-        if (!myParticipantId) return;
-
-        const myEncryptedKey = rekey.keys ? rekey.keys[myParticipantId] : null;
-        if (myEncryptedKey) {
-          const decryptedKey = await decryptRekeyPacket(rekey, myParticipantId, this.privateKey);
-          if (decryptedKey) {
-            const newKeyRec: KeyRecord = {
-              keyId: rekey.keyId,
-              epoch: rekey.epoch,
-              createdAt: rekey.timestamp,
-              key: decryptedKey.key,
-              signerId: rekey.signerId,
-              members: rekey.members || [],
-            };
-            this.keysMap.set(rekey.keyId, newKeyRec);
-            this.activeKeyId = rekey.keyId;
-            this.activeEpoch = rekey.epoch;
-            this.isApproved = true;
-
-            (rekey.members || []).forEach((memberId) => {
-              this.approvedMembers.add(memberId);
-              const p = this.participantsMap.get(memberId);
-              if (p) this.participantsMap.set(memberId, { ...p, isApproved: true });
-            });
-
-            this.pendingJoinRequests = [];
-            this.pendingRequestsMap.clear();
-            this.notifyChange();
-          }
-        }
+    try {
+      switch (packet.type) {
+        case 'channel_title':
+          shouldForward = this.applyChannelTitle(packet as ChannelTitlePacket);
+          break;
+        case 'join_request':
+          shouldForward = await this.handleJoinRequestPacket(packet as JoinRequestPacket);
+          break;
+        case 'join_decision':
+          shouldForward = await this.handleJoinDecisionPacket(packet as JoinDecisionPacket);
+          break;
+        case 'key':
+          shouldForward = await this.handleRekeyPacket(packet as RekeyPacket);
+          break;
+        case 'roster':
+          await this.handleRosterPacket(packet as RosterGossipPacket, rawPeerId);
+          break;
+        default:
+          break;
       }
     } catch (err) {
       console.warn('Failed to handle control packet:', err);
+      return;
+    }
+
+    if (shouldForward) this.forwardEnvelope('control', envelope, rawPeerId);
+  }
+
+  private applyChannelTitle(titlePacket: ChannelTitlePacket): boolean {
+    if (titlePacket.convId !== this.convId || !titlePacket.title?.trim()) return false;
+    const clean = titlePacket.title.trim();
+    // Already applied: accept it but stop the relay here to avoid ping-ponging.
+    if (clean === this.channelTitle) return false;
+
+    this.channelTitle = clean;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(`aircomic_channel_title_${this.convId}`, clean);
+    }
+    this.notifyChange();
+    return true;
+  }
+
+  private async handleJoinRequestPacket(req: JoinRequestPacket): Promise<boolean> {
+    if (req.convId !== this.convId) return false;
+    if (!(await verifyJoinRequestSignature(req))) return false;
+
+    const senderId = req.sender.participantId;
+    // Still worth relaying: another member may not have a direct link to them.
+    if (senderId === this.profile?.participantId) return false;
+    if (this.approvedMembers.has(senderId)) return true;
+    // Only members of the room get to see (and act on) entry requests.
+    if (!this.isApproved) return true;
+
+    const pending: PendingJoinRequest = {
+      requestId: req.requestId,
+      sender: req.sender,
+      timestamp: req.timestamp,
+      verified: true,
+    };
+
+    // Someone we invited ourselves: admit them without prompting.
+    if (this.autoApproveIds.has(senderId)) {
+      this.autoApproveIds.delete(senderId);
+      this.pendingRequestsMap.set(senderId, pending);
+      this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
+      await this.approveJoinRequest(req.requestId);
+      return true;
+    }
+
+    if (!this.declinedRequesters.has(senderId)) {
+      this.pendingRequestsMap.set(senderId, pending);
+      this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
+      this.notifyChange();
+    }
+    return true;
+  }
+
+  /** Another member admitted this person, so take the prompt off our screen too. */
+  private async handleJoinDecisionPacket(packet: JoinDecisionPacket): Promise<boolean> {
+    if (packet.convId !== this.convId) return false;
+    if (packet.decision !== 'approved') return false;
+    if (!(await verifyJoinDecisionSignature(packet))) return false;
+    if (this.roomMode === 'private' && !this.approvedMembers.has(packet.deciderId)) return false;
+    if (packet.targetParticipantId === this.profile?.participantId) return true;
+
+    this.approvedMembers.add(packet.targetParticipantId);
+    this.declinedRequesters.delete(packet.targetParticipantId);
+
+    const participant = this.participantsMap.get(packet.targetParticipantId);
+    if (participant) {
+      this.participantsMap.set(packet.targetParticipantId, { ...participant, isApproved: true });
+    }
+
+    if (this.pendingRequestsMap.delete(packet.targetParticipantId)) {
+      this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
+    }
+    this.notifyChange();
+    return true;
+  }
+
+  private async handleRekeyPacket(rekey: RekeyPacket): Promise<boolean> {
+    if (rekey.convId !== this.convId || !this.privateKey) return false;
+    if (!(await verifyRekeyPacketSignature(rekey))) return false;
+
+    const myParticipantId = this.profile?.participantId;
+    if (!myParticipantId) return false;
+
+    dbService.saveRekeyPacket(rekey).catch(() => {});
+
+    // Relay it regardless: members we can reach may not reach the signer directly.
+    const myEncryptedKey = rekey.keys ? rekey.keys[myParticipantId] : null;
+    if (!myEncryptedKey) return true;
+
+    const decryptedKey = await decryptRekeyPacket(rekey, myParticipantId, this.privateKey);
+    if (!decryptedKey) return true;
+
+    const newKeyRec: KeyRecord = {
+      keyId: rekey.keyId,
+      epoch: rekey.epoch,
+      createdAt: rekey.timestamp,
+      key: decryptedKey.key,
+      signerId: rekey.signerId,
+      members: rekey.members || [],
+    };
+    this.keysMap.set(rekey.keyId, newKeyRec);
+
+    // Gossip can deliver epochs out of order; never step backwards onto an older key.
+    if (rekey.epoch >= this.activeEpoch) {
+      this.activeKeyId = rekey.keyId;
+      this.activeEpoch = rekey.epoch;
+    }
+
+    this.isApproved = true;
+    this.stopJoinRetryTimer();
+
+    (rekey.members || []).forEach((memberId) => {
+      this.approvedMembers.add(memberId);
+      this.declinedRequesters.delete(memberId);
+      this.pendingRequestsMap.delete(memberId);
+      const p = this.participantsMap.get(memberId);
+      if (p) this.participantsMap.set(memberId, { ...p, isApproved: true });
+    });
+
+    const self = this.participantsMap.get(myParticipantId);
+    if (self) this.participantsMap.set(myParticipantId, { ...self, isApproved: true });
+
+    this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
+    this.notifyChange();
+    return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // History synchronisation
+  // --------------------------------------------------------------------------
+
+  private async sendStateSummaryTo(peerId: string) {
+    if (!this.profile || !this.signingPrivateKey || !this.trysteroService) return;
+    if (this.roomMode === 'private' && !this.isApproved) return;
+
+    try {
+      const recentMessageIds = this.messages.slice(-MAX_SYNC_MESSAGE_IDS).map((m) => m.id);
+      const newest = this.messages.length ? this.messages[this.messages.length - 1].timestamp : 0;
+
+      const summary = await createSignedStateSummary(
+        this.convId,
+        this.profile.participantId,
+        this.activeEpoch,
+        this.activeKeyId,
+        '',
+        [],
+        newest,
+        this.messages.length,
+        this.signingPrivateKey,
+        recentMessageIds
+      );
+
+      this.trysteroService.sendStateSummary(summary, peerId);
+    } catch (err) {
+      console.warn('Failed to send state summary:', err);
     }
   }
 
-  public async sendJoinRequest(): Promise<boolean> {
+  private async handleStateSummary(packet: StateSummaryPacket, peerId: string) {
+    if (packet.convId !== this.convId || !this.profile || !this.trysteroService) return;
+
+    const sender = this.participantsMap.get(packet.participantId);
+    if (!sender?.signingPublicKey) {
+      // Their hello has not landed yet; replay this once we can verify it.
+      this.deferredSummaries.set(packet.participantId, { packet, peerId });
+      return;
+    }
+    if (!(await verifyStateSummarySignature(packet, sender.signingPublicKey))) return;
+
+    const wantedMessageIds = (packet.recentMessageIds || [])
+      .filter((id) => !this.processedPacketIds.has(id))
+      .slice(0, MAX_SYNC_MESSAGE_IDS);
+
+    if (wantedMessageIds.length === 0) return;
+
+    const request: StateRequestPacket = {
+      type: 'state_request',
+      protocol: 'airthread/2',
+      convId: this.convId,
+      requesterId: this.profile.participantId,
+      wantedControlPacketIds: [],
+      wantedMessageIds,
+      timestamp: Date.now(),
+    };
+    this.trysteroService.sendStateRequest(request, peerId);
+  }
+
+  private async handleStateRequest(packet: StateRequestPacket, peerId: string) {
+    if (packet.convId !== this.convId || !this.profile || !this.trysteroService) return;
+    if (this.roomMode === 'private' && !this.approvedMembers.has(packet.requesterId)) return;
+
+    const wanted = packet.wantedMessageIds || [];
+    if (wanted.length === 0) return;
+
+    const available: EncryptedNetworkEnvelope[] = [];
+    for (const id of wanted) {
+      const envelope = this.envelopeCache.get(id) || this.messages.find((m) => m.id === id)?.envelope;
+      if (envelope) available.push(envelope);
+    }
+    if (available.length === 0) return;
+
+    for (let i = 0; i < available.length && i < MAX_CHUNK_ENVELOPES * MAX_CHUNKS_PER_REQUEST; i += MAX_CHUNK_ENVELOPES) {
+      const chunk: StateChunkPacket = {
+        type: 'state_chunk',
+        protocol: 'airthread/2',
+        convId: this.convId,
+        responderId: this.profile.participantId,
+        controlPackets: [],
+        messageEnvelopes: available.slice(i, i + MAX_CHUNK_ENVELOPES),
+        timestamp: Date.now(),
+      };
+      this.trysteroService.sendStateChunk(chunk, peerId);
+    }
+  }
+
+  private async handleStateChunk(packet: StateChunkPacket, peerId: string) {
+    if (packet.convId !== this.convId) return;
+    for (const envelope of packet.messageEnvelopes || []) {
+      await this.handleIncomingChat(envelope, peerId, true);
+    }
+    this.notifyChange();
+  }
+
+  // --------------------------------------------------------------------------
+  // Membership
+  // --------------------------------------------------------------------------
+
+  public async sendJoinRequest(targetPeerId?: string): Promise<boolean> {
     if (!this.profile || !this.signingPrivateKey || !this.rootKey || !this.trysteroService) return false;
+    if (this.isApproved || this.roomMode !== 'private') return false;
+
     try {
+      this.joinRequestAttempts += 1;
       const req = await createSignedJoinRequest(
         this.convId,
         this.profile.participantId,
@@ -634,18 +1155,12 @@ export class RoomSession {
         this.profile.contactInfo
       );
 
-      const envelope = await createEncryptedEnvelope(
-        this.rootKey,
-        this.convId,
-        req.requestId,
-        'root-v2',
-        this.profile.participantId,
-        JSON.stringify(req),
-        req.timestamp
+      return await this.sendControlPacket(
+        req,
+        targetPeerId ? [targetPeerId] : undefined,
+        [],
+        req.requestId
       );
-
-      this.trysteroService.sendControl(envelope);
-      return true;
     } catch (err) {
       console.warn('Failed to send join request:', err);
       return false;
@@ -656,30 +1171,76 @@ export class RoomSession {
     const req = this.pendingJoinRequests.find((r) => r.requestId === requestId);
     if (!req || !this.profile || !this.signingPrivateKey) return false;
 
-    this.pendingJoinRequests = this.pendingJoinRequests.filter((r) => r.requestId !== requestId);
-    this.pendingRequestsMap.delete(req.sender.participantId);
-    this.approvedMembers.add(req.sender.participantId);
+    const targetId = req.sender.participantId;
+    this.pendingRequestsMap.delete(targetId);
+    this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
+    this.approvedMembers.add(targetId);
+    this.declinedRequesters.delete(targetId);
 
-    const existingPart = this.participantsMap.get(req.sender.participantId);
-    if (existingPart) {
-      this.participantsMap.set(req.sender.participantId, { ...existingPart, isApproved: true });
-    }
+    // Take key material straight from the signed request: the rekey below only
+    // carries an epoch key for participants present in the map.
+    const existing = this.participantsMap.get(targetId);
+    this.participantsMap.set(targetId, {
+      participantId: targetId,
+      peerId: existing?.peerId,
+      publicKey: normalizePublicKey(req.sender.publicKey),
+      signingPublicKey: normalizePublicKey(req.sender.signingPublicKey),
+      screenName: req.sender.screenName,
+      avatarName: existing?.avatarName || 'Armando',
+      contactInfo: req.sender.contactInfo ?? existing?.contactInfo,
+      lastSeen: Date.now(),
+      isSelf: false,
+      status: existing?.status || 'online',
+      isApproved: true,
+    });
 
-    return this.rekeyConversation();
+    const ok = await this.rekeyConversation();
+    // Clear the prompt on every other member's screen, including those that could
+    // not decrypt the rekey packet themselves.
+    await this.broadcastJoinDecision(req.requestId, targetId, 'approved');
+    return ok;
   }
 
   public declineJoinRequest(requestId: string): void {
     const req = this.pendingJoinRequests.find((r) => r.requestId === requestId);
     if (req) {
+      // Local only: another member may still want to admit them.
+      this.declinedRequesters.add(req.sender.participantId);
       this.pendingRequestsMap.delete(req.sender.participantId);
     }
-    this.pendingJoinRequests = this.pendingJoinRequests.filter((r) => r.requestId !== requestId);
+    this.pendingJoinRequests = Array.from(this.pendingRequestsMap.values());
     this.notifyChange();
+  }
+
+  private async broadcastJoinDecision(
+    requestId: string,
+    targetParticipantId: string,
+    decision: 'approved' | 'declined'
+  ) {
+    if (!this.profile || !this.signingPrivateKey) return;
+    try {
+      const packet = await createSignedJoinDecision(
+        this.convId,
+        requestId,
+        targetParticipantId,
+        decision,
+        this.profile.participantId,
+        this.profile.screenName,
+        this.profile.signingPublicKeyBase64,
+        this.signingPrivateKey
+      );
+      await this.sendControlPacket(packet);
+    } catch (err) {
+      console.warn('Failed to broadcast join decision:', err);
+    }
   }
 
   public async removeParticipant(participantId: string, _screenName?: string): Promise<boolean> {
     this.approvedMembers.delete(participantId);
     this.participantsMap.delete(participantId);
+    this.knownHellos.delete(participantId);
+    this.helloSeenAt.delete(participantId);
+    this.autoApproveIds.delete(participantId);
     this.notifyChange();
     return this.rekeyConversation();
   }
@@ -754,6 +1315,7 @@ export class RoomSession {
       this.activeKeyId = newKeyId;
       this.activeEpoch = newEpoch;
       this.isApproved = true;
+      this.stopJoinRetryTimer();
 
       this.trysteroService.sendControl(envelope);
       return true;
@@ -801,7 +1363,8 @@ export class RoomSession {
           payload.timestamp
         );
 
-        this.processedPacketIds.add(payload.msgId);
+        this.markProcessed(payload.msgId);
+        this.rememberEnvelope(envelope);
         const chatMsg: ChatMessage = {
           id: payload.msgId,
           convId: this.convId,
@@ -816,12 +1379,11 @@ export class RoomSession {
           emotion: options?.emotion,
           emotionIntensity: options?.emotionIntensity,
           balloonMode: options?.balloonMode,
+          envelope,
         };
 
-        this.messages.push(chatMsg);
-        await dbService.saveMessage(chatMsg);
+        this.insertMessage(chatMsg, false);
         this.trysteroService.sendChat(envelope);
-        this.notifyChange();
         return true;
       } catch (err) {
         console.error('Failed to send public message:', err);
@@ -868,7 +1430,8 @@ export class RoomSession {
         payload.timestamp
       );
 
-      this.processedPacketIds.add(msgId);
+      this.markProcessed(msgId);
+      this.rememberEnvelope(envelope);
       const chatMsg: ChatMessage = {
         id: msgId,
         convId: this.convId,
@@ -883,12 +1446,11 @@ export class RoomSession {
         emotion: options?.emotion,
         emotionIntensity: options?.emotionIntensity,
         balloonMode: options?.balloonMode,
+        envelope,
       };
 
-      this.messages.push(chatMsg);
-      await dbService.saveMessage(chatMsg);
+      this.insertMessage(chatMsg, false);
       this.trysteroService.sendChat(envelope);
-      this.notifyChange();
       return true;
     } catch (err) {
       console.error('Failed to send encrypted message:', err);
@@ -906,12 +1468,6 @@ export class RoomSession {
 
     if (!this.profile || !this.trysteroService) return true;
 
-    const titleKey = this.roomMode === 'public'
-      ? this.keysMap.get('public-v2')?.key
-      : this.rootKey;
-
-    if (!titleKey) return true;
-
     const titlePacket: ChannelTitlePacket = {
       type: 'channel_title',
       protocol: 'airthread/2',
@@ -922,28 +1478,15 @@ export class RoomSession {
       timestamp: Date.now(),
     };
 
-    try {
-      const envelope = await createEncryptedEnvelope(
-        titleKey,
-        this.convId,
-        crypto.randomUUID(),
-        this.roomMode === 'public' ? 'public-v2' : 'root-v2',
-        this.profile.participantId,
-        JSON.stringify(titlePacket),
-        titlePacket.timestamp
-      );
-      this.trysteroService.sendControl(envelope);
-      return true;
-    } catch (err) {
-      console.warn('Failed to send channel title control envelope:', err);
-      return false;
-    }
+    return this.sendControlPacket(titlePacket);
   }
 
   public async clearHistory(): Promise<void> {
     await dbService.clearMessages(this.convId);
     this.messages = [];
     this.processedPacketIds.clear();
+    this.processedPacketOrder = [];
+    this.envelopeCache.clear();
     this.notifyChange();
   }
 
@@ -962,6 +1505,9 @@ export class RoomSession {
       this.isSecretMissing = false;
       this.isInitialized = false;
       await dbService.saveConversationMetadata(this.convId, secret, this.activeEpoch, this.activeKeyId);
+      this.stopPresenceTimer();
+      this.stopJoinRetryTimer();
+      this.joinRequestAttempts = 0;
       if (this.trysteroService) {
         this.trysteroService.disconnect();
       }
@@ -996,6 +1542,8 @@ export class RoomSession {
 
   public destroy(): void {
     this.isDestroyed = true;
+    this.stopPresenceTimer();
+    this.stopJoinRetryTimer();
     if (this.trysteroService) {
       try {
         this.trysteroService.disconnect();
@@ -1007,5 +1555,12 @@ export class RoomSession {
     this.participantsMap.clear();
     this.pendingRequestsMap.clear();
     this.sentHelloPeers.clear();
+    this.knownHellos.clear();
+    this.helloSeenAt.clear();
+    this.seenHelloNonces.clear();
+    this.seenHelloNonceOrder = [];
+    this.directPeerIds.clear();
+    this.envelopeCache.clear();
+    this.deferredSummaries.clear();
   }
 }

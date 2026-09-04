@@ -64,8 +64,13 @@ I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScri
   - **RSA-OAEP 2048-bit**: Asymmetric public-key encryption for AES-256-GCM conversation keys.
   - **ECDSA P-256**: Digital signatures for authenticating identity hellos, rekeys, join requests, and room actions.
 - **Channel Governance & Rekeying**:
-  - Proactive friend addition and entry request/approval workflow with cryptographic verification.
+  - Entry requests are gossiped to every member, so the prompt appears for all of them; whoever accepts first rekeys the room and clears the prompt everywhere else.
+  - Direct room invitations: invite a friend and they get a "would you like to join" prompt instead of a link. Accepting runs the normal join handshake, auto-approved by the inviter. Invitations for offline friends are held in IndexedDB and delivered when they next appear online.
   - Group participant removal with instant rekey exclusion.
+- **Presence & Gossip Mesh**:
+  - Friends directory shows who is currently online, driven by low-rate replaceable Nostr announcements rather than per-peer heartbeats.
+  - Signed hellos, control packets and messages are relayed peer-to-peer with packet-id de-duplication, so a room stays consistent even when some peer pairs cannot form a direct WebRTC link.
+  - Newly joined peers back-fill recent history from whichever peers they can reach.
 - **IndexedDB Persistence**: Local storage for user profiles, keypairs, friends directory, and conversation logs.
 
 ---

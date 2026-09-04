@@ -25,6 +25,7 @@ import { SecurityDialog } from './components/SecurityDialog';
 import { AddContactToRoomDialog } from './components/AddContactToRoomDialog';
 import { JoinRequestsDialog } from './components/JoinRequestsDialog';
 import { MissingSecretDialog } from './components/MissingSecretDialog';
+import { IncomingInviteDialog } from './components/IncomingInviteDialog';
 import { PublicRoomsDialog } from './components/PublicRoomsDialog';
 import { CreatePublicRoomDialog } from './components/CreatePublicRoomDialog';
 import { NewRoomDialog } from './components/NewRoomDialog';
@@ -175,6 +176,7 @@ const AppContent: React.FC = () => {
           onOpenCreatePublicRoom={() => setCreatePublicOpen(true)}
         />
         <MissingSecretDialog />
+        <IncomingInviteDialog />
       </Box>
     </ThemeProvider>
   );

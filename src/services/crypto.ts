@@ -9,6 +9,12 @@ import type {
   PublicRoomMetadataPacket,
   PlaintextMessagePayload,
   RoomMode,
+  JoinDecisionPacket,
+  PresencePacket,
+  PresenceStatus,
+  RoomInvitePayload,
+  RoomInviteResponsePayload,
+  SealedEnvelope,
 } from '../types';
 
 // ============================================================================
@@ -773,7 +779,8 @@ export async function createSignedStateSummary(
   controlPacketIds: string[],
   newestMessageTimestamp: number,
   messageCount: number,
-  signingPrivateKey: CryptoKey
+  signingPrivateKey: CryptoKey,
+  recentMessageIds?: string[]
 ): Promise<StateSummaryPacket> {
   const unsigned: Omit<StateSummaryPacket, 'signature'> = {
     type: 'state_summary',
@@ -786,6 +793,7 @@ export async function createSignedStateSummary(
     controlPacketIds,
     newestMessageTimestamp,
     messageCount,
+    ...(recentMessageIds ? { recentMessageIds } : {}),
     timestamp: Date.now(),
   };
 
@@ -1096,4 +1104,252 @@ export async function verifyPublicMessageSignature(payload: PlaintextMessagePayl
   const { signature, ...unsigned } = payload;
   const stringToSign = 'AIRTHREAD_PUBLIC_MESSAGE_V2:' + canonicalStringify(unsigned);
   return await verifySignature(payload.sender.signingPublicKey, stringToSign, signature);
+}
+
+// ============================================================================
+// JOIN DECISION PACKETS (multi-member notification dismissal)
+// ============================================================================
+
+export async function createSignedJoinDecision(
+  convId: string,
+  requestId: string,
+  targetParticipantId: string,
+  decision: 'approved' | 'declined',
+  deciderId: string,
+  deciderScreenName: string,
+  deciderSigningPublicKeyBase64: string,
+  signingPrivateKey: CryptoKey
+): Promise<JoinDecisionPacket> {
+  const unsigned: Omit<JoinDecisionPacket, 'signature'> = {
+    type: 'join_decision',
+    protocol: 'airthread/2',
+    convId,
+    requestId,
+    targetParticipantId,
+    decision,
+    deciderId,
+    deciderScreenName,
+    deciderSigningPublicKey: normalizePublicKey(deciderSigningPublicKeyBase64),
+    timestamp: Date.now(),
+  };
+
+  const stringToSign = 'AIRTHREAD_JOIN_DECISION_V2:' + canonicalStringify(unsigned);
+  const signature = await signData(signingPrivateKey, stringToSign);
+  return { ...unsigned, signature };
+}
+
+export async function verifyJoinDecisionSignature(packet: JoinDecisionPacket): Promise<boolean> {
+  if (!packet.signature || !packet.deciderSigningPublicKey) return false;
+  const derivedPid = await getParticipantId(packet.deciderSigningPublicKey);
+  if (derivedPid !== packet.deciderId) {
+    console.error('Decider ID does not match signing public key hash in Join Decision');
+    return false;
+  }
+  const { signature, ...unsigned } = packet;
+  const stringToSign = 'AIRTHREAD_JOIN_DECISION_V2:' + canonicalStringify(unsigned);
+  return await verifySignature(packet.deciderSigningPublicKey, stringToSign, signature);
+}
+
+// ============================================================================
+// PRESENCE & DIRECT INVITE ADDRESSING (airthread/2-presence)
+// ============================================================================
+
+/**
+ * Relay-side routing tag for a participant's presence announcements. Derived by
+ * hashing the participantId so the raw identity is not published as a plain index.
+ */
+export async function derivePresenceTag(participantId: string): Promise<string> {
+  const buf = new TextEncoder().encode('airthread-presence-v1:' + participantId);
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  return arrayBufferToBase64Url(hash);
+}
+
+/** Relay-side routing tag for a participant's direct-invite inbox. */
+export async function deriveInboxTag(participantId: string): Promise<string> {
+  const buf = new TextEncoder().encode('airthread-inbox-v1:' + participantId);
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  return arrayBufferToBase64Url(hash);
+}
+
+export async function createSignedPresence(
+  participantId: string,
+  screenName: string,
+  publicKeyBase64: string,
+  signingPublicKeyBase64: string,
+  signingPrivateKey: CryptoKey,
+  status: PresenceStatus,
+  avatarName?: string,
+  timestamp: number = Date.now()
+): Promise<PresencePacket> {
+  const unsigned: Omit<PresencePacket, 'signature'> = {
+    type: 'presence',
+    protocol: 'airthread/2',
+    extension: 'airthread/2-presence',
+    participantId,
+    screenName,
+    avatarName,
+    publicKey: normalizePublicKey(publicKeyBase64),
+    signingPublicKey: normalizePublicKey(signingPublicKeyBase64),
+    status,
+    timestamp,
+  };
+
+  const stringToSign = 'AIRTHREAD_PRESENCE_V2:' + canonicalStringify(unsigned);
+  const signature = await signData(signingPrivateKey, stringToSign);
+  return { ...unsigned, signature };
+}
+
+export async function verifyPresenceSignature(packet: PresencePacket): Promise<boolean> {
+  if (!packet.signature || !packet.signingPublicKey) return false;
+  const derivedPid = await getParticipantId(packet.signingPublicKey);
+  if (derivedPid !== packet.participantId) return false;
+  const { signature, ...unsigned } = packet;
+  const stringToSign = 'AIRTHREAD_PRESENCE_V2:' + canonicalStringify(unsigned);
+  return await verifySignature(packet.signingPublicKey, stringToSign, signature);
+}
+
+export async function createSignedRoomInvite(
+  inviteId: string,
+  convId: string,
+  roomMode: RoomMode,
+  channelTitle: string,
+  recipientParticipantId: string,
+  inviter: {
+    participantId: string;
+    screenName: string;
+    avatarName?: string;
+    publicKey: string;
+    signingPublicKey: string;
+    contactInfo?: ContactInfo;
+  },
+  signingPrivateKey: CryptoKey,
+  options?: { roomSecret?: string; publicJoinToken?: string }
+): Promise<RoomInvitePayload> {
+  const unsigned: Omit<RoomInvitePayload, 'signature'> = {
+    type: 'room_invite',
+    protocol: 'airthread/2',
+    extension: 'airthread/2-presence',
+    inviteId,
+    convId,
+    roomMode,
+    roomSecret: options?.roomSecret,
+    publicJoinToken: options?.publicJoinToken,
+    channelTitle,
+    recipientParticipantId,
+    inviter: {
+      ...inviter,
+      publicKey: normalizePublicKey(inviter.publicKey),
+      signingPublicKey: normalizePublicKey(inviter.signingPublicKey),
+    },
+    timestamp: Date.now(),
+  };
+
+  const stringToSign = 'AIRTHREAD_ROOM_INVITE_V2:' + canonicalStringify(unsigned);
+  const signature = await signData(signingPrivateKey, stringToSign);
+  return { ...unsigned, signature };
+}
+
+export async function verifyRoomInviteSignature(packet: RoomInvitePayload): Promise<boolean> {
+  if (!packet.signature || !packet.inviter?.signingPublicKey) return false;
+  const derivedPid = await getParticipantId(packet.inviter.signingPublicKey);
+  if (derivedPid !== packet.inviter.participantId) return false;
+  const { signature, ...unsigned } = packet;
+  const stringToSign = 'AIRTHREAD_ROOM_INVITE_V2:' + canonicalStringify(unsigned);
+  return await verifySignature(packet.inviter.signingPublicKey, stringToSign, signature);
+}
+
+export async function createSignedInviteResponse(
+  inviteId: string,
+  convId: string,
+  decision: 'accepted' | 'declined',
+  responderParticipantId: string,
+  responderScreenName: string,
+  responderSigningPublicKeyBase64: string,
+  signingPrivateKey: CryptoKey
+): Promise<RoomInviteResponsePayload> {
+  const unsigned: Omit<RoomInviteResponsePayload, 'signature'> = {
+    type: 'room_invite_response',
+    protocol: 'airthread/2',
+    extension: 'airthread/2-presence',
+    inviteId,
+    convId,
+    decision,
+    responderParticipantId,
+    responderScreenName,
+    responderSigningPublicKey: normalizePublicKey(responderSigningPublicKeyBase64),
+    timestamp: Date.now(),
+  };
+
+  const stringToSign = 'AIRTHREAD_INVITE_RESPONSE_V2:' + canonicalStringify(unsigned);
+  const signature = await signData(signingPrivateKey, stringToSign);
+  return { ...unsigned, signature };
+}
+
+export async function verifyInviteResponseSignature(packet: RoomInviteResponsePayload): Promise<boolean> {
+  if (!packet.signature || !packet.responderSigningPublicKey) return false;
+  const derivedPid = await getParticipantId(packet.responderSigningPublicKey);
+  if (derivedPid !== packet.responderParticipantId) return false;
+  const { signature, ...unsigned } = packet;
+  const stringToSign = 'AIRTHREAD_INVITE_RESPONSE_V2:' + canonicalStringify(unsigned);
+  return await verifySignature(packet.responderSigningPublicKey, stringToSign, signature);
+}
+
+/**
+ * Seals an arbitrary payload for one recipient: a fresh AES-256-GCM key encrypts
+ * the body, and RSA-OAEP encrypts that key to the recipient's public key.
+ */
+export async function sealForParticipant(
+  recipientParticipantId: string,
+  recipientPublicKeyBase64: string,
+  senderParticipantId: string,
+  payloadStr: string
+): Promise<SealedEnvelope> {
+  const recipientKey = await importPublicKey(recipientPublicKeyBase64);
+  const { key, rawBuffer } = await generateNewConversationKey();
+  const timestamp = Date.now();
+  const aad = `airthread/2-presence:${recipientParticipantId}:${senderParticipantId}:${timestamp}`;
+  const { ciphertext, iv } = await encryptSymmetric(key, payloadStr, aad);
+
+  return {
+    type: 'sealed',
+    protocol: 'airthread/2',
+    extension: 'airthread/2-presence',
+    recipientParticipantId,
+    senderParticipantId,
+    encryptedKey: await encryptAsymmetric(recipientKey, rawBuffer),
+    iv,
+    data: ciphertext,
+    timestamp,
+  };
+}
+
+export async function openSealedEnvelope(
+  envelope: SealedEnvelope,
+  recipientPrivateKey: CryptoKey
+): Promise<string> {
+  const rawKey = await decryptAsymmetric(recipientPrivateKey, envelope.encryptedKey);
+  const key = await importRawAesKey(rawKey);
+  const aad = `airthread/2-presence:${envelope.recipientParticipantId}:${envelope.senderParticipantId}:${envelope.timestamp}`;
+  return await decryptSymmetric(key, envelope.data, envelope.iv, aad);
+}
+
+/**
+ * Derives a stable secp256k1 secret key from the user's ECDSA signing key so that
+ * presence announcements land on the same Nostr pubkey across sessions and can be
+ * published as replaceable events instead of accumulating duplicates.
+ */
+export async function deriveNostrSecretKey(signingPrivateKeyJwk: JsonWebKey): Promise<Uint8Array> {
+  const seedMaterial = new TextEncoder().encode(
+    'airthread-nostr-identity-v1:' + (signingPrivateKeyJwk.d || '') + ':' + (signingPrivateKeyJwk.x || '')
+  );
+
+  let digest = new Uint8Array(await crypto.subtle.digest('SHA-256', seedMaterial));
+  // secp256k1 group order; reject-and-rehash keeps the scalar in range.
+  const order = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
+  for (let i = 0; i < 32; i++) {
+    const asInt = BigInt('0x' + Array.from(digest).map((b) => b.toString(16).padStart(2, '0')).join(''));
+    if (asInt > 0n && asInt < order) return digest;
+    digest = new Uint8Array(await crypto.subtle.digest('SHA-256', digest));
+  }
+  throw new Error('Failed to derive a valid Nostr secret key');
 }
