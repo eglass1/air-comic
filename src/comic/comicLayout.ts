@@ -24,6 +24,33 @@ export interface LayoutOptions {
 export const COMIC_FONT_FAMILY =
   '"Comic Sans MS", "Comic Relief", "Comic Neue", "Chalkboard SE", sans-serif';
 
+/** Line box height used for balloon text, at both layout and draw time. */
+const BALLOON_LINE_HEIGHT = 16;
+
+export function balloonFontFor(mode: BalloonMode): string {
+  return mode === 'whisper'
+    ? `italic bold 12px ${COMIC_FONT_FAMILY}`
+    : `bold 12px ${COMIC_FONT_FAMILY}`;
+}
+
+/**
+ * Scratch context used to measure balloon text during layout. The original
+ * wraps text for real before negotiating positions (CBalloon::SetBBox), so the
+ * box the layout reasons about is the box that actually gets drawn; estimating
+ * from character counts and then re-wrapping at draw time lets the two drift.
+ */
+let measureCtx: CanvasRenderingContext2D | null = null;
+
+function getMeasureContext(): CanvasRenderingContext2D | null {
+  if (measureCtx) return measureCtx;
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 8;
+  canvas.height = 8;
+  measureCtx = canvas.getContext('2d');
+  return measureCtx;
+}
+
 export class ComicLayoutEngine {
   static readonly DEFAULT_WIDTH = 420;
   static readonly DEFAULT_HEIGHT = 360;
@@ -362,6 +389,149 @@ export class ComicLayoutEngine {
   private static readonly STEM_GAP = 34;
   /** How far above the hair a stem stops. Keeps the tip clear of the artwork. */
   private static readonly STEM_CLEARANCE = 10;
+  /** Side and top margins of the region balloons may occupy. */
+  private static readonly BALLOON_MARGIN = 14;
+  private static readonly BALLOON_TOP_MARGIN = 12;
+  /**
+   * Width of the corridor a balloon keeps clear on the side its stem descends,
+   * so a later balloon can never be dropped on top of an earlier stem.
+   * Ported from MINROUTEWIDTH (300 twips).
+   */
+  private static readonly MIN_ROUTE_WIDTH = 20;
+  /**
+   * Gap left when docking a balloon under an earlier one. The original tucks the
+   * two together by 90 twips because its outline carries a tall wavy fringe;
+   * ours is tighter and carries a white nimbus, so it wants a small gap instead.
+   */
+  private static readonly BALLOON_DOCK_GAP = 4;
+  /** Shortest stem worth drawing; below this the balloon is nudged up instead. */
+  private static readonly MIN_STEM_HEIGHT = 14;
+  /** How far the stem root is pulled inside the last text line's extent. */
+  private static readonly STEM_ROOT_INSET = 10;
+  /** Effectively infinite, for route-region intersection. */
+  private static readonly FAR = 1e6;
+
+  /**
+   * Padding between the text line boxes and the drawn outline. Kept here so the
+   * measured box and the painted outline are derived from the same numbers.
+   */
+  private static balloonPadding(mode: BalloonMode): { padX: number; padY: number; bleed: number; bleedY: number } {
+    if (mode === 'think') {
+      // The cloud path bulges 8px horizontally and 6px vertically past the boxes.
+      return { padX: 22, padY: 11, bleed: 8, bleedY: 6 };
+    }
+    return { padX: 14, padY: 7, bleed: 0, bleedY: 0 };
+  }
+
+  /**
+   * Wrap the text for real and return the outline's true footprint.
+   *
+   * Width is chosen by balancing the box rather than by counting characters:
+   * for text of total run length `len` wrapped at width w, the stack is about
+   * `len / w` lines tall, so w = sqrt(aspect * lineHeight * len) lands on a
+   * given aspect ratio. Comic balloons read best at roughly 2.2:1.
+   */
+  static measureBalloon(
+    text: string,
+    mode: BalloonMode,
+    panelWidth: number,
+    maxHeight?: number
+  ): { lines: string[]; width: number; height: number } {
+    const { padX, padY, bleed, bleedY } = this.balloonPadding(mode);
+    const ctx = getMeasureContext();
+    const maxOutlineWidth = Math.round(panelWidth * (mode === 'think' ? 0.54 : 0.5));
+
+    if (!ctx) {
+      // No DOM (tests/SSR): fall back to a character-count estimate.
+      const approxWidth = Math.min(maxOutlineWidth, Math.max(90, text.length * 7.5 + 2 * padX));
+      const approxLines = Math.max(1, Math.ceil((text.length * 7.2) / Math.max(40, approxWidth - 2 * padX)));
+      return {
+        lines: [text],
+        width: approxWidth,
+        height: approxLines * BALLOON_LINE_HEIGHT + 2 * padY + 2 * bleedY,
+      };
+    }
+
+    ctx.font = balloonFontFor(mode);
+    const runLength = ctx.measureText(text).width;
+    let widestWord = 0;
+    for (const word of text.split(/\s+/)) {
+      if (word) widestWord = Math.max(widestWord, ctx.measureText(word).width);
+    }
+
+    const maxTextWidth = maxOutlineWidth - 2 * padX - 2 * bleed;
+    const balanced = Math.sqrt(2.2 * BALLOON_LINE_HEIGHT * runLength);
+    let wrapWidth = Math.max(
+      Math.min(widestWord, maxTextWidth),
+      Math.min(balanced, runLength, maxTextWidth)
+    );
+
+    const chrome = 2 * padY + 2 * bleedY;
+    let lines = this.getWrappedLines(ctx, text, wrapWidth);
+
+    // Too tall for the space above the speaker? Spend width to buy back height,
+    // the way the original derives a minimum width from the text's area and the
+    // headroom it has left (CUnitPanel::GetCloudEstimate).
+    if (maxHeight !== undefined) {
+      const linesThatFit = Math.max(1, Math.floor((maxHeight - chrome) / BALLOON_LINE_HEIGHT));
+      while (lines.length > linesThatFit && wrapWidth < maxTextWidth) {
+        wrapWidth = Math.min(maxTextWidth, wrapWidth * 1.18);
+        const widened = this.getWrappedLines(ctx, text, wrapWidth);
+        if (widened.length >= lines.length && wrapWidth >= maxTextWidth) {
+          lines = widened;
+          break;
+        }
+        lines = widened;
+      }
+    }
+
+    let maxLineWidth = 0;
+    for (const line of lines) {
+      maxLineWidth = Math.max(maxLineWidth, ctx.measureText(line.trim()).width);
+    }
+
+    return {
+      lines,
+      width: Math.ceil(maxLineWidth + 2 * padX + 2 * bleed),
+      height: Math.ceil(lines.length * BALLOON_LINE_HEIGHT + chrome),
+    };
+  }
+
+  /**
+   * The corridor `other` must respect so it does not land on this balloon's
+   * stem. A balloon whose speaker stands to the right has to stay right of this
+   * stem, and vice versa. Ported from CBalloon::QueryRouteRgn.
+   */
+  private static queryRouteRegion(
+    balloon: ComicBalloon,
+    ownArrowX: number,
+    otherArrowX: number
+  ): { left: number; right: number } {
+    const left = balloon.routeLeft ?? balloon.x;
+    const right = balloon.routeRight ?? balloon.x + balloon.width;
+    if (otherArrowX > ownArrowX) {
+      return { left: Math.max(ownArrowX, left + this.MIN_ROUTE_WIDTH), right: this.FAR };
+    }
+    return { left: -this.FAR, right: Math.min(ownArrowX, right - this.MIN_ROUTE_WIDTH) };
+  }
+
+  /**
+   * Shrink this balloon's stem corridor away from a newly placed balloon, so the
+   * stem leaves on the side that is still clear. Ported from CBalloon::SetRouteRgn.
+   */
+  private static setRouteRegion(
+    balloon: ComicBalloon,
+    ownArrowX: number,
+    otherArrowX: number,
+    otherLeft: number,
+    otherRight: number
+  ): void {
+    if (otherArrowX > ownArrowX) {
+      balloon.routeRight = Math.min(balloon.routeRight ?? balloon.x + balloon.width, otherLeft);
+    } else {
+      balloon.routeLeft = Math.max(balloon.routeLeft ?? balloon.x, otherRight);
+    }
+  }
 
   static layoutSinglePanel(
     panel: ComicPanel,
@@ -423,165 +593,173 @@ export class ComicLayoutEngine {
       });
     }
 
-    // Balloon placement to minimize overlapping (matching MS Comic Chat panel.cpp)
-    const topMargin = 14;
-    const numBalloons = panel.balloons.length;
+    // ---- Balloon placement --------------------------------------------------
+    // Ported from CUnitPanel::LayoutBalloons. Balloons dock from the top of the
+    // panel downward and each one reserves a horizontal corridor for its stem;
+    // later balloons are slid out of those corridors, so stems can never cross
+    // another balloon or each other, and never have to cut back across a face.
+    const margin = this.BALLOON_MARGIN;
+    const freeLeft = margin;
+    const freeRight = panelWidth - margin;
+    const freeTop = this.BALLOON_TOP_MARGIN;
 
-    // First pass: compute dimensions for every balloon in panel
-    const balloonDims = panel.balloons.map((balloon) => {
+    const placed: ComicBalloon[] = [];
+
+    panel.balloons.forEach((balloon, idx) => {
+      const speaker =
+        panel.characters.find((c) => c.participantId === balloon.speakerParticipantId) ||
+        panel.characters[idx % Math.max(1, numChars)];
+
       if (balloon.mode === 'action') {
+        // Narrative box: full width, pinned to the top, no stem. Measured against
+        // its own box rather than a balloon's, since drawBalloon lays this out
+        // with its own padding and 15px leading.
+        balloon.width = panelWidth - 2 * margin - 4;
         const actionText = `* ${balloon.speakerName}: ${balloon.text} *`;
-        const approxLineCount = Math.max(1, Math.ceil((actionText.length * 7.2) / (panelWidth - 56)));
-        return {
-          width: panelWidth - 32,
-          height: Math.max(34, 16 + approxLineCount * 16),
-        };
+        const actionCtx = getMeasureContext();
+        let actionLines = 1;
+        if (actionCtx) {
+          actionCtx.font = `italic bold 12px ${COMIC_FONT_FAMILY}`;
+          actionLines = this.getWrappedLines(actionCtx, actionText, balloon.width - 24).length;
+        } else {
+          actionLines = Math.max(1, Math.ceil((actionText.length * 7.2) / (balloon.width - 24)));
+        }
+        balloon.height = Math.max(34, 16 + actionLines * 15);
+        balloon.x = margin + 2;
+        balloon.y = freeTop;
+        balloon.lines = undefined;
+        balloon.tailX = 0;
+        balloon.tailY = 0;
+        balloon.routeLeft = balloon.x;
+        balloon.routeRight = balloon.x + balloon.width;
+        placed.push(balloon);
+        return;
       }
-      if (balloon.mode === 'think') {
-        const approxLineCount = Math.max(1, Math.ceil((balloon.text.length * 7.2) / (panelWidth * 0.44)));
-        return {
-          width: Math.min(
-            Math.round(panelWidth * 0.50),
-            Math.max(120, Math.min(220, balloon.text.length * 8.2 + 54))
-          ),
-          height: Math.max(52, 30 + approxLineCount * 18),
-        };
+
+      const arrowX = speaker ? speaker.headX : panelWidth / 2;
+      // Lowest the underside may reach and still leave the stem somewhere to run.
+      const lowestBottom = speaker
+        ? speaker.headTopY - this.STEM_CLEARANCE - this.MIN_STEM_HEIGHT
+        : panelHeight;
+
+      // Placing is mildly circular — the wrap width decides the height, the width
+      // decides which corridor we land in, and that decides how much headroom is
+      // left. Two passes settle it: measure against the whole band, place, then
+      // re-measure against the headroom that actually survived.
+      let top = freeTop;
+      for (let pass = 0; pass < 2; pass++) {
+        const headroom = lowestBottom - top;
+        const measured = this.measureBalloon(
+          balloon.text,
+          balloon.mode,
+          panelWidth,
+          headroom > 0 ? headroom : undefined
+        );
+        balloon.lines = measured.lines;
+        balloon.width = Math.min(measured.width, freeRight - freeLeft);
+        balloon.height = measured.height;
+
+        // Start centred over the speaker, then slide into the corridor every
+        // earlier balloon leaves open for us (CUnitPanel::GetInterveningBBox).
+        let left = Math.round(arrowX - balloon.width / 2);
+        let allowedLeft = freeLeft;
+        let allowedRight = freeRight;
+        for (const prior of placed) {
+          if (prior.mode === 'action') continue;
+          const priorSpeaker = panel.characters.find(
+            (c) => c.participantId === prior.speakerParticipantId
+          );
+          const priorArrowX = priorSpeaker ? priorSpeaker.headX : panelWidth / 2;
+          const corridor = this.queryRouteRegion(prior, priorArrowX, arrowX);
+          allowedLeft = Math.max(allowedLeft, corridor.left);
+          allowedRight = Math.min(allowedRight, corridor.right);
+        }
+
+        if (allowedRight - allowedLeft >= balloon.width) {
+          left = Math.max(allowedLeft, Math.min(allowedRight - balloon.width, left));
+        } else {
+          // Corridor too tight to honour: keep the balloon on the panel and let
+          // the vertical docking below separate it from the earlier ones.
+          left = Math.max(freeLeft, Math.min(freeRight - balloon.width, left));
+        }
+        balloon.x = left;
+
+        // Dock below any earlier balloon we overlap horizontally, otherwise sit
+        // level with it. Balloons hang from the top so they clear the cast.
+        const previousTop = top;
+        top = freeTop;
+        for (const prior of placed) {
+          const overlaps =
+            balloon.x < prior.x + prior.width && prior.x < balloon.x + balloon.width;
+          if (overlaps) {
+            top = Math.max(top, prior.y + prior.height + this.BALLOON_DOCK_GAP);
+          }
+        }
+        // Settled: the second pass would measure against the same headroom.
+        if (top === previousTop) break;
       }
-      const maxBubbleWidth = Math.min(
-        Math.round(panelWidth * 0.46),
-        Math.max(110, Math.min(210, balloon.text.length * 8 + 36))
-      );
-      const usableWidth = Math.max(80, maxBubbleWidth - 24);
-      const approxLineCount = Math.max(1, Math.ceil((balloon.text.length * 7.2) / usableWidth));
-      return {
-        width: Math.min(maxBubbleWidth, Math.max(90, Math.min(usableWidth + 24, balloon.text.length * 7.5 + 28))),
-        height: Math.max(46, 26 + approxLineCount * 16),
-      };
+
+      // Balloons hang from the top of the panel, as in the original, so they stay
+      // as far off the cast as the panel allows and the stem does the reaching.
+      balloon.y = top;
+
+      balloon.tailX = speaker ? speaker.headX : arrowX;
+      balloon.tailY = speaker ? speaker.headTopY - this.STEM_CLEARANCE : balloon.y + balloon.height;
+
+      // Reserve our own corridor, then push every earlier stem clear of us.
+      balloon.routeLeft = balloon.x;
+      balloon.routeRight = balloon.x + balloon.width;
+      for (const prior of placed) {
+        if (prior.mode === 'action') continue;
+        const priorSpeaker = panel.characters.find(
+          (c) => c.participantId === prior.speakerParticipantId
+        );
+        const priorArrowX = priorSpeaker ? priorSpeaker.headX : panelWidth / 2;
+        this.setRouteRegion(prior, priorArrowX, arrowX, balloon.x, balloon.x + balloon.width);
+      }
+
+      placed.push(balloon);
     });
 
-    if (numBalloons === 1) {
-      const b = panel.balloons[0];
-      const dim = balloonDims[0];
-      const speakerChar =
-        panel.characters.find((c) => c.participantId === b.speakerParticipantId) ||
-        panel.characters[0];
+    // Resolve each stem's exit point now that all corridors are final.
+    panel.balloons.forEach((balloon) => {
+      this.resolveStemRoot(balloon);
+    });
+  }
 
-      if (b.mode === 'action') {
-        b.x = 16;
-        b.y = topMargin;
-        b.width = dim.width;
-        b.height = dim.height;
-        b.tailX = 0;
-        b.tailY = 0;
-      } else {
-        b.width = dim.width;
-        b.height = dim.height;
-        if (numChars === 1) {
-          b.x = Math.round((panelWidth - dim.width) / 2);
-        } else {
-          if (speakerChar.flip) {
-            b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, speakerChar.headX - dim.width / 2 + 10));
-          } else {
-            b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, speakerChar.headX - dim.width / 2 - 10));
-          }
-        }
-        // Sits above the hair, not above the mouth, so the stem has somewhere to
-        // run without crossing the face.
-        b.y = Math.max(14, speakerChar.headTopY - dim.height - this.STEM_GAP);
-        b.tailX = speakerChar.headX;
-        b.tailY = speakerChar.headTopY - this.STEM_CLEARANCE;
-      }
-    } else if (numBalloons === 2) {
-      const b0 = panel.balloons[0];
-      const b1 = panel.balloons[1];
-      const dim0 = balloonDims[0];
-      const dim1 = balloonDims[1];
-      const speaker0 =
-        panel.characters.find((c) => c.participantId === b0.speakerParticipantId) ||
-        panel.characters[0];
-      const speaker1 =
-        panel.characters.find((c) => c.participantId === b1.speakerParticipantId) ||
-        panel.characters[numChars > 1 ? 1 : 0];
-
-      b0.width = dim0.width;
-      b0.height = dim0.height;
-      b1.width = dim1.width;
-      b1.height = dim1.height;
-
-      // Check if both balloons fit side-by-side horizontally
-      const canFitSideBySide = dim0.width + dim1.width + 16 <= panelWidth - 28;
-
-      if (canFitSideBySide) {
-        // Place Side-by-Side
-        if (numChars >= 2 && speaker0 !== speaker1) {
-          if (speaker0.headX <= speaker1.headX) {
-            b0.x = Math.max(14, Math.min(panelWidth / 2 - dim0.width - 6, speaker0.headX - dim0.width / 2));
-            b1.x = Math.max(panelWidth / 2 + 6, Math.min(panelWidth - dim1.width - 14, speaker1.headX - dim1.width / 2));
-          } else {
-            b1.x = Math.max(14, Math.min(panelWidth / 2 - dim1.width - 6, speaker1.headX - dim1.width / 2));
-            b0.x = Math.max(panelWidth / 2 + 6, Math.min(panelWidth - dim0.width - 14, speaker0.headX - dim0.width / 2));
-          }
-          b0.y = Math.max(14, speaker0.headTopY - dim0.height - this.STEM_GAP);
-          b1.y = Math.max(14, speaker1.headTopY - dim1.height - (this.STEM_GAP - 4));
-        } else {
-          // Same speaker: Balloon 0 on left, Balloon 1 on right
-          b0.x = Math.max(14, Math.round(panelWidth / 2 - dim0.width - 8));
-          b1.x = Math.min(panelWidth - dim1.width - 14, Math.round(panelWidth / 2 + 8));
-          b0.y = Math.max(14, speaker0.headTopY - dim0.height - (this.STEM_GAP + 4));
-          b1.y = Math.max(14, speaker0.headTopY - dim1.height - (this.STEM_GAP - 4));
-        }
-        b0.tailX = speaker0.headX;
-        b0.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
-        b1.tailX = speaker1.headX;
-        b1.tailY = speaker1.headTopY - this.STEM_CLEARANCE;
-      } else {
-        // Cascaded / Stacked Tiers (strictly preventing vertical overlap)
-        if (numChars >= 2 && speaker0 !== speaker1) {
-          b1.y = Math.max(14 + dim0.height + 10, speaker1.headTopY - dim1.height - (this.STEM_GAP - 4));
-          b0.y = Math.max(14, b1.y - dim0.height - 10);
-          b0.x = Math.max(14, Math.min(panelWidth - dim0.width - 14, speaker0.headX - dim0.width / 2));
-          b1.x = Math.max(14, Math.min(panelWidth - dim1.width - 14, speaker1.headX - dim1.width / 2));
-          b0.tailX = speaker0.headX;
-          b0.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
-          b1.tailX = speaker1.headX;
-          b1.tailY = speaker1.headTopY - this.STEM_CLEARANCE;
-        } else {
-          // Same speaker: aligned above speaker, b1 sits above head, b0 sits above b1
-          b1.x = Math.round((panelWidth - dim1.width) / 2);
-          b1.y = Math.max(14 + dim0.height + 10, speaker0.headTopY - dim1.height - (this.STEM_GAP - 6));
-
-          b0.x = Math.round((panelWidth - dim0.width) / 2);
-          b0.y = Math.max(14, b1.y - dim0.height - 10);
-
-          b0.tailX = b1.x + b1.width / 2;
-          b0.tailY = b1.y;
-          b1.tailX = speaker0.headX;
-          b1.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
-        }
-      }
-    } else {
-      // 3 or more balloons (multi-tiered grid)
-      let currentY = topMargin;
-      panel.balloons.forEach((b, idx) => {
-        const dim = balloonDims[idx];
-        const speakerChar =
-          panel.characters.find((c) => c.participantId === b.speakerParticipantId) ||
-          panel.characters[idx % numChars];
-
-        b.width = dim.width;
-        b.height = dim.height;
-        b.y = currentY;
-        b.tailX = speakerChar.headX;
-        b.tailY = speakerChar.headTopY - this.STEM_CLEARANCE;
-
-        if (idx % 2 === 0) {
-          b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, (panelWidth - dim.width) / 2 - 25));
-        } else {
-          b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, (panelWidth - dim.width) / 2 + 25));
-        }
-        currentY += dim.height + 10;
-      });
+  /**
+   * Choose where the stem leaves the balloon's underside: the middle of whatever
+   * corridor survived the negotiation, pulled inside the last line of text so it
+   * springs from under the words rather than from an empty corner.
+   * Ported from CBWoodringNormal::AddArrow's xbreak calculation.
+   */
+  private static resolveStemRoot(balloon: ComicBalloon): void {
+    if (balloon.mode === 'action' || !balloon.tailY) {
+      balloon.tailRootX = undefined;
+      return;
     }
+    const routeLeft = balloon.routeLeft ?? balloon.x;
+    const routeRight = balloon.routeRight ?? balloon.x + balloon.width;
+
+    // An empty corridor means later balloons boxed this stem in on both sides;
+    // fall back to aiming straight at the speaker.
+    let root =
+      routeRight > routeLeft ? (routeLeft + routeRight) / 2 : balloon.tailX;
+
+    const inset = this.STEM_ROOT_INSET;
+    root = Math.max(balloon.x + inset, Math.min(balloon.x + balloon.width - inset, root));
+
+    // Limit the stem to 45 degrees from vertical by moving its root along the
+    // balloon rather than bending it sideways (the original clamps the angle and
+    // recomputes xbreak). A bent stem is what read as a spike across the face.
+    const drop = balloon.tailY - (balloon.y + balloon.height);
+    if (drop > 0) {
+      const maxRun = drop;
+      root = Math.max(balloon.tailX - maxRun, Math.min(balloon.tailX + maxRun, root));
+      root = Math.max(balloon.x + inset, Math.min(balloon.x + balloon.width - inset, root));
+    }
+
+    balloon.tailRootX = root;
   }
 
   // Draw a comic panel onto a 2D Canvas context
@@ -643,29 +821,24 @@ export class ComicLayoutEngine {
         char.headY = char.y + (rendered.headY / rendered.canvas.height) * char.height;
         char.headTopY = exactHeadTopY;
 
-        // Synchronize speaker balloons (ordered by vertical position)
+        // Retarget this speaker's balloons onto the measured artwork, then
+        // re-resolve their stem roots so the corridors negotiated at layout time
+        // still hold against the real head position.
         const speakerBalloons = panel.balloons
           .filter(
-            (b) => b.speakerParticipantId === char.participantId || panel.characters.length === 1
+            (b) =>
+              b.mode !== 'action' &&
+              (b.speakerParticipantId === char.participantId || panel.characters.length === 1)
           )
           .sort((a, b) => a.y - b.y);
 
-        // Each balloon points at the speaker, except where one genuinely sits on
-        // top of another — only then does the upper one chain down to the lower.
-        for (let i = 0; i < speakerBalloons.length; i++) {
-          const current = speakerBalloons[i];
-          const below = speakerBalloons[i + 1];
-
-          if (below && this.isStackedAbove(current, below)) {
-            current.tailX = Math.max(
-              below.x + 12,
-              Math.min(below.x + below.width - 12, current.x + current.width / 2)
-            );
-            current.tailY = below.y;
-          } else {
-            current.tailX = exactHeadX;
-            current.tailY = targetHeadY;
-          }
+        // Every balloon points at its own speaker. Stacked balloons no longer
+        // need to chain through one another: the route regions guarantee an
+        // upper balloon's stem descends past the lower one rather than over it.
+        for (const speakerBalloon of speakerBalloons) {
+          speakerBalloon.tailX = exactHeadX;
+          speakerBalloon.tailY = targetHeadY;
+          this.resolveStemRoot(speakerBalloon);
         }
       } else {
         // Fallback sketch avatar if loading
@@ -673,10 +846,11 @@ export class ComicLayoutEngine {
       }
     });
 
-    // 3. Draw Balloons
-    panel.balloons.forEach((balloon) => {
-      this.drawBalloon(ctx, balloon);
-    });
+    // 3. Draw Balloons, latest first so earlier ones stay on top and reading
+    //    order survives any overlap (matches the original's paint order).
+    for (let i = panel.balloons.length - 1; i >= 0; i--) {
+      this.drawBalloon(ctx, panel.balloons[i]);
+    }
 
     // 4. Draw Solid Black Comic Border
     ctx.lineWidth = 3;
@@ -941,17 +1115,6 @@ export class ComicLayoutEngine {
     return lines;
   }
 
-  /**
-   * True when `upper` really is a tier above `lower` rather than merely being a
-   * little higher beside it. Chaining two side-by-side balloons is what produced
-   * the long horizontal stem that cut across the speaker's face.
-   */
-  private static isStackedAbove(upper: ComicBalloon, lower: ComicBalloon): boolean {
-    const clearsVertically = lower.y >= upper.y + upper.height - 6;
-    const overlap =
-      Math.min(upper.x + upper.width, lower.x + lower.width) - Math.max(upper.x, lower.x);
-    return clearsVertically && overlap > 12;
-  }
 
   static drawBalloon(ctx: CanvasRenderingContext2D, balloon: ComicBalloon): void {
     ctx.save();
@@ -984,20 +1147,19 @@ export class ComicLayoutEngine {
     }
 
     // Set font for line measurement and rendering
-    ctx.font =
-      mode === 'whisper'
-        ? `italic bold 12px ${COMIC_FONT_FAMILY}`
-        : `bold 12px ${COMIC_FONT_FAMILY}`;
+    ctx.font = balloonFontFor(mode);
 
-    const maxTextWidth = Math.max(60, width - 24);
-    const lines = this.getWrappedLines(ctx, text, maxTextWidth);
-    const lineHeight = 16;
+    // Reuse the wrap decided during layout so the painted outline is exactly the
+    // box that was negotiated against the other balloons.
+    const lines =
+      balloon.lines && balloon.lines.length > 0
+        ? balloon.lines
+        : this.getWrappedLines(ctx, text, Math.max(60, width - 24));
+    const lineHeight = BALLOON_LINE_HEIGHT;
     const totalTextHeight = lines.length * lineHeight;
     const startY = y + (height - totalTextHeight) / 2;
     const centerX = x + width / 2;
-    const isThink = mode === 'think';
-    const padX = isThink ? 22 : 14;
-    const padY = isThink ? 11 : 7;
+    const { padX, padY } = this.balloonPadding(mode);
 
     const lineBoxes = lines.map((line, i) => {
       const w = ctx.measureText(line.trim()).width;
@@ -1026,7 +1188,14 @@ export class ComicLayoutEngine {
       this.drawCloudPath(ctx, cloudL, cloudT, cloudR - cloudL, cloudB - cloudT);
     } else {
       const hasTail = tailX > 0 && tailY > 0;
-      this.drawHuggingSpeechBalloonPath(ctx, lineBoxes, tailX, tailY, hasTail);
+      this.drawHuggingSpeechBalloonPath(
+        ctx,
+        lineBoxes,
+        tailX,
+        tailY,
+        hasTail,
+        balloon.tailRootX
+      );
     }
 
     // 2. Pass 1: Solid White Fill + Nimbus (White Halo Outline)
@@ -1063,10 +1232,13 @@ export class ComicLayoutEngine {
       // Same reasoning as the speech stem: leave from the underside nearest the
       // speaker and keep the trail descending, so it reads as coming down off the
       // balloon rather than drifting sideways across the panel.
-      const bubbleRootX = Math.max(x + 14, Math.min(x + width - 14, tailX));
+      const bubbleRootX = Math.max(
+        x + 14,
+        Math.min(x + width - 14, balloon.tailRootX ?? tailX)
+      );
       const bubbleRootY = y + height + 2;
       const trailDy = Math.max(10, tailY - bubbleRootY);
-      const maxTrailDx = trailDy * 1.6;
+      const maxTrailDx = trailDy;
       const trailDx = Math.max(-maxTrailDx, Math.min(maxTrailDx, tailX - bubbleRootX));
       const steps = 4;
       for (let i = 1; i <= steps; i++) {
@@ -1112,7 +1284,8 @@ export class ComicLayoutEngine {
     lineBoxes: { left: number; right: number; top: number; bottom: number }[],
     tailX: number,
     tailY: number,
-    hasTail: boolean
+    hasTail: boolean,
+    preferredRootX?: number
   ): void {
     const n = lineBoxes.length;
     if (n === 0) return;
@@ -1191,9 +1364,15 @@ export class ComicLayoutEngine {
       const tailBaseWidth = Math.min(18, Math.max(10, (botRight - botLeft) * 0.14));
       const minRootX = botLeft + rBotLast + tailBaseWidth / 2 + 2;
       const maxRootX = botRight - rBotLast - tailBaseWidth / 2 - 2;
-      const targetRatio = (tailX - botLeft) / Math.max(1, botRight - botLeft);
-      const clampedRatio = Math.max(0.12, Math.min(0.88, targetRatio));
-      const tailRootX = Math.max(minRootX, Math.min(maxRootX, botLeft + (botRight - botLeft) * clampedRatio));
+      // The layout picked an exit point in the middle of this balloon's free
+      // corridor; pull it onto the last line of text so the stem springs from
+      // under the words rather than from an empty corner.
+      const targetX =
+        preferredRootX !== undefined
+          ? preferredRootX
+          : botLeft + (botRight - botLeft) * Math.max(0.12, Math.min(0.88,
+              (tailX - botLeft) / Math.max(1, botRight - botLeft)));
+      const tailRootX = Math.max(minRootX, Math.min(maxRootX, targetX));
 
       const tailRightX = tailRootX + tailBaseWidth / 2;
       const tailLeftX = tailRootX - tailBaseWidth / 2;
@@ -1201,10 +1380,10 @@ export class ComicLayoutEngine {
       this.drawWavyLine(ctx, botRight - rBotLast, botY, tailRightX, botY, 1.0, 20);
 
       const dy = Math.max(12, tailY - botY);
-      // Cap the sideways run against the drop. Without this, a target beside the
-      // balloon rather than below it draws a long near-horizontal spike straight
-      // across whatever sits between them.
-      const maxDx = dy * 1.6;
+      // Hold the stem within 45 degrees of vertical, as the original does. The
+      // root was already moved to satisfy this; the cap only catches the cases
+      // where the balloon had no room to shift.
+      const maxDx = dy;
       const dx = Math.max(-maxDx, Math.min(maxDx, tailX - tailRootX));
       const halfBase = tailBaseWidth / 2;
 

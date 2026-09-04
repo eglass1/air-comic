@@ -134,6 +134,20 @@ export interface ComicBalloon {
   height: number;
   tailX: number;
   tailY: number;
+  /**
+   * Text as wrapped during layout. Drawing reuses these rather than re-wrapping,
+   * so the outline that gets painted is exactly the box the layout negotiated.
+   */
+  lines?: string[];
+  /**
+   * Horizontal corridor reserved for this balloon's stem, in panel pixels.
+   * Later balloons must not cover it, and the stem leaves from its midpoint.
+   * Ported from CBalloon::m_routeRgn.
+   */
+  routeLeft?: number;
+  routeRight?: number;
+  /** Where the stem leaves the balloon's underside, once negotiated. */
+  tailRootX?: number;
 }
 
 export interface ComicCharacterInPanel {
