@@ -6,7 +6,6 @@ import {
   IconButton,
   Button,
   Box,
-  Chip,
   Tooltip,
   Menu,
   MenuItem,
@@ -24,7 +23,6 @@ import DarkModeIcon from '@mui/icons-material/DarkMode';
 import LightModeIcon from '@mui/icons-material/LightMode';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
 import AutoAwesomeMosaicIcon from '@mui/icons-material/AutoAwesomeMosaic';
-import HubIcon from '@mui/icons-material/Hub';
 import PersonAddAlt1Icon from '@mui/icons-material/PersonAddAlt1';
 import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive';
 import VpnKeyIcon from '@mui/icons-material/VpnKey';
@@ -208,27 +206,27 @@ export const Navbar: React.FC<NavbarProps> = ({
             </Tooltip>
           )}
 
-          {/* WebRTC Mesh Peers Badge */}
-          <Tooltip title={`Connected Peers: ${connectedPeersCount}`}>
-            <Chip
-              size="small"
-              icon={<HubIcon sx={{ fontSize: '13px !important' }} />}
-              label={connectedPeersCount}
-              color={connectedPeersCount > 0 ? 'success' : 'default'}
-              variant="outlined"
-              sx={{ height: 24, fontSize: '0.75rem', fontWeight: 700, ml: 0.2 }}
-            />
-          </Tooltip>
-
-          {/* Signaling Status Indicator Bubble */}
-          <Tooltip title={connectionStatus === 'connected' ? 'Connected' : 'Connecting...'}>
+          {/* Combined Connection & Peers Status Indicator */}
+          <Tooltip
+            title={
+              connectionStatus !== 'connected'
+                ? 'Not Connected'
+                : connectedPeersCount === 0
+                ? 'Connected (no peers)'
+                : connectedPeersCount === 1
+                ? 'Connected (1 peer)'
+                : `Connected (${connectedPeersCount} peers)`
+            }
+          >
             <Box
               sx={{
                 display: 'flex',
                 alignItems: 'center',
+                justifyContent: 'center',
                 gap: 0.5,
-                px: 0.8,
-                py: 0.3,
+                height: 24,
+                minWidth: 24,
+                px: connectionStatus === 'connected' && connectedPeersCount > 0 ? 0.8 : 0.7,
                 borderRadius: 4,
                 bgcolor:
                   connectionStatus === 'connected'
@@ -253,16 +251,19 @@ export const Navbar: React.FC<NavbarProps> = ({
                       : '0 0 6px rgba(255, 171, 0, 0.8)',
                 }}
               />
-              <Typography
-                variant="caption"
-                sx={{
-                  fontWeight: 700,
-                  fontSize: '0.7rem',
-                  color: connectionStatus === 'connected' ? 'success.main' : 'warning.main',
-                }}
-              >
-                {connectionStatus === 'connected' ? 'Live' : 'Connecting'}
-              </Typography>
+              {connectionStatus === 'connected' && connectedPeersCount > 0 && (
+                <Typography
+                  variant="caption"
+                  sx={{
+                    fontWeight: 700,
+                    fontSize: '0.75rem',
+                    lineHeight: 1,
+                    color: 'success.main',
+                  }}
+                >
+                  {connectedPeersCount}
+                </Typography>
+              )}
             </Box>
           </Tooltip>
         </Box>
