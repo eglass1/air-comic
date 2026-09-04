@@ -53,7 +53,7 @@ export class AvatarManager {
 
   private avatarCache: Map<string, AvatarData> = new Map();
   private backdropCache: Map<string, BackdropData> = new Map();
-  private characterCanvasCache: Map<string, { canvas: HTMLCanvasElement; headX: number; headY: number }> = new Map();
+  private characterCanvasCache: Map<string, { canvas: HTMLCanvasElement; headX: number; headY: number; headTopY: number }> = new Map();
   private iconCanvasCache: Map<string, HTMLCanvasElement> = new Map();
 
   // Known built-in avatar list
@@ -283,12 +283,36 @@ export class AvatarManager {
     }
   }
 
+  /**
+   * Topmost row holding any ink — the top of the hair, not the face anchor.
+   * Balloon stems are aimed at this so they stop above the character instead of
+   * landing on the mouth and covering the face.
+   */
+  private static measureHeadTop(canvas: HTMLCanvasElement): number {
+    try {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx || !canvas.width || !canvas.height) return 0;
+
+      const scanHeight = Math.max(1, Math.min(canvas.height, Math.ceil(canvas.height * 0.6)));
+      const data = ctx.getImageData(0, 0, canvas.width, scanHeight).data;
+      for (let y = 0; y < scanHeight; y++) {
+        const rowStart = y * canvas.width * 4;
+        for (let x = 0; x < canvas.width; x++) {
+          if (data[rowStart + x * 4 + 3] > 40) return y;
+        }
+      }
+    } catch {
+      // Reading pixels can fail in exotic contexts; the caller falls back safely.
+    }
+    return 0;
+  }
+
   renderCharacter(
     avatar: AvatarData,
     emotion: number = EM_NEUTRAL,
     intensity: number = 0.0,
     flip: boolean = false
-  ): { canvas: HTMLCanvasElement; headX: number; headY: number } {
+  ): { canvas: HTMLCanvasElement; headX: number; headY: number; headTopY: number } {
     const cacheKey = `${avatar.name}_${emotion.toFixed(2)}_${intensity.toFixed(2)}_${flip ? 'F' : 'N'}`;
     if (this.characterCanvasCache.has(cacheKey)) {
       return this.characterCanvasCache.get(cacheKey)!;
@@ -324,8 +348,9 @@ export class AvatarManager {
       }
     }
 
-    this.characterCanvasCache.set(cacheKey, rendered);
-    return rendered;
+    const measured = { ...rendered, headTopY: AvatarManager.measureHeadTop(rendered.canvas) };
+    this.characterCanvasCache.set(cacheKey, measured);
+    return measured;
   }
 
   renderAvatarIcon(avatar: AvatarData): HTMLCanvasElement {

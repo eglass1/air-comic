@@ -150,7 +150,10 @@ export interface ComicCharacterInPanel {
   height: number;
   flip: boolean;
   headX: number;
+  /** Face anchor, roughly the mouth. */
   headY: number;
+  /** Top of the hair. Balloon stems stop above this so they never cover the face. */
+  headTopY: number;
   canvas?: HTMLCanvasElement;
 }
 

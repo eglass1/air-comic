@@ -317,6 +317,7 @@ export class ComicLayoutEngine {
             flip: false,
             headX: 0,
             headY: 0,
+            headTopY: 0,
           };
           currentPanel!.characters.push(charEntry);
         } else {
@@ -352,6 +353,16 @@ export class ComicLayoutEngine {
     return panels;
   }
 
+  /**
+   * Estimated hair top as a fraction of character height, used to place balloons
+   * before the avatar art has loaded. Refined from the real pixels at draw time.
+   */
+  private static readonly HEAD_TOP_RATIO = 0.08;
+  /** Gap left between a balloon's underside and the top of the speaker's hair. */
+  private static readonly STEM_GAP = 34;
+  /** How far above the hair a stem stops. Keeps the tip clear of the artwork. */
+  private static readonly STEM_CLEARANCE = 10;
+
   static layoutSinglePanel(
     panel: ComicPanel,
     panelWidth: number,
@@ -372,6 +383,7 @@ export class ComicLayoutEngine {
       char.flip = false;
       char.headX = char.x + Math.round(char.width * 0.5);
       char.headY = char.y + Math.round(char.height * 0.24); // Initial head estimate
+      char.headTopY = char.y + Math.round(char.height * this.HEAD_TOP_RATIO);
     } else if (numChars === 2) {
       // Two characters facing each other
       const char1 = panel.characters[0];
@@ -384,6 +396,7 @@ export class ComicLayoutEngine {
       char1.flip = false; // faces right
       char1.headX = char1.x + Math.round(char1.width * 0.5);
       char1.headY = char1.y + Math.round(char1.height * 0.24);
+      char1.headTopY = char1.y + Math.round(char1.height * this.HEAD_TOP_RATIO);
 
       char2.height = maxCharHeight;
       char2.width = Math.round(char2.height * aspect);
@@ -392,6 +405,7 @@ export class ComicLayoutEngine {
       char2.flip = true; // faces left
       char2.headX = char2.x + Math.round(char2.width * 0.5);
       char2.headY = char2.y + Math.round(char2.height * 0.24);
+      char2.headTopY = char2.y + Math.round(char2.height * this.HEAD_TOP_RATIO);
     } else {
       // 3 or more characters
       const availableWidth = panelWidth - 24;
@@ -405,6 +419,7 @@ export class ComicLayoutEngine {
         char.flip = idx >= Math.floor(numChars / 2);
         char.headX = char.x + Math.round(char.width * 0.5);
         char.headY = char.y + Math.round(char.height * 0.24);
+        char.headTopY = char.y + Math.round(char.height * this.HEAD_TOP_RATIO);
       });
     }
 
@@ -470,10 +485,11 @@ export class ComicLayoutEngine {
             b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, speakerChar.headX - dim.width / 2 - 10));
           }
         }
-        // Position comfortably above speaker head with natural stem length (~42px)
-        b.y = Math.max(14, speakerChar.headY - dim.height - 42);
+        // Sits above the hair, not above the mouth, so the stem has somewhere to
+        // run without crossing the face.
+        b.y = Math.max(14, speakerChar.headTopY - dim.height - this.STEM_GAP);
         b.tailX = speakerChar.headX;
-        b.tailY = speakerChar.headY;
+        b.tailY = speakerChar.headTopY - this.STEM_CLEARANCE;
       }
     } else if (numBalloons === 2) {
       const b0 = panel.balloons[0];
@@ -505,34 +521,34 @@ export class ComicLayoutEngine {
             b1.x = Math.max(14, Math.min(panelWidth / 2 - dim1.width - 6, speaker1.headX - dim1.width / 2));
             b0.x = Math.max(panelWidth / 2 + 6, Math.min(panelWidth - dim0.width - 14, speaker0.headX - dim0.width / 2));
           }
-          b0.y = Math.max(14, speaker0.headY - dim0.height - 42);
-          b1.y = Math.max(14, speaker1.headY - dim1.height - 38);
+          b0.y = Math.max(14, speaker0.headTopY - dim0.height - this.STEM_GAP);
+          b1.y = Math.max(14, speaker1.headTopY - dim1.height - (this.STEM_GAP - 4));
         } else {
           // Same speaker: Balloon 0 on left, Balloon 1 on right
           b0.x = Math.max(14, Math.round(panelWidth / 2 - dim0.width - 8));
           b1.x = Math.min(panelWidth - dim1.width - 14, Math.round(panelWidth / 2 + 8));
-          b0.y = Math.max(14, speaker0.headY - dim0.height - 46);
-          b1.y = Math.max(14, speaker0.headY - dim1.height - 38);
+          b0.y = Math.max(14, speaker0.headTopY - dim0.height - (this.STEM_GAP + 4));
+          b1.y = Math.max(14, speaker0.headTopY - dim1.height - (this.STEM_GAP - 4));
         }
         b0.tailX = speaker0.headX;
-        b0.tailY = speaker0.headY;
+        b0.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
         b1.tailX = speaker1.headX;
-        b1.tailY = speaker1.headY;
+        b1.tailY = speaker1.headTopY - this.STEM_CLEARANCE;
       } else {
         // Cascaded / Stacked Tiers (strictly preventing vertical overlap)
         if (numChars >= 2 && speaker0 !== speaker1) {
-          b1.y = Math.max(14 + dim0.height + 10, speaker1.headY - dim1.height - 38);
+          b1.y = Math.max(14 + dim0.height + 10, speaker1.headTopY - dim1.height - (this.STEM_GAP - 4));
           b0.y = Math.max(14, b1.y - dim0.height - 10);
           b0.x = Math.max(14, Math.min(panelWidth - dim0.width - 14, speaker0.headX - dim0.width / 2));
           b1.x = Math.max(14, Math.min(panelWidth - dim1.width - 14, speaker1.headX - dim1.width / 2));
           b0.tailX = speaker0.headX;
-          b0.tailY = speaker0.headY;
+          b0.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
           b1.tailX = speaker1.headX;
-          b1.tailY = speaker1.headY;
+          b1.tailY = speaker1.headTopY - this.STEM_CLEARANCE;
         } else {
           // Same speaker: aligned above speaker, b1 sits above head, b0 sits above b1
           b1.x = Math.round((panelWidth - dim1.width) / 2);
-          b1.y = Math.max(14 + dim0.height + 10, speaker0.headY - dim1.height - 36);
+          b1.y = Math.max(14 + dim0.height + 10, speaker0.headTopY - dim1.height - (this.STEM_GAP - 6));
 
           b0.x = Math.round((panelWidth - dim0.width) / 2);
           b0.y = Math.max(14, b1.y - dim0.height - 10);
@@ -540,7 +556,7 @@ export class ComicLayoutEngine {
           b0.tailX = b1.x + b1.width / 2;
           b0.tailY = b1.y;
           b1.tailX = speaker0.headX;
-          b1.tailY = speaker0.headY;
+          b1.tailY = speaker0.headTopY - this.STEM_CLEARANCE;
         }
       }
     } else {
@@ -556,7 +572,7 @@ export class ComicLayoutEngine {
         b.height = dim.height;
         b.y = currentY;
         b.tailX = speakerChar.headX;
-        b.tailY = speakerChar.headY;
+        b.tailY = speakerChar.headTopY - this.STEM_CLEARANCE;
 
         if (idx % 2 === 0) {
           b.x = Math.max(14, Math.min(panelWidth - dim.width - 14, (panelWidth - dim.width) / 2 - 25));
@@ -617,13 +633,15 @@ export class ComicLayoutEngine {
           char.height
         );
 
-        // Calculate exact hair-top anchoring directly above the avatar face
+        // Anchor on the measured top of the artwork rather than the face anchor:
+        // aiming at the mouth is what used to run the stem straight over the face.
         const exactHeadX = charX + (rendered.headX / rendered.canvas.width) * charWidth;
-        const exactMouthY = char.y + (rendered.headY / rendered.canvas.height) * char.height;
-        const targetHeadY = Math.round(exactMouthY - 22); // Hovering 22px above face/mouth at hair top
+        const exactHeadTopY = char.y + (rendered.headTopY / rendered.canvas.height) * char.height;
+        const targetHeadY = Math.round(exactHeadTopY - this.STEM_CLEARANCE);
 
         char.headX = exactHeadX;
-        char.headY = targetHeadY;
+        char.headY = char.y + (rendered.headY / rendered.canvas.height) * char.height;
+        char.headTopY = exactHeadTopY;
 
         // Synchronize speaker balloons (ordered by vertical position)
         const speakerBalloons = panel.balloons
@@ -632,35 +650,21 @@ export class ComicLayoutEngine {
           )
           .sort((a, b) => a.y - b.y);
 
-        if (speakerBalloons.length === 1) {
-          speakerBalloons[0].tailX = exactHeadX;
-          speakerBalloons[0].tailY = targetHeadY;
-        } else if (speakerBalloons.length === 2) {
-          const [topB, bottomB] = speakerBalloons;
-          if (Math.abs(topB.y - bottomB.y) < 20) {
-            // Side-by-side
-            topB.tailX = exactHeadX;
-            topB.tailY = targetHeadY;
-            bottomB.tailX = exactHeadX;
-            bottomB.tailY = targetHeadY;
+        // Each balloon points at the speaker, except where one genuinely sits on
+        // top of another — only then does the upper one chain down to the lower.
+        for (let i = 0; i < speakerBalloons.length; i++) {
+          const current = speakerBalloons[i];
+          const below = speakerBalloons[i + 1];
+
+          if (below && this.isStackedAbove(current, below)) {
+            current.tailX = Math.max(
+              below.x + 12,
+              Math.min(below.x + below.width - 12, current.x + current.width / 2)
+            );
+            current.tailY = below.y;
           } else {
-            // Stacked: top balloon links to bottom balloon, bottom balloon links to speaker
-            topB.tailX = bottomB.x + bottomB.width / 2;
-            topB.tailY = bottomB.y;
-            bottomB.tailX = exactHeadX;
-            bottomB.tailY = targetHeadY;
-          }
-        } else if (speakerBalloons.length >= 3) {
-          for (let i = 0; i < speakerBalloons.length; i++) {
-            if (i < speakerBalloons.length - 1) {
-              const curr = speakerBalloons[i];
-              const next = speakerBalloons[i + 1];
-              curr.tailX = next.x + next.width / 2;
-              curr.tailY = next.y;
-            } else {
-              speakerBalloons[i].tailX = exactHeadX;
-              speakerBalloons[i].tailY = targetHeadY;
-            }
+            current.tailX = exactHeadX;
+            current.tailY = targetHeadY;
           }
         }
       } else {
@@ -937,6 +941,18 @@ export class ComicLayoutEngine {
     return lines;
   }
 
+  /**
+   * True when `upper` really is a tier above `lower` rather than merely being a
+   * little higher beside it. Chaining two side-by-side balloons is what produced
+   * the long horizontal stem that cut across the speaker's face.
+   */
+  private static isStackedAbove(upper: ComicBalloon, lower: ComicBalloon): boolean {
+    const clearsVertically = lower.y >= upper.y + upper.height - 6;
+    const overlap =
+      Math.min(upper.x + upper.width, lower.x + lower.width) - Math.max(upper.x, lower.x);
+    return clearsVertically && overlap > 12;
+  }
+
   static drawBalloon(ctx: CanvasRenderingContext2D, balloon: ComicBalloon): void {
     ctx.save();
 
@@ -1044,13 +1060,19 @@ export class ComicLayoutEngine {
 
     // 4. Thought bubbles trailing from thought balloon to speaker head
     if (mode === 'think' && tailX > 0 && tailY > 0) {
-      const bubbleRootX = x + width / 2;
+      // Same reasoning as the speech stem: leave from the underside nearest the
+      // speaker and keep the trail descending, so it reads as coming down off the
+      // balloon rather than drifting sideways across the panel.
+      const bubbleRootX = Math.max(x + 14, Math.min(x + width - 14, tailX));
       const bubbleRootY = y + height + 2;
+      const trailDy = Math.max(10, tailY - bubbleRootY);
+      const maxTrailDx = trailDy * 1.6;
+      const trailDx = Math.max(-maxTrailDx, Math.min(maxTrailDx, tailX - bubbleRootX));
       const steps = 4;
       for (let i = 1; i <= steps; i++) {
         const t = i / (steps + 1);
-        const bx = bubbleRootX + (tailX - bubbleRootX) * t;
-        const by = bubbleRootY + (tailY - bubbleRootY) * t;
+        const bx = bubbleRootX + trailDx * t;
+        const by = bubbleRootY + trailDy * t;
         // Small descending circles: ~6.5px down to ~2px radius (13px down to 4px diameter)
         const r = 6.5 - (i - 1) * 1.5;
 
@@ -1178,8 +1200,12 @@ export class ComicLayoutEngine {
 
       this.drawWavyLine(ctx, botRight - rBotLast, botY, tailRightX, botY, 1.0, 20);
 
-      const dx = tailX - tailRootX;
       const dy = Math.max(12, tailY - botY);
+      // Cap the sideways run against the drop. Without this, a target beside the
+      // balloon rather than below it draws a long near-horizontal spike straight
+      // across whatever sits between them.
+      const maxDx = dy * 1.6;
+      const dx = Math.max(-maxDx, Math.min(maxDx, tailX - tailRootX));
       const halfBase = tailBaseWidth / 2;
 
       // Concave Woodring stem: curves inward towards center spine immediately
@@ -1188,7 +1214,7 @@ export class ComicLayoutEngine {
       const l_cp1 = { x: tailRootX - halfBase * 0.05 + dx * 0.70, y: botY + dy * 0.75 };
       const l_cp2 = { x: tailRootX - halfBase * 0.25 + dx * 0.25, y: botY + dy * 0.35 };
 
-      ctx.bezierCurveTo(r_cp1.x, r_cp1.y, r_cp2.x, r_cp2.y, tailX, botY + dy);
+      ctx.bezierCurveTo(r_cp1.x, r_cp1.y, r_cp2.x, r_cp2.y, tailRootX + dx, botY + dy);
       ctx.bezierCurveTo(l_cp1.x, l_cp1.y, l_cp2.x, l_cp2.y, tailLeftX, botY);
 
       this.drawWavyLine(ctx, tailLeftX, botY, botLeft + rBotLast, botY, 1.0, 20);
