@@ -35,7 +35,9 @@ This is a small, fun side project. I was experimenting with peer-to-peer web mes
 
 [https://microsoft.github.io/comic-chat/](https://microsoft.github.io/comic-chat/)
 
-I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScript based on source code examination); it took maybe half an hour to get a rough initial thing working, then a few hours of back-and-forth tweaking (correcting color mapping for the non-monochrome items, and bubble placement which still is kind of a rough approximation, and simple UI feature stuff).
+I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScript based on source code examination); it took maybe half an hour to get a rough initial thing working, then a few hours of back-and-forth tweaking (correcting color mapping for the non-monochrome items, balloon placement etc.). I found a similar project (more faithful to the original) which provided a lot of guidance on accurate rendering:
+
+[https://github.com/comicchat/comicchat](https://github.com/comicchat/comicchat)
 
 ---
 

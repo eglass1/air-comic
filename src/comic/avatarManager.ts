@@ -13,9 +13,15 @@ import { EMBEDDED_AVATARS, EMBEDDED_BACKDROPS } from './artData';
 import {
   EARL_HEAD_WIDTH,
   EARL_HEAD_HEIGHT,
+  EARL_HEAD_ANCHOR_X,
+  EARL_HEAD_ANCHOR_Y,
+  EARL_FACE_X,
+  EARL_FACE_Y,
+  EARL_ICON_SIZE,
   EARL_HEAD_DEFLATE_B64,
   EARL_ICON_DEFLATE_B64,
 } from './earlData';
+import { earlTorso, isEarlTorsoPose } from './earlArt';
 import pako from 'pako';
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
@@ -116,6 +122,14 @@ export class AvatarManager {
     return AvatarManager.instance;
   }
 
+  /**
+   * Earl: Armando's body under a different head.
+   *
+   * The head and roster icon are the only bitmaps shipped for him. The torsos
+   * are Armando's, re-inked at load time into black shoes and a bolo tie, and
+   * every face record points at that one head with the same anchor — Earl's
+   * dead stare never changes, whatever he is saying.
+   */
   private createEarlAvatar(armando: AvatarData): AvatarData {
     const decompHead = pako.inflate(base64ToUint8Array(EARL_HEAD_DEFLATE_B64));
     const earlHeadImage: DecodedImage = {
@@ -126,8 +140,8 @@ export class AvatarManager {
 
     const decompIcon = pako.inflate(base64ToUint8Array(EARL_ICON_DEFLATE_B64));
     const earlIconImage: DecodedImage = {
-      width: 64,
-      height: 64,
+      width: EARL_ICON_SIZE,
+      height: EARL_ICON_SIZE,
       data: new Uint8ClampedArray(decompIcon.buffer, decompIcon.byteOffset, decompIcon.byteLength),
     };
 
@@ -146,18 +160,34 @@ export class AvatarManager {
       faces: armando.faces.map((f) => ({
         ...f,
         poseID: 2,
-        cx: 55,
-        cy: 88,
+        cx: EARL_HEAD_ANCHOR_X,
+        cy: EARL_HEAD_ANCHOR_Y,
         cxDelta: 0,
         cyDelta: 0,
-        faceX: 55,
-        faceY: 45,
+        faceX: EARL_FACE_X,
+        faceY: EARL_FACE_Y,
       })),
       decodedPoses: new Map(armando.decodedPoses),
     };
 
     earl.decodedPoses.set(1, { drawing: earlIconImage, mask: null, aura: null });
     earl.decodedPoses.set(2, { drawing: earlHeadImage, mask: null, aura: null });
+
+    // Overwrite, don't skip: the map starts as a copy of Armando's, so any pose
+    // he has already decoded is sitting there as his own artwork.
+    const reInked = new Set<number>();
+    for (const torso of armando.torsos) {
+      if (reInked.has(torso.poseID) || !isEarlTorsoPose(torso.poseID)) continue;
+      reInked.add(torso.poseID);
+      const pose = AVBParser.getPose(armando, torso.poseID);
+      if (!pose?.drawing) continue;
+      earl.decodedPoses.set(torso.poseID, {
+        drawing: earlTorso(pose.drawing, torso.poseID, torso.cx, torso.cy),
+        mask: pose.mask,
+        aura: pose.aura,
+      });
+    }
+
     return earl;
   }
 
