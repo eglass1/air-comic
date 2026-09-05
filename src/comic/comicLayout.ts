@@ -11,6 +11,8 @@ import {
   EM_COY,
   EM_SHOUT,
   EM_BORED,
+  EM_SAD,
+  EM_ANGRY,
   TitleStarringMember,
 } from './types';
 import {
@@ -1565,6 +1567,8 @@ export class ComicLayoutEngine {
     // 4. Character heads with screen names
     const starring = panel.starringMembers || [];
     const count = starring.length;
+    // Which room the card is for, mixed into each head's expression pick.
+    const castSeed = panel.roomName || panel.title || panel.id;
 
     if (count > 0) {
       const listStartY = boxY + boxH + 54;
@@ -1605,7 +1609,7 @@ export class ComicLayoutEngine {
         const nameX = iconX + iconSize + gap;
         const nameY = iconY + iconSize / 2;
 
-        this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, availWidth);
+        this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, availWidth, castSeed);
       } else if (count === 2) {
         // 2 People: Split vertical space top/bottom and scale proportionally
         const slotH = contentH / 2;
@@ -1642,7 +1646,7 @@ export class ComicLayoutEngine {
           const iconY = Math.round(listStartY + idx * slotH + (slotH - iconSize) / 2);
           const nameX = iconX + iconSize + gap;
           const nameY = iconY + iconSize / 2;
-          this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, width - iconX - 16);
+          this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, width - iconX - 16, castSeed);
         });
       } else {
         // 3 or more: standard 4 rows per column, 2 columns max (up to 8 participants)
@@ -1666,7 +1670,7 @@ export class ComicLayoutEngine {
           const nameX = iconX + iconSize + 10;
           const nameY = iconY + iconSize / 2;
 
-          this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, maxNameWidth);
+          this.drawTitleCastMember(ctx, avatarManager, member, iconX, iconY, iconSize, nameX, nameY, fontSize, maxNameWidth, castSeed);
         });
       }
     }
@@ -1687,16 +1691,17 @@ export class ComicLayoutEngine {
     nameX: number,
     nameY: number,
     fontSize: number,
-    maxNameWidth: number
+    maxNameWidth: number,
+    castSeed: string
   ): void {
     const cleanKey = (member.avatarName || 'Armando').toLowerCase().replace(/\.avb$/, '');
     const av = avatarManager['avatarCache'].get(cleanKey);
 
     if (av) {
-      // Each face gets its own expression and facing, picked from a seed seeded
-      // on who they are, so the cast list has some life in it but a given person
-      // looks the same every time the card is drawn.
-      const variant = this.titleHeadVariant(member);
+      // Each face gets its own expression and facing, picked from a seed made of
+      // the room and who they are, so the cast list has some life in it but a
+      // given card looks the same every time it is drawn.
+      const variant = this.titleHeadVariant(member, castSeed);
       const head =
         avatarManager.renderAvatarHead(av, variant.emotion, variant.intensity, variant.flip) ||
         avatarManager.renderAvatarIcon(av);
@@ -1739,25 +1744,31 @@ export class ComicLayoutEngine {
   }
 
   /**
-   * Expressions the cast card draws from. Neutral is in there more than once so
-   * a straight face stays the most common look.
+   * Expressions the cast card draws from. All of them are expressive on
+   * purpose: an avatar's neutral face is the same drawing as its roster icon,
+   * so a neutral pick is indistinguishable from no pick at all.
    */
   private static readonly TITLE_HEAD_EMOTIONS: { emotion: number; intensity: number }[] = [
-    { emotion: EM_NEUTRAL, intensity: 0 },
-    { emotion: EM_NEUTRAL, intensity: 0 },
     { emotion: EM_HAPPY, intensity: 0.7 },
     { emotion: EM_HAPPY, intensity: 1.0 },
     { emotion: EM_LAUGH, intensity: 0.9 },
     { emotion: EM_COY, intensity: 0.7 },
     { emotion: EM_SHOUT, intensity: 0.8 },
     { emotion: EM_BORED, intensity: 0.6 },
+    { emotion: EM_SAD, intensity: 0.7 },
+    { emotion: EM_ANGRY, intensity: 0.8 },
   ];
 
-  /** Stable per-person pick, so the card does not reshuffle on every redraw. */
+  /**
+   * Stable pick, so the card does not reshuffle on every redraw. The room is in
+   * the seed alongside the person: seeded on the person alone, one unlucky hash
+   * froze someone into the same face in every room they ever joined.
+   */
   private static titleHeadVariant(
-    member: TitleStarringMember
+    member: TitleStarringMember,
+    castSeed: string
   ): { emotion: number; intensity: number; flip: boolean } {
-    const rand = new MsvcRand(seedFromId(`${member.screenName}|${member.avatarName}`));
+    const rand = new MsvcRand(seedFromId(`${castSeed}|${member.screenName}|${member.avatarName}`));
     const choice = this.TITLE_HEAD_EMOTIONS[rand.next() % this.TITLE_HEAD_EMOTIONS.length];
     return { ...choice, flip: rand.next() % 2 === 0 };
   }
