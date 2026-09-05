@@ -1331,8 +1331,11 @@ export class ComicLayoutEngine {
    * corridor survived the negotiation, pulled inside the last line of text so it
    * springs from under the words rather than from an empty corner.
    * Ported from CBWoodringNormal::AddArrow's xbreak calculation.
+   *
+   * Public because a balloon can be drawn outside a panel — the quick-message
+   * overlay lays one out on its own and needs the same stem treatment.
    */
-  private static resolveStemRoot(balloon: ComicBalloon): void {
+  static resolveStemRoot(balloon: ComicBalloon): void {
     if (balloon.mode === 'action' || !balloon.tailY) {
       balloon.tailRootX = undefined;
       return;

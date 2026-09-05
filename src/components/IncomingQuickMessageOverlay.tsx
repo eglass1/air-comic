@@ -6,6 +6,9 @@ import { AvatarManager } from '../comic/avatarManager';
 import { ComicLayoutEngine, COMIC_FONT_FAMILY } from '../comic/comicLayout';
 import { ComicBalloon, EM_NEUTRAL } from '../comic/types';
 
+/** Widest the overlay balloon may get before it wraps. */
+const BALLOON_MAX_WIDTH = 260;
+
 export const IncomingQuickMessageOverlay: React.FC = () => {
   const {
     incomingQuickMessage,
@@ -86,19 +89,19 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
           const ctx = offscreen.getContext('2d');
           if (!ctx) return;
 
-          // Calculate balloon text dimensions
-          const safeText = (incomingQuickMessage.text || '').trim() || '...';
-          ctx.font = `bold 12px ${COMIC_FONT_FAMILY}`;
-          const lines = ComicLayoutEngine.getWrappedLines(ctx, safeText, 210);
-          const lineHeight = 16;
-          let maxLineW = 60;
-          for (const line of lines) {
-            const w = ctx.measureText(line.trim()).width;
-            if (w > maxLineW) maxLineW = w;
-          }
-
-          const bW = Math.max(120, Math.min(260, Math.round(maxLineW + 36)));
-          const bH = Math.max(42, lines.length * lineHeight + 24);
+          // Measure and shape the balloon exactly as a panel does, so the
+          // overlay gets the same hand-drawn outline and stem.
+          const safeText =
+            ((incomingQuickMessage.text || '').trim() || '...').toLocaleUpperCase();
+          const measured = ComicLayoutEngine.measureBalloon(
+            safeText,
+            'say',
+            BALLOON_MAX_WIDTH,
+            undefined,
+            BALLOON_MAX_WIDTH
+          );
+          const bW = measured.width;
+          const bH = measured.height;
 
           // Size offscreen canvas to hold both balloon above and character below
           const canvasW = Math.max(bW + 28, charW + 40);
@@ -157,7 +160,10 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
             height: bH,
             tailX,
             tailY,
+            lines: measured.lines,
+            outline: measured.outline ?? undefined,
           };
+          ComicLayoutEngine.resolveStemRoot(balloon);
 
           ComicLayoutEngine.drawBalloon(ctx, balloon);
 

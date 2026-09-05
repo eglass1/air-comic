@@ -215,6 +215,13 @@ export class RoomSession {
       this.roomSecret = savedMeta.roomSecret;
       this.isSecretMissing = false;
     }
+    // A room we created is ours on every later visit too. The caller can only
+    // guess at this from the URL, and after the first load the URL always
+    // carries a conversation id — which would otherwise make us look like a
+    // guest waiting to be let into our own room.
+    if (savedMeta?.isCreator) {
+      this.isInitialCreator = true;
+    }
 
     // Initialize root key or public transport key
     if (this.roomMode === 'public') {
@@ -262,6 +269,16 @@ export class RoomSession {
         if (this.isInitialCreator) {
           this.isApproved = true;
           this.approvedMembers.add(profile.participantId);
+          // Remember it, so a refresh does not demote us to a pending guest.
+          dbService
+            .saveConversationMetadata(
+              this.convId,
+              this.roomSecret,
+              this.activeEpoch,
+              this.activeKeyId,
+              true
+            )
+            .catch((err) => console.warn('Failed to persist room ownership:', err));
         } else {
           this.isApproved = false;
         }

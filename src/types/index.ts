@@ -507,6 +507,21 @@ export interface QuickMessagePayload {
  * after it is delivered, so this is what stops an acknowledged one from popping
  * up again the next time the app reconnects.
  */
+/** Per-conversation metadata kept in IndexedDB. */
+export interface ConversationMetadataRecord {
+  convId: string;
+  roomSecret: string;
+  activeEpoch: number;
+  activeKeyId: string;
+  /**
+   * True when this device created the room. Without it a reload cannot tell a
+   * room we own from one we were invited to, because both carry a conversation
+   * id in the URL by then.
+   */
+  isCreator?: boolean;
+  updatedAt?: number;
+}
+
 export interface QuickMessageAckRecord {
   id: string;
   senderParticipantId?: string;

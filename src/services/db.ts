@@ -2,6 +2,7 @@ import type {
   UserProfile,
   Friend,
   ChatMessage,
+  ConversationMetadataRecord,
   RekeyPacket,
   PendingInviteRecord,
   QuickMessageAckRecord,
@@ -386,20 +387,37 @@ export class DatabaseService {
 
   // --- Conversation Metadata ---
 
-  async saveConversationMetadata(convId: string, roomSecret: string, activeEpoch: number, activeKeyId: string): Promise<void> {
+  /**
+   * Merges into the existing record rather than replacing it, so a caller that
+   * only knows about the key state cannot wipe `isCreator` (and vice versa).
+   */
+  async saveConversationMetadata(
+    convId: string,
+    roomSecret: string,
+    activeEpoch: number,
+    activeKeyId: string,
+    isCreator?: boolean
+  ): Promise<void> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction('conversations', 'readwrite');
       const store = transaction.objectStore('conversations');
-      const request = store.put({
-        convId,
-        roomSecret,
-        activeEpoch,
-        activeKeyId,
-        updatedAt: Date.now(),
-      });
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      const existing = store.get(convId);
+      existing.onerror = () => reject(existing.error);
+      existing.onsuccess = () => {
+        const prev = existing.result as ConversationMetadataRecord | undefined;
+        const request = store.put({
+          ...(prev || {}),
+          convId,
+          roomSecret,
+          activeEpoch,
+          activeKeyId,
+          isCreator: isCreator ?? prev?.isCreator ?? false,
+          updatedAt: Date.now(),
+        });
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      };
     });
   }
 
@@ -543,7 +561,7 @@ export class DatabaseService {
     });
   }
 
-  async getConversationMetadata(convId: string): Promise<{ convId: string; roomSecret: string; activeEpoch: number; activeKeyId: string } | null> {
+  async getConversationMetadata(convId: string): Promise<ConversationMetadataRecord | null> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction('conversations', 'readonly');
