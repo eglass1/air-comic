@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import type {
   UserProfile,
+  FavoriteRoomRecord,
   Friend,
   Participant,
   ChatMessage,
@@ -31,7 +32,7 @@ import {
   createSignedInviteResponse,
 } from '../services/crypto';
 import { getRandomChannelTitle, getOrInitChannelTitle } from '../utils/channelNameGenerator';
-import { dbService } from '../services/db';
+import { dbService, DatabaseService } from '../services/db';
 import { publicDirectoryService } from '../services/publicDirectory';
 import { presenceService } from '../services/presence';
 import { RoomSession } from '../services/roomSession';
@@ -148,6 +149,14 @@ export interface ChatContextType {
   zoomLevel: number;
   setZoomLevel: React.Dispatch<React.SetStateAction<number>>;
 
+  // Favorite Rooms
+  favoriteRooms: FavoriteRoomRecord[];
+  /** True when the room currently in view is starred. */
+  isFavoriteRoom: boolean;
+  toggleFavoriteRoom: () => Promise<void>;
+  removeFavoriteRoom: (id: string) => Promise<void>;
+  openFavoriteRoom: (record: FavoriteRoomRecord) => void;
+
   // Public Directory
   publicRoomsList: PublicRoomDescriptorPacket[];
   refreshPublicRoomsList: () => Promise<PublicRoomDescriptorPacket[]>;
@@ -175,6 +184,7 @@ const STORAGE_KEY_TABS = 'aircomic_open_tabs';
 export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [friends, setFriends] = useState<Friend[]>([]);
+  const [favoriteRooms, setFavoriteRooms] = useState<FavoriteRoomRecord[]>([]);
   const [publicRoomsList, setPublicRoomsList] = useState<PublicRoomDescriptorPacket[]>([]);
   const [zoomLevel, setZoomLevel] = useState<number>(1.0);
 
@@ -705,6 +715,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         const loadedFriends = await dbService.getFriends();
         setFriends(loadedFriends);
+
+        try {
+          setFavoriteRooms(await dbService.getFavoriteRooms());
+        } catch (err) {
+          console.warn('Failed to load favorite rooms:', err);
+        }
 
         // Restore the outgoing invite queue before any session is built, so
         // auto-approval is re-armed for people we invited in a previous session.
@@ -1354,6 +1370,111 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [openTab]
   );
 
+  // --- Favorite rooms ---------------------------------------------------------
+
+  const activeFavoriteId = convId ? DatabaseService.favoriteRoomId(roomMode, convId) : null;
+  const isFavoriteRoom = Boolean(
+    activeFavoriteId && favoriteRooms.some((f) => f.id === activeFavoriteId)
+  );
+
+  // A private room has no description; a public one carries its own in the
+  // directory descriptor it was published with.
+  const activeRoomDescription = useMemo(() => {
+    if (roomMode !== 'public' || !convId) return undefined;
+    const descriptor = publicRoomsList.find(
+      (r) => r.convId === convId && (!publicJoinToken || r.publicJoinToken === publicJoinToken)
+    );
+    return descriptor?.description || undefined;
+  }, [roomMode, convId, publicJoinToken, publicRoomsList]);
+
+  /** Who else is in the room, for the roster we remember alongside it. */
+  const rosterSnapshot = useCallback(
+    (): FavoriteRoomRecord['members'] =>
+      Array.from(participantsMap.values())
+        .filter((p) => !p.isSelf)
+        .map((p) => ({
+          participantId: p.participantId,
+          screenName: p.screenName,
+          avatarName: p.avatarName,
+        })),
+    [participantsMap]
+  );
+
+  const toggleFavoriteRoom = useCallback(async () => {
+    if (!convId || !activeFavoriteId) return;
+    try {
+      if (favoriteRooms.some((f) => f.id === activeFavoriteId)) {
+        await dbService.deleteFavoriteRoom(activeFavoriteId);
+      } else {
+        await dbService.saveFavoriteRoom({
+          convId,
+          roomMode,
+          roomSecret: roomMode === 'private' ? roomSecret : undefined,
+          publicJoinToken: roomMode === 'public' ? publicJoinToken || undefined : undefined,
+          name: channelTitle,
+          description: activeRoomDescription,
+          members: rosterSnapshot(),
+          membersUpdatedAt: Date.now(),
+        });
+      }
+      setFavoriteRooms(await dbService.getFavoriteRooms());
+    } catch (err) {
+      console.warn('Failed to update favorite rooms:', err);
+    }
+  }, [
+    convId,
+    activeFavoriteId,
+    favoriteRooms,
+    roomMode,
+    roomSecret,
+    publicJoinToken,
+    channelTitle,
+    activeRoomDescription,
+    rosterSnapshot,
+  ]);
+
+  const removeFavoriteRoom = useCallback(async (id: string) => {
+    try {
+      await dbService.deleteFavoriteRoom(id);
+      setFavoriteRooms(await dbService.getFavoriteRooms());
+    } catch (err) {
+      console.warn('Failed to remove favorite room:', err);
+    }
+  }, []);
+
+  const openFavoriteRoom = useCallback(
+    (record: FavoriteRoomRecord) => {
+      openTab({
+        convId: record.convId,
+        roomMode: record.roomMode,
+        roomSecret: record.roomSecret,
+        publicJoinToken: record.publicJoinToken,
+        channelTitle: record.name,
+        isInitialCreator: false,
+      });
+    },
+    [openTab]
+  );
+
+  // Keep a starred room's name, description and roster current while it is open,
+  // so the list shows who is actually there rather than who happened to be there
+  // when it was starred. Debounced, since the roster churns as peers connect.
+  useEffect(() => {
+    if (!activeFavoriteId || !isFavoriteRoom) return;
+    const timer = setTimeout(() => {
+      dbService
+        .refreshFavoriteRoom(activeFavoriteId, {
+          name: channelTitle,
+          description: activeRoomDescription,
+          members: rosterSnapshot(),
+        })
+        .then(() => dbService.getFavoriteRooms())
+        .then(setFavoriteRooms)
+        .catch((err) => console.warn('Failed to refresh favorite room:', err));
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [activeFavoriteId, isFavoriteRoom, channelTitle, activeRoomDescription, rosterSnapshot]);
+
   const createPublicRoom = useCallback(
     async (name: string, description?: string, tags?: string[], language?: string) => {
       return createPublicRoomTab(name, description, tags, language);
@@ -1453,6 +1574,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     switchConversation,
     zoomLevel,
     setZoomLevel,
+    favoriteRooms,
+    isFavoriteRoom,
+    toggleFavoriteRoom,
+    removeFavoriteRoom,
+    openFavoriteRoom,
     publicRoomsList,
     refreshPublicRoomsList,
     createPublicRoom,

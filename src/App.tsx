@@ -27,6 +27,7 @@ import { JoinRequestsDialog } from './components/JoinRequestsDialog';
 import { MissingSecretDialog } from './components/MissingSecretDialog';
 import { IncomingInviteDialog } from './components/IncomingInviteDialog';
 import { PublicRoomsDialog } from './components/PublicRoomsDialog';
+import { FavoriteRoomsDialog } from './components/FavoriteRoomsDialog';
 import { CreatePublicRoomDialog } from './components/CreatePublicRoomDialog';
 import { NewRoomDialog } from './components/NewRoomDialog';
 import { QuickMessageDialog } from './components/QuickMessageDialog';
@@ -41,6 +42,7 @@ const AppContent: React.FC = () => {
   const [addContactOpen, setAddContactOpen] = useState<boolean>(false);
   const [requestsOpen, setRequestsOpen] = useState<boolean>(false);
   const [publicRoomsOpen, setPublicRoomsOpen] = useState<boolean>(false);
+  const [favoritesOpen, setFavoritesOpen] = useState<boolean>(false);
   const [createPublicOpen, setCreatePublicOpen] = useState<boolean>(false);
   const [newRoomOpen, setNewRoomOpen] = useState<boolean>(false);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState<boolean>(false);
@@ -80,6 +82,7 @@ const AppContent: React.FC = () => {
           onOpenAddContact={() => setAddContactOpen(true)}
           onOpenRequests={() => setRequestsOpen(true)}
           onOpenPublicRooms={() => setPublicRoomsOpen(true)}
+          onOpenFavorites={() => setFavoritesOpen(true)}
         />
 
         {/* Multi-Conversation Tab Bar */}
@@ -149,6 +152,8 @@ const AppContent: React.FC = () => {
         {/* Modals & Dialogs */}
         <ProfileDialog open={profileOpen} onClose={() => setProfileOpen(false)} />
         <FriendsDialog open={friendsOpen} onClose={() => setFriendsOpen(false)} />
+
+        <FavoriteRoomsDialog open={favoritesOpen} onClose={() => setFavoritesOpen(false)} />
         <InviteDialog open={inviteOpen} onClose={() => setInviteOpen(false)} />
         <SecurityDialog open={securityOpen} onClose={() => setSecurityOpen(false)} />
         <AddContactToRoomDialog

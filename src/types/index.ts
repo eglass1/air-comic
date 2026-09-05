@@ -507,6 +507,33 @@ export interface QuickMessagePayload {
  * after it is delivered, so this is what stops an acknowledged one from popping
  * up again the next time the app reconnects.
  */
+/** A person as they stood in a favourited room's roster. */
+export interface FavoriteRoomMember {
+  participantId: string;
+  screenName: string;
+  avatarName?: string;
+}
+
+/**
+ * A room the user has starred. Carries enough to rejoin without an invite —
+ * the secret for a private room, the join token for a public one — plus the
+ * roster as it last stood, so the list can show faces for rooms that are not
+ * currently open.
+ */
+export interface FavoriteRoomRecord {
+  /** `${roomMode}::${convId}` */
+  id: string;
+  convId: string;
+  roomMode: RoomMode;
+  roomSecret?: string;
+  publicJoinToken?: string;
+  name: string;
+  description?: string;
+  members: FavoriteRoomMember[];
+  membersUpdatedAt?: number;
+  savedAt: number;
+}
+
 /** Per-conversation metadata kept in IndexedDB. */
 export interface ConversationMetadataRecord {
   convId: string;

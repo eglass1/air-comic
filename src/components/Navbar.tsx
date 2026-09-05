@@ -17,6 +17,7 @@ import {
 } from '@mui/material';
 import SecurityIcon from '@mui/icons-material/Security';
 import PeopleIcon from '@mui/icons-material/People';
+import FavoriteIcon from '@mui/icons-material/Favorite';
 import AccountCircleIcon from '@mui/icons-material/AccountCircle';
 import ShareIcon from '@mui/icons-material/Share';
 import DarkModeIcon from '@mui/icons-material/DarkMode';
@@ -44,6 +45,7 @@ interface NavbarProps {
   onOpenAddContact: () => void;
   onOpenRequests: () => void;
   onOpenPublicRooms: () => void;
+  onOpenFavorites: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -56,9 +58,11 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenAddContact,
   onOpenRequests,
   onOpenPublicRooms,
+  onOpenFavorites,
 }) => {
   const {
     profile,
+    favoriteRooms,
     connectionStatus,
     connectedPeersCount,
     activeEpoch,
@@ -304,10 +308,10 @@ export const Navbar: React.FC<NavbarProps> = ({
             </IconButton>
           </Tooltip>
 
-          {/* 4. Friends (x) */}
-          <Tooltip title={`Friends (${friends.length})`}>
-            <IconButton color="inherit" onClick={onOpenFriends}>
-              <PeopleIcon />
+          {/* 4. Favorite Rooms */}
+          <Tooltip title={`Favorite Rooms (${favoriteRooms.length})`}>
+            <IconButton color="inherit" onClick={onOpenFavorites}>
+              <FavoriteIcon />
             </IconButton>
           </Tooltip>
 
@@ -353,7 +357,15 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Public Rooms</ListItemText>
             </MenuItem>
 
-            {/* 4. Friends (x) */}
+            {/* 4. Favorite Rooms (x) */}
+            <MenuItem onClick={() => { handleCloseMenu(); onOpenFavorites(); }}>
+              <ListItemIcon>
+                <FavoriteIcon fontSize="small" color="primary" />
+              </ListItemIcon>
+              <ListItemText>Favorite Rooms ({favoriteRooms.length})</ListItemText>
+            </MenuItem>
+
+            {/* 6. Friends (x) */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenFriends(); }}>
               <ListItemIcon>
                 <PeopleIcon fontSize="small" color="primary" />
@@ -369,7 +381,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Profile</ListItemText>
             </MenuItem>
 
-            {/* 6. Network/Security */}
+            {/* 7. Network/Security */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenSecurity(); }}>
               <ListItemIcon>
                 <SecurityIcon fontSize="small" color="primary" />
@@ -377,7 +389,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Network/Security</ListItemText>
             </MenuItem>
 
-            {/* 7. Comic Zoom Control */}
+            {/* 8. Comic Zoom Control */}
             <Box
               sx={{
                 display: 'flex',

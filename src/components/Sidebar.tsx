@@ -26,74 +26,7 @@ import StarIcon from '@mui/icons-material/Star';
 import { useChat } from '../context/ChatContext';
 import { Participant } from '../types';
 import { ContactCardDialog } from './ContactCardDialog';
-import { AvatarManager } from '../comic/avatarManager';
-
-const AvatarHeadIcon: React.FC<{
-  avatarName?: string;
-  screenName: string;
-  isSelf?: boolean;
-}> = ({
-  avatarName,
-  screenName,
-  isSelf,
-}) => {
-  const [iconUrl, setIconUrl] = useState<string | null>(null);
-  const avatarManager = AvatarManager.getInstance();
-
-  React.useEffect(() => {
-    let isMounted = true;
-    const cleanName = (avatarName || 'Armando').toLowerCase().replace(/\.avb$/, '');
-    avatarManager.loadAvatar(cleanName).then((av) => {
-      if (isMounted && av) {
-        const canvas = avatarManager.renderAvatarIcon(av);
-        if (canvas) {
-          setIconUrl(canvas.toDataURL());
-        }
-      }
-    });
-    return () => {
-      isMounted = false;
-    };
-  }, [avatarName]);
-
-  if (iconUrl) {
-    return (
-      <Box
-        component="img"
-        src={iconUrl}
-        alt={avatarName || screenName}
-        sx={{
-          width: 32,
-          height: 32,
-          objectFit: 'contain',
-          borderRadius: '50%',
-          bgcolor: 'background.paper',
-          border: isSelf ? '2.5px solid' : '1px solid',
-          borderColor: isSelf ? 'primary.main' : 'divider',
-          boxSizing: 'border-box',
-        }}
-      />
-    );
-  }
-
-  return (
-    <Avatar
-      sx={{
-        width: 32,
-        height: 32,
-        fontSize: '0.85rem',
-        fontWeight: 700,
-        bgcolor: isSelf ? 'background.paper' : 'primary.main',
-        color: isSelf ? 'primary.main' : 'primary.contrastText',
-        border: isSelf ? '2.5px solid' : '1px solid',
-        borderColor: isSelf ? 'primary.main' : 'divider',
-        boxSizing: 'border-box',
-      }}
-    >
-      {screenName ? screenName.charAt(0).toUpperCase() : '?'}
-    </Avatar>
-  );
-};
+import { AvatarHeadIcon } from './AvatarHeadIcon';
 
 interface SidebarProps {
   onOpenInvite: () => void;

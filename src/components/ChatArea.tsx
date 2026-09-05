@@ -15,6 +15,8 @@ import {
   ToggleButton,
   Collapse,
 } from '@mui/material';
+import FavoriteIcon from '@mui/icons-material/Favorite';
+import FavoriteBorderIcon from '@mui/icons-material/FavoriteBorder';
 import SendIcon from '@mui/icons-material/Send';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import SecurityIcon from '@mui/icons-material/Security';
@@ -59,6 +61,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     messages,
     sendMessage,
     convId,
+    isFavoriteRoom,
+    toggleFavoriteRoom,
     profile,
     activeEpoch,
     isApproved,
@@ -251,7 +255,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               }}
             >
               <Typography variant="body2" sx={{ fontWeight: 800, color: 'text.primary' }}>
-                Channel: <strong>{channelTitle}</strong>
+                {channelTitle}
               </Typography>
               <Tooltip title="Edit Channel Title">
                 <EditIcon sx={{ fontSize: 15, color: 'text.secondary', opacity: 0.7 }} />
@@ -261,7 +265,34 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </Box>
 
         {/* Right Toggle Buttons (Icon-only with Tooltips) */}
-        <Box sx={{ width: { xs: 'auto', sm: 80 }, display: 'flex', justifyContent: 'flex-end', flexShrink: 0 }}>
+        <Box
+          sx={{
+            width: { xs: 'auto', sm: 116 },
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'flex-end',
+            gap: 0.5,
+            flexShrink: 0,
+          }}
+        >
+          <Tooltip title={isFavoriteRoom ? 'Remove from Favorite Rooms' : 'Save to Favorite Rooms'}>
+            <span>
+              <IconButton
+                size="small"
+                onClick={() => { void toggleFavoriteRoom(); }}
+                disabled={!convId}
+                aria-label={isFavoriteRoom ? 'Remove from favorites' : 'Add to favorites'}
+                sx={{ color: isFavoriteRoom ? 'error.main' : 'action.disabled' }}
+              >
+                {isFavoriteRoom ? (
+                  <FavoriteIcon sx={{ fontSize: 19 }} />
+                ) : (
+                  <FavoriteBorderIcon sx={{ fontSize: 19 }} />
+                )}
+              </IconButton>
+            </span>
+          </Tooltip>
+
           <ToggleButtonGroup
             value={viewMode}
             exclusive

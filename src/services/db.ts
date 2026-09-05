@@ -3,6 +3,7 @@ import type {
   Friend,
   ChatMessage,
   ConversationMetadataRecord,
+  FavoriteRoomRecord,
   RekeyPacket,
   PendingInviteRecord,
   QuickMessageAckRecord,
@@ -12,7 +13,7 @@ import type {
 import { generateUserKeyPair, getParticipantId } from './crypto';
 
 const DB_NAME = 'AirComicDB_v2';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 /**
  * How long an acknowledged quick message stays on the suppression list. The
@@ -105,6 +106,13 @@ export class DatabaseService {
           const preapprovalStore = db.createObjectStore('preapprovals', { keyPath: 'id' });
           preapprovalStore.createIndex('convId', 'convId', { unique: false });
           preapprovalStore.createIndex('participantId', 'participantId', { unique: false });
+        }
+
+        // Rooms the user has starred, newest first when read back.
+        if (!db.objectStoreNames.contains('favorites')) {
+          const favoriteStore = db.createObjectStore('favorites', { keyPath: 'id' });
+          favoriteStore.createIndex('savedAt', 'savedAt', { unique: false });
+          favoriteStore.createIndex('convId', 'convId', { unique: false });
         }
 
         // Outgoing room invites, parked until the recipient is seen online
@@ -417,6 +425,100 @@ export class DatabaseService {
         });
         request.onsuccess = () => resolve();
         request.onerror = () => reject(request.error);
+      };
+    });
+  }
+
+  // --- Favorite Rooms ---
+
+  /** The id a room is filed under; a public and a private room can share a convId. */
+  static favoriteRoomId(roomMode: string, convId: string): string {
+    return `${roomMode}::${convId}`;
+  }
+
+  /** Saved rooms, most recently starred first. */
+  async getFavoriteRooms(): Promise<FavoriteRoomRecord[]> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('favorites', 'readonly');
+      const request = transaction.objectStore('favorites').getAll();
+      request.onsuccess = () => {
+        const rows = (request.result || []) as FavoriteRoomRecord[];
+        rows.sort((a, b) => b.savedAt - a.savedAt);
+        resolve(rows);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Star a room. Re-saving one that is already starred keeps its original
+   * position in the list rather than jumping it to the top, but refreshes the
+   * details we know about it.
+   */
+  async saveFavoriteRoom(
+    record: Omit<FavoriteRoomRecord, 'id' | 'savedAt'> & { savedAt?: number }
+  ): Promise<FavoriteRoomRecord> {
+    const db = await this.getDB();
+    const id = DatabaseService.favoriteRoomId(record.roomMode, record.convId);
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('favorites', 'readwrite');
+      const store = transaction.objectStore('favorites');
+      const existing = store.get(id);
+      existing.onerror = () => reject(existing.error);
+      existing.onsuccess = () => {
+        const prev = existing.result as FavoriteRoomRecord | undefined;
+        const row: FavoriteRoomRecord = {
+          ...record,
+          id,
+          savedAt: record.savedAt ?? prev?.savedAt ?? Date.now(),
+        };
+        const put = store.put(row);
+        put.onsuccess = () => resolve(row);
+        put.onerror = () => reject(put.error);
+      };
+    });
+  }
+
+  async deleteFavoriteRoom(id: string): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('favorites', 'readwrite');
+      const request = transaction.objectStore('favorites').delete(id);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Refresh a starred room's roster and details in place. Does nothing when the
+   * room is not starred, so callers can fire it whenever a room is open without
+   * checking first.
+   */
+  async refreshFavoriteRoom(
+    id: string,
+    patch: Partial<Pick<FavoriteRoomRecord, 'name' | 'description' | 'members' | 'roomSecret' | 'publicJoinToken'>>
+  ): Promise<void> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('favorites', 'readwrite');
+      const store = transaction.objectStore('favorites');
+      const existing = store.get(id);
+      existing.onerror = () => reject(existing.error);
+      existing.onsuccess = () => {
+        const prev = existing.result as FavoriteRoomRecord | undefined;
+        if (!prev) {
+          resolve();
+          return;
+        }
+        const next: FavoriteRoomRecord = {
+          ...prev,
+          ...patch,
+          membersUpdatedAt: patch.members ? Date.now() : prev.membersUpdatedAt,
+        };
+        const put = store.put(next);
+        put.onsuccess = () => resolve();
+        put.onerror = () => reject(put.error);
       };
     });
   }
