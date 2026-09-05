@@ -22,14 +22,20 @@ import PersonAddAlt1Icon from '@mui/icons-material/PersonAddAlt1';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import LockIcon from '@mui/icons-material/Lock';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
+import StarIcon from '@mui/icons-material/Star';
 import { useChat } from '../context/ChatContext';
 import { Participant } from '../types';
 import { ContactCardDialog } from './ContactCardDialog';
 import { AvatarManager } from '../comic/avatarManager';
 
-const AvatarHeadIcon: React.FC<{ avatarName?: string; screenName: string }> = ({
+const AvatarHeadIcon: React.FC<{
+  avatarName?: string;
+  screenName: string;
+  isSelf?: boolean;
+}> = ({
   avatarName,
   screenName,
+  isSelf,
 }) => {
   const [iconUrl, setIconUrl] = useState<string | null>(null);
   const avatarManager = AvatarManager.getInstance();
@@ -62,8 +68,9 @@ const AvatarHeadIcon: React.FC<{ avatarName?: string; screenName: string }> = ({
           objectFit: 'contain',
           borderRadius: '50%',
           bgcolor: 'background.paper',
-          border: '1px solid',
-          borderColor: 'divider',
+          border: isSelf ? '2.5px solid' : '1px solid',
+          borderColor: isSelf ? 'primary.main' : 'divider',
+          boxSizing: 'border-box',
         }}
       />
     );
@@ -76,11 +83,14 @@ const AvatarHeadIcon: React.FC<{ avatarName?: string; screenName: string }> = ({
         height: 32,
         fontSize: '0.85rem',
         fontWeight: 700,
-        bgcolor: 'primary.main',
-        color: 'primary.contrastText',
+        bgcolor: isSelf ? 'background.paper' : 'primary.main',
+        color: isSelf ? 'primary.main' : 'primary.contrastText',
+        border: isSelf ? '2.5px solid' : '1px solid',
+        borderColor: isSelf ? 'primary.main' : 'divider',
+        boxSizing: 'border-box',
       }}
     >
-      {screenName.charAt(0).toUpperCase()}
+      {screenName ? screenName.charAt(0).toUpperCase() : '?'}
     </Avatar>
   );
 };
@@ -120,13 +130,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const handleRemove = async (e: React.MouseEvent, p: Participant) => {
     e.stopPropagation();
+    const friend = friends.find((f) => f.participantId === p.participantId);
+    const name = p.screenName?.trim() || friend?.screenName?.trim() || 'this participant';
     if (
       window.confirm(
-        `Are you sure you want to remove ${p.screenName} from the conversation? This will rekey the conversation to exclude them.`
+        `Are you sure you want to remove ${name} from the conversation? This will rekey the conversation to exclude them.`
       )
     ) {
       setRemovingId(p.participantId);
-      await removeParticipant(p.participantId, p.screenName);
+      await removeParticipant(p.participantId, name);
       setRemovingId(null);
     }
   };
@@ -189,9 +201,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Participants List */}
       <List sx={{ flexGrow: 1, overflowY: 'auto', p: 1 }}>
         {participants.map((p) => {
-          const isFriend = friends.some(
+          const friend = friends.find(
             (f) => f.participantId === p.participantId
           );
+          const isFriend = !p.isSelf && Boolean(friend);
+          const displayName = p.screenName?.trim() || friend?.screenName?.trim() || 'Unknown';
+          const avatarTooltip = p.isSelf
+            ? 'This is you'
+            : isFriend
+            ? `${displayName} is your friend`
+            : '';
 
           return (
             <ListItem
@@ -205,36 +224,81 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   bgcolor: 'action.hover',
                 },
               }}
-              onClick={() => setSelectedParticipant(p)}
+              onClick={() =>
+                setSelectedParticipant({
+                  ...p,
+                  screenName: displayName,
+                  avatarName: p.avatarName || friend?.avatarName,
+                })
+              }
             >
               <ListItemAvatar sx={{ minWidth: 44 }}>
-                <Badge
-                  overlap="circular"
-                  anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
-                  variant="dot"
-                  color={p.status === 'online' ? 'success' : 'default'}
-                >
-                  <AvatarHeadIcon avatarName={p.avatarName} screenName={p.screenName} />
-                </Badge>
+                <Tooltip title={avatarTooltip} arrow disableHoverListener={!avatarTooltip}>
+                  <Box sx={{ position: 'relative', display: 'inline-flex' }}>
+                    <Badge
+                      overlap="circular"
+                      anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+                      variant="dot"
+                      color={p.status === 'online' ? 'success' : 'default'}
+                    >
+                      <AvatarHeadIcon
+                        avatarName={p.avatarName || friend?.avatarName}
+                        screenName={displayName}
+                        isSelf={p.isSelf}
+                      />
+                    </Badge>
+                    {isFriend && (
+                      <StarIcon
+                        sx={{
+                          position: 'absolute',
+                          top: -4,
+                          right: -4,
+                          fontSize: 14,
+                          color: '#ffb300',
+                          filter: 'drop-shadow(0px 1px 1px rgba(0,0,0,0.4))',
+                          pointerEvents: 'none',
+                          zIndex: 1,
+                        }}
+                      />
+                    )}
+                  </Box>
+                </Tooltip>
               </ListItemAvatar>
 
               <ListItemText
+                sx={{ my: 0, minWidth: 0, flex: '1 1 auto' }}
                 primary={
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8 }}>
-                    <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
-                      {p.screenName}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6, minWidth: 0 }}>
+                    <Typography
+                      variant="body2"
+                      noWrap
+                      sx={{
+                        fontWeight: 600,
+                        minWidth: 0,
+                        flexShrink: 1,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                      title={displayName}
+                    >
+                      {displayName}
                     </Typography>
                     {!p.isSelf && (
                       <Tooltip title="Quick Message">
                         <IconButton
                           size="small"
-                          sx={{ p: 0.25, color: 'text.secondary', '&:hover': { color: 'primary.main' } }}
+                          sx={{
+                            p: 0.25,
+                            flexShrink: 0,
+                            color: 'text.secondary',
+                            '&:hover': { color: 'primary.main' },
+                          }}
                           onClick={(e) => {
                             e.stopPropagation();
                             openQuickMessage({
                               participantId: p.participantId,
-                              screenName: p.screenName,
-                              avatarName: p.avatarName,
+                              screenName: displayName,
+                              avatarName: p.avatarName || friend?.avatarName,
                               publicKey: p.publicKey,
                               signingPublicKey: p.signingPublicKey,
                               peerId: p.peerId,
@@ -245,21 +309,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         </IconButton>
                       </Tooltip>
                     )}
-                    {p.isSelf && (
-                      <Chip label="You" size="small" color="primary" sx={{ height: 16, fontSize: '0.65rem' }} />
-                    )}
-                    {isFriend && (
-                      <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.68rem', fontWeight: 600 }}>
-                        ★ Friend
-                      </Typography>
-                    )}
                   </Box>
                 }
               />
 
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.2 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.2, flexShrink: 0, ml: 0.5 }}>
                 {roomMode !== 'public' && isApproved && !p.isSelf && p.isApproved && (
-                  <Tooltip title={`Remove ${p.screenName} from room`}>
+                  <Tooltip title={`Remove ${displayName} from room`}>
                     <IconButton
                       size="small"
                       color="error"
@@ -275,8 +331,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </Tooltip>
                 )}
 
-                  <Tooltip title="View Details">
-                  <IconButton size="small" edge="end" onClick={(e) => { e.stopPropagation(); setSelectedParticipant(p); }}>
+                <Tooltip title="View Details">
+                  <IconButton
+                    size="small"
+                    edge="end"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedParticipant({
+                        ...p,
+                        screenName: displayName,
+                        avatarName: p.avatarName || friend?.avatarName,
+                      });
+                    }}
+                  >
                     <InfoOutlinedIcon fontSize="small" />
                   </IconButton>
                 </Tooltip>

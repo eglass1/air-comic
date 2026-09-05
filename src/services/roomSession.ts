@@ -611,8 +611,8 @@ export class RoomSession {
       peerId: hello.peerId,
       publicKey: normalizePublicKey(hello.publicKey),
       signingPublicKey: normalizePublicKey(hello.signingPublicKey),
-      screenName: hello.screenName,
-      avatarName: hello.avatarName || 'Armando',
+      screenName: hello.screenName?.trim() || previous?.screenName || 'Anonymous',
+      avatarName: hello.avatarName || previous?.avatarName || 'Armando',
       contactInfo: hello.contactInfo ?? previous?.contactInfo,
       lastSeen: Date.now(),
       isSelf: false,
@@ -1087,6 +1087,22 @@ export class RoomSession {
     const participant = this.participantsMap.get(packet.targetParticipantId);
     if (participant) {
       this.participantsMap.set(packet.targetParticipantId, { ...participant, isApproved: true });
+    } else {
+      const pending = this.pendingRequestsMap.get(packet.targetParticipantId);
+      if (pending) {
+        this.participantsMap.set(packet.targetParticipantId, {
+          participantId: packet.targetParticipantId,
+          publicKey: normalizePublicKey(pending.sender.publicKey),
+          signingPublicKey: normalizePublicKey(pending.sender.signingPublicKey),
+          screenName: pending.sender.screenName?.trim() || 'Anonymous',
+          avatarName: 'Armando',
+          contactInfo: pending.sender.contactInfo,
+          lastSeen: Date.now(),
+          isSelf: false,
+          status: 'online',
+          isApproved: true,
+        });
+      }
     }
 
     if (this.pendingRequestsMap.delete(packet.targetParticipantId)) {
@@ -1155,9 +1171,25 @@ export class RoomSession {
     (rekey.members || []).forEach((memberId) => {
       this.approvedMembers.add(memberId);
       this.declinedRequesters.delete(memberId);
+      const pending = this.pendingRequestsMap.get(memberId);
       this.pendingRequestsMap.delete(memberId);
       const p = this.participantsMap.get(memberId);
-      if (p) this.participantsMap.set(memberId, { ...p, isApproved: true });
+      if (p) {
+        this.participantsMap.set(memberId, { ...p, isApproved: true });
+      } else if (pending) {
+        this.participantsMap.set(memberId, {
+          participantId: memberId,
+          publicKey: normalizePublicKey(pending.sender.publicKey),
+          signingPublicKey: normalizePublicKey(pending.sender.signingPublicKey),
+          screenName: pending.sender.screenName?.trim() || 'Anonymous',
+          avatarName: 'Armando',
+          contactInfo: pending.sender.contactInfo,
+          lastSeen: Date.now(),
+          isSelf: false,
+          status: 'online',
+          isApproved: true,
+        });
+      }
     });
 
     const self = this.participantsMap.get(myParticipantId);
@@ -1391,7 +1423,7 @@ export class RoomSession {
       peerId: existing?.peerId,
       publicKey: normalizePublicKey(req.sender.publicKey),
       signingPublicKey: normalizePublicKey(req.sender.signingPublicKey),
-      screenName: req.sender.screenName,
+      screenName: req.sender.screenName?.trim() || existing?.screenName || 'Anonymous',
       avatarName: existing?.avatarName || 'Armando',
       contactInfo: req.sender.contactInfo ?? existing?.contactInfo,
       lastSeen: Date.now(),
