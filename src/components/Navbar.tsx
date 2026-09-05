@@ -281,17 +281,8 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {/* 2. Share Invite */}
           <Tooltip title="Share Invite">
-            <IconButton
-              color="primary"
-              onClick={onOpenInvite}
-              sx={{
-                border: '1px solid',
-                borderColor: 'primary.main',
-                bgcolor: 'rgba(0, 229, 255, 0.08)',
-                '&:hover': { bgcolor: 'rgba(0, 229, 255, 0.18)' },
-              }}
-            >
-              <ShareIcon fontSize="small" />
+            <IconButton color="inherit" onClick={onOpenInvite}>
+              <ShareIcon />
             </IconButton>
           </Tooltip>
 

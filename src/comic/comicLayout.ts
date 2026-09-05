@@ -6,6 +6,11 @@ import {
   AvatarData,
   AvatarMetrics,
   EM_NEUTRAL,
+  EM_HAPPY,
+  EM_LAUGH,
+  EM_COY,
+  EM_SHOUT,
+  EM_BORED,
   TitleStarringMember,
 } from './types';
 import {
@@ -1483,6 +1488,20 @@ export class ComicLayoutEngine {
     ctx.restore();
   }
 
+  /** Tracking added to the title banner's lettering. */
+  private static readonly TITLE_LETTER_SPACING = '2.5px';
+
+  /**
+   * `letterSpacing` is a fairly recent canvas property; setting it on a context
+   * that does not support it is silently ignored rather than throwing, but the
+   * guard keeps the intent obvious.
+   */
+  private static setLetterSpacing(ctx: CanvasRenderingContext2D, value: string): void {
+    if ('letterSpacing' in ctx) {
+      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = value;
+    }
+  }
+
   static drawTitlePanel(
     ctx: CanvasRenderingContext2D,
     panel: ComicPanel,
@@ -1512,7 +1531,9 @@ export class ComicLayoutEngine {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    // Measure and format title text
+    // Measure and format title text. Bangers sets very tightly, so the letters
+    // are tracked apart a little; measureText accounts for it once it is set.
+    this.setLetterSpacing(ctx, this.TITLE_LETTER_SPACING);
     ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
     const titleMetrics = ctx.measureText(episodeTitle);
     if (titleMetrics.width > boxW - 20) {
@@ -1521,12 +1542,13 @@ export class ComicLayoutEngine {
       const mid = Math.ceil(words.length / 2);
       const line1 = words.slice(0, mid).join(' ');
       const line2 = words.slice(mid).join(' ');
-      ctx.font = `bold 17px ${COMIC_FONT_FAMILY}`;
+      ctx.font = `bold 17px "Bangers", ${COMIC_FONT_FAMILY}`;
       ctx.fillText(line1, width / 2, boxY + boxH * 0.32);
       ctx.fillText(line2, width / 2, boxY + boxH * 0.70);
     } else {
       ctx.fillText(episodeTitle, width / 2, boxY + boxH / 2);
     }
+    this.setLetterSpacing(ctx, '0px');
 
     // 2. STARRING Subtitle
     ctx.font = `bold 16px ${COMIC_FONT_FAMILY}`;
@@ -1671,9 +1693,25 @@ export class ComicLayoutEngine {
     const av = avatarManager['avatarCache'].get(cleanKey);
 
     if (av) {
-      const iconCanvas = avatarManager.renderAvatarIcon(av);
-      if (iconCanvas) {
-        ctx.drawImage(iconCanvas, iconX, iconY, iconSize, iconSize);
+      // Each face gets its own expression and facing, picked from a seed seeded
+      // on who they are, so the cast list has some life in it but a given person
+      // looks the same every time the card is drawn.
+      const variant = this.titleHeadVariant(member);
+      const head =
+        avatarManager.renderAvatarHead(av, variant.emotion, variant.intensity, variant.flip) ||
+        avatarManager.renderAvatarIcon(av);
+      if (head) {
+        // Fit inside the square box without stretching the artwork.
+        const scale = Math.min(iconSize / head.width, iconSize / head.height);
+        const w = Math.round(head.width * scale);
+        const h = Math.round(head.height * scale);
+        ctx.drawImage(
+          head,
+          iconX + Math.round((iconSize - w) / 2),
+          iconY + Math.round((iconSize - h) / 2),
+          w,
+          h
+        );
       }
     } else {
       // Fallback placeholder head circle
@@ -1698,6 +1736,30 @@ export class ComicLayoutEngine {
     ctx.textBaseline = 'middle';
     const displayName = this.truncateText(ctx, member.screenName, maxNameWidth);
     ctx.fillText(displayName, nameX, nameY);
+  }
+
+  /**
+   * Expressions the cast card draws from. Neutral is in there more than once so
+   * a straight face stays the most common look.
+   */
+  private static readonly TITLE_HEAD_EMOTIONS: { emotion: number; intensity: number }[] = [
+    { emotion: EM_NEUTRAL, intensity: 0 },
+    { emotion: EM_NEUTRAL, intensity: 0 },
+    { emotion: EM_HAPPY, intensity: 0.7 },
+    { emotion: EM_HAPPY, intensity: 1.0 },
+    { emotion: EM_LAUGH, intensity: 0.9 },
+    { emotion: EM_COY, intensity: 0.7 },
+    { emotion: EM_SHOUT, intensity: 0.8 },
+    { emotion: EM_BORED, intensity: 0.6 },
+  ];
+
+  /** Stable per-person pick, so the card does not reshuffle on every redraw. */
+  private static titleHeadVariant(
+    member: TitleStarringMember
+  ): { emotion: number; intensity: number; flip: boolean } {
+    const rand = new MsvcRand(seedFromId(`${member.screenName}|${member.avatarName}`));
+    const choice = this.TITLE_HEAD_EMOTIONS[rand.next() % this.TITLE_HEAD_EMOTIONS.length];
+    return { ...choice, flip: rand.next() % 2 === 0 };
   }
 
   static truncateText(

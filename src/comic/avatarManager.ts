@@ -57,6 +57,7 @@ export class AvatarManager {
   private backdropCache: Map<string, BackdropData> = new Map();
   private characterCanvasCache: Map<string, RenderedCharacter> = new Map();
   private metricsCache: Map<string, AvatarMetrics> = new Map();
+  private headCanvasCache: Map<string, HTMLCanvasElement> = new Map();
   private iconCanvasCache: Map<string, HTMLCanvasElement> = new Map();
 
   // Known built-in avatar list
@@ -378,6 +379,99 @@ export class AvatarManager {
     };
     this.metricsCache.set(cleanKey, metrics);
     return metrics;
+  }
+
+  /**
+   * A head-and-shoulders crop at the artwork's native resolution, for the title
+   * card's cast list.
+   *
+   * The avatar's own icon pose is a small bitmap meant for a roster row, so
+   * blowing it up to title size makes it fuzzy. A complex avatar's face pose is
+   * the same head drawn much larger, and a simple avatar's body can be cropped
+   * to its head band, so both give something sharp to scale from.
+   */
+  renderAvatarHead(
+    avatar: AvatarData,
+    emotion: number = EM_NEUTRAL,
+    intensity: number = 0.0,
+    flip: boolean = false
+  ): HTMLCanvasElement | null {
+    const cacheKey = `${avatar.name}_head_${emotion.toFixed(2)}_${intensity.toFixed(2)}_${flip ? 'F' : 'N'}`;
+    const cached = this.headCanvasCache.get(cacheKey);
+    if (cached) return cached;
+
+    let source: HTMLCanvasElement | null = null;
+
+    if (avatar.type === AvatarType.AT_COMPLEX) {
+      const poseRecs = EmotionEngine.getFaceAndTorso(avatar, emotion, intensity);
+      const facePose = poseRecs ? AVBParser.getPose(avatar, poseRecs.face.poseID) : null;
+      if (facePose?.drawing) source = AVBParser.imageToCanvas(facePose.drawing);
+    }
+
+    if (!source) {
+      // Simple avatar (or a complex one missing its face pose): crop the head
+      // band off the full composite.
+      const rendered = this.renderCharacter(avatar, emotion, intensity, false);
+      const cropH = Math.max(1, Math.min(rendered.canvas.height, Math.round(rendered.headBottomY)));
+      const crop = document.createElement('canvas');
+      crop.width = rendered.canvas.width;
+      crop.height = cropH;
+      const cropCtx = crop.getContext('2d');
+      if (!cropCtx) return null;
+      cropCtx.drawImage(rendered.canvas, 0, 0);
+      source = crop;
+    }
+
+    const trimmed = AvatarManager.trimTransparent(source) ?? source;
+    const result = flip ? AvatarManager.flipCanvas(trimmed) : trimmed;
+    this.headCanvasCache.set(cacheKey, result);
+    return result;
+  }
+
+  /** Crops away fully transparent margins so the head fills its box. */
+  private static trimTransparent(canvas: HTMLCanvasElement): HTMLCanvasElement | null {
+    try {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx || !canvas.width || !canvas.height) return null;
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      let minX = canvas.width;
+      let minY = canvas.height;
+      let maxX = -1;
+      let maxY = -1;
+      for (let y = 0; y < canvas.height; y++) {
+        for (let x = 0; x < canvas.width; x++) {
+          if (data[(y * canvas.width + x) * 4 + 3] > 40) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      if (maxX < minX || maxY < minY) return null;
+      const out = document.createElement('canvas');
+      out.width = maxX - minX + 1;
+      out.height = maxY - minY + 1;
+      const outCtx = out.getContext('2d');
+      if (!outCtx) return null;
+      outCtx.drawImage(canvas, -minX, -minY);
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  private static flipCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
+    const out = document.createElement('canvas');
+    out.width = canvas.width;
+    out.height = canvas.height;
+    const ctx = out.getContext('2d');
+    if (ctx) {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(canvas, 0, 0);
+    }
+    return out;
   }
 
   renderAvatarIcon(avatar: AvatarData): HTMLCanvasElement {
