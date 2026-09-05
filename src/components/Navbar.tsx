@@ -32,8 +32,21 @@ import LockIcon from '@mui/icons-material/Lock';
 import ZoomInIcon from '@mui/icons-material/ZoomIn';
 import ZoomOutIcon from '@mui/icons-material/ZoomOut';
 import InfoIcon from '@mui/icons-material/Info';
+import InstallMobileIcon from '@mui/icons-material/InstallMobile';
 import { useChat } from '../context/ChatContext';
+import { usePwaStatus } from '../services/pwa';
 import { AboutDialog } from './AboutDialog';
+
+type LinkState = 'success' | 'warning' | 'error';
+
+/** RGB triples matching the palette entries the status dot uses. */
+const LINK_RGB: Record<LinkState, string> = {
+  success: '0, 230, 118',
+  warning: '255, 171, 0',
+  error: '255, 82, 82',
+};
+
+const linkTint = (state: LinkState, alpha: number): string => `rgba(${LINK_RGB[state]}, ${alpha})`;
 
 interface NavbarProps {
   themeMode: 'dark' | 'light';
@@ -46,6 +59,7 @@ interface NavbarProps {
   onOpenRequests: () => void;
   onOpenPublicRooms: () => void;
   onOpenFavorites: () => void;
+  onOpenInstall: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -59,6 +73,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenRequests,
   onOpenPublicRooms,
   onOpenFavorites,
+  onOpenInstall,
 }) => {
   const {
     profile,
@@ -78,8 +93,15 @@ export const Navbar: React.FC<NavbarProps> = ({
     setZoomLevel,
   } = useChat();
 
+  const { standalone, online } = usePwaStatus();
+
   const [menuAnchor, setMenuAnchor] = useState<null | HTMLElement>(null);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
+
+  // The device being offline is distinct from the relay mesh not being reachable,
+  // and the indicator says which one it is.
+  const isLinked = online && connectionStatus === 'connected';
+  const linkState: LinkState = !online ? 'error' : isLinked ? 'success' : 'warning';
 
   const handleOpenMenu = (event: React.MouseEvent<HTMLElement>) => {
     setMenuAnchor(event.currentTarget);
@@ -105,6 +127,9 @@ export const Navbar: React.FC<NavbarProps> = ({
         color: 'text.primary',
         borderBottom: '1px solid',
         borderColor: 'divider',
+        // Extend the bar's own surface under a notch / translucent status bar.
+        pt: 'env(safe-area-inset-top)',
+        flexShrink: 0,
       }}
     >
       <Toolbar sx={{ justifyContent: 'space-between', gap: 1, minHeight: 60 }}>
@@ -213,7 +238,9 @@ export const Navbar: React.FC<NavbarProps> = ({
           {/* Combined Connection & Peers Status Indicator */}
           <Tooltip
             title={
-              connectionStatus !== 'connected'
+              !online
+                ? 'Offline - no network connection'
+                : connectionStatus !== 'connected'
                 ? 'Not Connected'
                 : connectedPeersCount === 0
                 ? 'Connected (no peers)'
@@ -230,17 +257,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                 gap: 0.5,
                 height: 24,
                 minWidth: 24,
-                px: connectionStatus === 'connected' && connectedPeersCount > 0 ? 0.8 : 0.7,
+                px: isLinked && connectedPeersCount > 0 ? 0.8 : 0.7,
                 borderRadius: 4,
-                bgcolor:
-                  connectionStatus === 'connected'
-                    ? 'rgba(0, 230, 118, 0.12)'
-                    : 'rgba(255, 171, 0, 0.12)',
+                bgcolor: linkTint(linkState, 0.12),
                 border: '1px solid',
-                borderColor:
-                  connectionStatus === 'connected'
-                    ? 'rgba(0, 230, 118, 0.3)'
-                    : 'rgba(255, 171, 0, 0.3)',
+                borderColor: linkTint(linkState, 0.3),
               }}
             >
               <Box
@@ -248,14 +269,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                   width: 8,
                   height: 8,
                   borderRadius: '50%',
-                  bgcolor: connectionStatus === 'connected' ? 'success.main' : 'warning.main',
-                  boxShadow:
-                    connectionStatus === 'connected'
-                      ? '0 0 6px rgba(0, 230, 118, 0.8)'
-                      : '0 0 6px rgba(255, 171, 0, 0.8)',
+                  bgcolor: `${linkState}.main`,
+                  boxShadow: `0 0 6px ${linkTint(linkState, 0.8)}`,
                 }}
               />
-              {connectionStatus === 'connected' && connectedPeersCount > 0 && (
+              {isLinked && connectedPeersCount > 0 && (
                 <Typography
                   variant="caption"
                   sx={{
@@ -451,10 +469,20 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>{themeMode === 'light' ? 'Dark' : 'Light'}</ListItemText>
             </MenuItem>
 
+            {/* 9. Install App (hidden once running as an installed app) */}
+            {!standalone && (
+              <MenuItem onClick={() => { handleCloseMenu(); onOpenInstall(); }}>
+                <ListItemIcon>
+                  <InstallMobileIcon fontSize="small" color="primary" />
+                </ListItemIcon>
+                <ListItemText>Install App...</ListItemText>
+              </MenuItem>
+            )}
+
             {/* Separator for Clear Local Message History */}
             <Divider sx={{ my: 0.5 }} />
 
-            {/* 9. Clear Local Message History */}
+            {/* 10. Clear Local Message History */}
             <MenuItem onClick={handleClearHistory} sx={{ color: 'error.main' }}>
               <ListItemIcon>
                 <DeleteSweepIcon fontSize="small" color="error" />
@@ -464,7 +492,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
             <Divider sx={{ my: 0.5 }} />
 
-            {/* 10. About... */}
+            {/* 11. About... */}
             <MenuItem
               onClick={() => {
                 handleCloseMenu();

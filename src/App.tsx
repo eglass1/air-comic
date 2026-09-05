@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   ThemeProvider,
   CssBaseline,
@@ -8,6 +8,9 @@ import {
   IconButton,
   Fab,
   Badge,
+  Snackbar,
+  Alert,
+  Button,
 } from '@mui/material';
 import PeopleIcon from '@mui/icons-material/People';
 import CloseIcon from '@mui/icons-material/Close';
@@ -32,6 +35,8 @@ import { CreatePublicRoomDialog } from './components/CreatePublicRoomDialog';
 import { NewRoomDialog } from './components/NewRoomDialog';
 import { QuickMessageDialog } from './components/QuickMessageDialog';
 import { IncomingQuickMessageOverlay } from './components/IncomingQuickMessageOverlay';
+import { InstallAppDialog } from './components/InstallAppDialog';
+import { applyUpdate, usePwaStatus } from './services/pwa';
 
 const AppContent: React.FC = () => {
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>('light');
@@ -46,12 +51,22 @@ const AppContent: React.FC = () => {
   const [createPublicOpen, setCreatePublicOpen] = useState<boolean>(false);
   const [newRoomOpen, setNewRoomOpen] = useState<boolean>(false);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState<boolean>(false);
+  const [installOpen, setInstallOpen] = useState<boolean>(false);
+  const [updateDismissed, setUpdateDismissed] = useState<boolean>(false);
 
   const { isApproved, pendingJoinRequests } = useChat();
+  const { updateReady } = usePwaStatus();
 
   const isMobile = useMediaQuery('(max-width:900px)');
 
   const theme = useMemo(() => createAppTheme(themeMode), [themeMode]);
+
+  // Keep the browser/OS chrome tint (Android status bar, installed title bar)
+  // in step with the in-app theme so the app surface reads as one piece.
+  useEffect(() => {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    meta?.setAttribute('content', theme.palette.background.paper);
+  }, [theme]);
 
   const toggleTheme = () => {
     setThemeMode((prev) => (prev === 'dark' ? 'light' : 'dark'));
@@ -62,13 +77,19 @@ const AppContent: React.FC = () => {
       <CssBaseline />
       <Box
         sx={{
+          // dvh tracks collapsing mobile browser chrome; vh is the fallback.
           height: '100vh',
-          width: '100vw',
+          '@supports (height: 100dvh)': { height: '100dvh' },
+          width: '100%',
           display: 'flex',
           flexDirection: 'column',
           bgcolor: 'background.default',
           color: 'text.primary',
           overflow: 'hidden',
+          // Landscape display cutouts. Top and bottom insets are applied by the
+          // navbar and the composer so their own surfaces extend into them.
+          pl: 'env(safe-area-inset-left)',
+          pr: 'env(safe-area-inset-right)',
         }}
       >
         {/* Navbar */}
@@ -83,6 +104,7 @@ const AppContent: React.FC = () => {
           onOpenRequests={() => setRequestsOpen(true)}
           onOpenPublicRooms={() => setPublicRoomsOpen(true)}
           onOpenFavorites={() => setFavoritesOpen(true)}
+          onOpenInstall={() => setInstallOpen(true)}
         />
 
         {/* Multi-Conversation Tab Bar */}
@@ -108,7 +130,13 @@ const AppContent: React.FC = () => {
               onClose={() => setMobileDrawerOpen(false)}
               slotProps={{
                 paper: {
-                  sx: { width: 310, bgcolor: 'background.paper' },
+                  sx: {
+                    width: 310,
+                    bgcolor: 'background.paper',
+                    pt: 'env(safe-area-inset-top)',
+                    pb: 'env(safe-area-inset-bottom)',
+                    pl: 'env(safe-area-inset-left)',
+                  },
                 },
               }}
             >
@@ -182,10 +210,37 @@ const AppContent: React.FC = () => {
           onOpenPublicDirectory={() => setPublicRoomsOpen(true)}
           onOpenCreatePublicRoom={() => setCreatePublicOpen(true)}
         />
+        <InstallAppDialog open={installOpen} onClose={() => setInstallOpen(false)} />
         <MissingSecretDialog />
         <IncomingInviteDialog />
         <QuickMessageDialog />
         <IncomingQuickMessageOverlay />
+
+        {/* A newer build is cached and waiting; swapping it in is the user's
+            call, and dismissing it must not leave the composer covered. */}
+        <Snackbar
+          open={updateReady && !updateDismissed}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+          sx={{ mb: 'env(safe-area-inset-bottom)' }}
+        >
+          <Alert
+            severity="info"
+            variant="filled"
+            sx={{ alignItems: 'center' }}
+            action={
+              <>
+                <Button color="inherit" size="small" onClick={applyUpdate} sx={{ fontWeight: 700 }}>
+                  Reload
+                </Button>
+                <IconButton size="small" color="inherit" onClick={() => setUpdateDismissed(true)}>
+                  <CloseIcon fontSize="small" />
+                </IconButton>
+              </>
+            }
+          >
+            A new version of AirComic is ready.
+          </Alert>
+        </Snackbar>
       </Box>
     </ThemeProvider>
   );

@@ -463,6 +463,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         elevation={4}
         sx={{
           p: { xs: 1, sm: 1.5 },
+          // Keep the composer clear of the home indicator / gesture bar while
+          // letting the paper surface itself run to the bottom edge.
+          pb: { xs: 'calc(8px + env(safe-area-inset-bottom))', sm: 'calc(12px + env(safe-area-inset-bottom))' },
           bgcolor: 'background.paper',
           borderTop: '1px solid',
           borderColor: 'divider',

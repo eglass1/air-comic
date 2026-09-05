@@ -22,7 +22,7 @@
 
 AirComic is a multi-user, peer-coordinated, end-to-end encrypted chat application built with **React**, **HTML5 Canvas**, and **Material Design (MUI)**. It recreates and modernizes the classic **Microsoft Comic Chat** engine, automatically generating dynamic comic strips with characters, speech/thought/whisper balloons, and emotional poses directly from conversation streams.
 
-Everything gets bundled into a single `index.html` file that you can drop on any static web server and pull up in your browser. You can try it out here:
+Everything gets bundled into a single `index.html` file that you can drop on any static web server and pull up in your browser. It also installs as a Progressive Web App, so it runs from a phone home screen in its own window. You can try it out here:
 
 [https://eglass1.github.io/air-comic/](https://eglass1.github.io/air-comic/)
 
@@ -77,17 +77,52 @@ I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScri
 
 ---
 
+## 📱 Install as an App (PWA)
+
+AirComic ships as an installable PWA. Launched from its icon it opens standalone -- no address bar, no browser toolbar -- respects display cutouts and the software keyboard, and starts from cache even with no connection.
+
+- **Android / Chromium**: use **Install App...** in the AirComic menu, or the browser's own install action.
+- **iPhone / iPad**: in Safari, tap **Share → Add to Home Screen**. (Safari has no install prompt; the in-app dialog spells out the steps.)
+- **Desktop Chrome/Edge**: same **Install App...** menu item, which opens AirComic in its own window.
+
+The install option hides itself once you are already running the installed app.
+
+Offline means *the app starts*, not *chat works*: AirComic is peer-to-peer, so with no network there are no peers. The status dot in the toolbar distinguishes the two -- red for no network connection, amber for a network but no relay mesh, green for connected (with the peer count).
+
+When a new version is deployed, the running app keeps working from its cached build and offers a **Reload** prompt; nothing swaps out mid-conversation, and nobody is stranded on an old build.
+
 ## 📦 Building and Running
 
 ```bash
 # Install dependencies
 npm install
 
-# Build standalone HTML bundle (output: docs/index.html)
+# Build standalone HTML bundle + PWA files (output: docs/)
 npm run build
 
 # Start development server
 npm run dev
+
+# Serve the real production output (needed to exercise the PWA)
+npm run preview
 ```
 
-Open [`docs/index.html`](docs/index.html) directly or host it on any static web server (such as GitHub Pages).
+The build writes to `docs/`, which is what GitHub Pages publishes:
+
+```
+docs/
+├── index.html              the entire application, self-contained
+├── manifest.webmanifest    name, icons, standalone display mode
+├── sw.js                   app-shell cache, update flow, push handlers
+└── icons/                  192/512 any + maskable, apple-touch-icon
+```
+
+`docs/index.html` remains a genuine single file: open it directly, e-mail it, or drop it on any static host and it runs as an ordinary web page. The companion files are what make it *installable* -- a manifest in a `data:` URL cannot declare a scope, and a service worker cannot be registered from one at all, so they are deliberately kept as separate same-origin files rather than inlined.
+
+All paths are relative, so the same output works at a domain root or under a project subpath such as `/air-comic/`. PWA features need a secure context: `https://`, or `http://localhost` for testing. Opening `docs/index.html` over `file://` still runs the app, but registers no service worker and cannot be installed.
+
+The icon set in `pwa/icons/` is generated from `logo.png` and committed, so a normal build needs no extra tooling. Regenerate it only when the logo changes:
+
+```bash
+python3 scripts/generate-icons.py   # requires Pillow
+```
