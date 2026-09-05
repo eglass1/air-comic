@@ -27,6 +27,8 @@ const ComicPanelItem: React.FC<{
   panel: ComicPanel;
   panelWidth: number;
   panelHeight: number;
+  /** 1 at full size, less when the panel has to shrink to fit the window. */
+  displayScale: number;
   avatarManager: AvatarManager;
   loadedAvatars: Map<string, AvatarData>;
   backdropData: BackdropData | null;
@@ -34,6 +36,7 @@ const ComicPanelItem: React.FC<{
   panel,
   panelWidth,
   panelHeight,
+  displayScale,
   avatarManager,
   loadedAvatars,
   backdropData,
@@ -65,12 +68,13 @@ const ComicPanelItem: React.FC<{
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // High DPI Canvas backing
+    // High DPI Canvas backing. The backing store is always the full panel size;
+    // shrinking to fit the window is done in CSS by the effect below, so a
+    // narrow window downscales a high-resolution image rather than forcing a
+    // re-layout of the whole strip on every resize tick.
     const dpr = window.devicePixelRatio || 2;
     canvas.width = panelWidth * dpr;
     canvas.height = panelHeight * dpr;
-    canvas.style.width = `${panelWidth}px`;
-    canvas.style.height = `${panelHeight}px`;
 
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, panelWidth, panelHeight);
@@ -90,6 +94,14 @@ const ComicPanelItem: React.FC<{
       backdropData?.canvas || null
     );
   }, [panel, panelWidth, panelHeight, loadedAvatars, backdropData, avatarManager, fontsReady]);
+
+  // Displayed size. Kept in its own effect so resizing never re-runs the draw.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.style.width = `${Math.round(panelWidth * displayScale)}px`;
+    canvas.style.height = `${Math.round(panelHeight * displayScale)}px`;
+  }, [panelWidth, panelHeight, displayScale]);
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -271,12 +283,44 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const [availableWidth, setAvailableWidth] = useState<number>(0);
 
   const baseWidth = 400;
   const baseHeight = 425; // Scaled vertically to 125% (400x425 near-square aspect ratio)
 
   const panelWidth = Math.round(baseWidth * zoomLevel);
   const panelHeight = Math.round(baseHeight * zoomLevel);
+
+  // Track the width actually available to the strip. clientWidth already
+  // excludes any vertical scrollbar, so taking the padding off it leaves the
+  // room the panels really have.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const style = window.getComputedStyle(el);
+      const padding =
+        (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      setAvailableWidth(Math.max(0, el.clientWidth - padding));
+    };
+    measure();
+    // Both, deliberately: the observer catches the container changing on its own
+    // (the sidebar opening, a tab bar appearing), while the window listener
+    // covers plain window resizes even where observer delivery is throttled.
+    window.addEventListener('resize', measure);
+    const observer =
+      typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    observer?.observe(el);
+    return () => {
+      window.removeEventListener('resize', measure);
+      observer?.disconnect();
+    };
+  }, []);
+
+  // Never wider than the window; a narrow screen scales the whole panel down
+  // rather than pushing it off the side.
+  const displayScale =
+    availableWidth > 0 ? Math.min(1, availableWidth / panelWidth) : 1;
 
   // Pick 3 random distinct avatars for this room's title page (Earl excluded)
   const titleAvatars = useMemo(() => {
@@ -414,6 +458,7 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
             panel={panel}
             panelWidth={panelWidth}
             panelHeight={panelHeight}
+            displayScale={displayScale}
             avatarManager={avatarManager}
             loadedAvatars={loadedAvatars}
             backdropData={backdropData}
