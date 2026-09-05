@@ -283,7 +283,9 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
     return ComicLayoutEngine.getRandomTitleAvatars();
   }, [roomName]);
 
-  // Generate Panels
+  // Generate Panels. `loadedAvatars` is a dependency because the panel camera
+  // sizes the cast from each avatar's real proportions; until the art arrives
+  // the layout uses estimates, and re-runs once for real when it lands.
   const panels = useMemo(() => {
     return ComicLayoutEngine.generatePanels(messages, {
       panelWidth,
@@ -293,8 +295,9 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
       titleAvatars,
       profile,
       participants,
+      avatarMetrics: (avatarName) => avatarManager.getAvatarMetrics(avatarName),
     });
-  }, [messages, panelWidth, panelHeight, defaultBackdrop, roomName, titleAvatars, profile, participants]);
+  }, [messages, panelWidth, panelHeight, defaultBackdrop, roomName, titleAvatars, profile, participants, avatarManager, loadedAvatars]);
 
   // Pre-load Backdrop
   useEffect(() => {

@@ -4,12 +4,45 @@ import {
   ComicBalloon,
   BalloonMode,
   AvatarData,
+  AvatarMetrics,
   EM_NEUTRAL,
   TitleStarringMember,
 } from './types';
+import {
+  buildBalloonOutline,
+  arcPoints,
+  breakSpline,
+  XBORDER,
+  SMALLDELTA,
+  LARGEDELTA,
+  MINTAILHEIGHT,
+  BUBBLEHEIGHT,
+  INTERBUBBLE,
+  ENDBUBBLEWIDTH,
+  type BalloonOutline,
+  type BalloonFontMetrics,
+  type Pt,
+} from './balloonSpline';
 import { EmotionEngine, DetectedEmotion } from './emotionEngine';
 import { AvatarManager } from './avatarManager';
 import { ChatMessage, Participant } from '../types';
+
+/** Per-speaker placement memory, kept across the panels of one strip. */
+export interface CharacterHysteresis {
+  /** Which way they faced last time (false = facing right). */
+  lastDir: boolean;
+  /** Who stood immediately to their left / right in the previous panel. */
+  lastLeft: string | null;
+  lastRight: string | null;
+}
+
+export interface PanelLayoutContext {
+  hysteresis: Map<string, CharacterHysteresis>;
+  /** participantId -> the participantIds that speaker was addressing. */
+  talkTos: Map<string, string[]>;
+  /** Avatar proportions, when the artwork has loaded. */
+  metricsOf?: (avatarName: string) => AvatarMetrics | null;
+}
 
 export interface LayoutOptions {
   panelWidth: number;
@@ -19,6 +52,12 @@ export interface LayoutOptions {
   titleAvatars?: string[];
   profile?: { screenName?: string; avatarName?: string } | null;
   participants?: Participant[];
+  /**
+   * Avatar proportions, so the panel camera can size the cast. Returns null for
+   * an avatar whose art has not loaded yet, and the layout falls back to
+   * estimates until it has.
+   */
+  avatarMetrics?: (avatarName: string) => AvatarMetrics | null;
 }
 
 export const COMIC_FONT_FAMILY =
@@ -26,6 +65,54 @@ export const COMIC_FONT_FAMILY =
 
 /** Line box height used for balloon text, at both layout and draw time. */
 const BALLOON_LINE_HEIGHT = 16;
+
+/**
+ * Approximate text height for the balloon font, used in the original's area
+ * estimate (its tmHeight).
+ */
+const BALLOON_TEXT_HEIGHT = 16;
+
+/**
+ * The original seeds a panel's layout with srand(m_seed) so the same panel
+ * always comes out the same on redraw, then uses rand() to vary balloon widths.
+ * This is that generator; we seed it from the panel id so the variety is stable
+ * across re-renders instead of shuffling on every keystroke.
+ */
+class MsvcRand {
+  private state: number;
+
+  constructor(seed: number) {
+    this.state = seed >>> 0;
+  }
+
+  next(): number {
+    this.state = (Math.imul(this.state, 214013) + 2531011) >>> 0;
+    return (this.state >>> 16) & 0x7fff;
+  }
+
+  /** balloon.cpp randfloat(): rand() / RAND_MAX, in [0, 1]. */
+  float(): number {
+    return this.next() / 32767;
+  }
+}
+
+function seedFromId(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h = Math.imul(h ^ id.charCodeAt(i), 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Font metrics the outline builder needs. `baseAdd` is the Comic Sans vertical
+ * kern the original applies (30 twips at the 180-twip balloon size).
+ */
+const BALLOON_FONT_METRICS: BalloonFontMetrics = {
+  lineHeight: BALLOON_LINE_HEIGHT,
+  topOffset: 1,
+  baseAdd: 2,
+};
 
 export function balloonFontFor(mode: BalloonMode): string {
   return mode === 'whisper'
@@ -162,6 +249,40 @@ export class ComicLayoutEngine {
     return result.length > 0 ? result : [text];
   }
 
+  /** The original caps a panel at five bodies and five balloons. */
+  static readonly MAX_PANEL_BODIES = 5;
+  static readonly MAX_PANEL_BALLOONS = 5;
+
+  /**
+   * Work out who a line is addressed to. Comic Chat took this from IRC-style
+   * addressing, so we look for the classic "Name:" / "Name," opener first and
+   * otherwise accept the name mentioned anywhere in the line.
+   */
+  private static detectTalkTos(
+    text: string,
+    idByName: Map<string, string>,
+    selfId: string
+  ): string[] {
+    if (!text) return [];
+    const found: string[] = [];
+    const opener = text.match(/^\s*([^\s,:]{1,32})\s*[,:]/);
+    const openerId = opener ? idByName.get(opener[1].toLowerCase()) : undefined;
+    if (openerId && openerId !== selfId) found.push(openerId);
+
+    const lower = text.toLowerCase();
+    for (const [name, id] of idByName) {
+      if (id === selfId || found.includes(id)) continue;
+      const at = lower.indexOf(name);
+      if (at < 0) continue;
+      // Whole word only, so "Sam" does not match inside "Samantha".
+      const before = at === 0 ? ' ' : lower[at - 1];
+      const after = at + name.length >= lower.length ? ' ' : lower[at + name.length];
+      if (/[a-z0-9]/.test(before) || /[a-z0-9]/.test(after)) continue;
+      found.push(id);
+    }
+    return found;
+  }
+
   static generatePanels(
     messages: ChatMessage[],
     options: Partial<LayoutOptions> = {}
@@ -218,6 +339,23 @@ export class ComicLayoutEngine {
 
     // Up to 8 members (2 columns of 4 rows, bumping oldest when > 8)
     const starringMembers = Array.from(seenMembersMap.values()).slice(-8);
+
+    // Who is in the room, so a line can be matched to the person it addresses.
+    const castById = new Map<string, { screenName: string; avatarName: string }>();
+    const idByName = new Map<string, string>();
+    messages.forEach((msg) => {
+      if (msg.isSystem || !msg.senderId) return;
+      const sName = msg.sender?.screenName || (msg as any).senderName;
+      if (!sName) return;
+      castById.set(msg.senderId, {
+        screenName: sName,
+        avatarName: msg.sender?.avatarName || (msg as any).avatarName || 'Armando',
+      });
+      idByName.set(sName.toLowerCase(), msg.senderId);
+    });
+
+    /** participantId -> who they were last addressing. */
+    const talkTos = new Map<string, string[]>();
 
     const panels: ComicPanel[] = [];
 
@@ -295,18 +433,14 @@ export class ComicLayoutEngine {
         } else if (cIdx > 0) {
           // Subsequent chunks of a split long message flow into a new panel
           startNew = true;
-        } else if (currentPanel.balloons.length >= 2) {
-          // Max 2 balloons per panel for clean readability
+        } else if (currentPanel.balloons.length >= this.MAX_PANEL_BALLOONS) {
           startNew = true;
-        } else {
-          // If another balloon is in the current panel:
-          const lastBalloon = currentPanel.balloons[currentPanel.balloons.length - 1];
-          if (lastBalloon && lastBalloon.speakerParticipantId === senderId) {
-            // Same speaker can say 2 consecutive sentences in 1 panel only if short
-            if (lastBalloon.text.length + chunkText.length > 70) {
-              startNew = true;
-            }
-          }
+        } else if (currentPanel.characters.some((c) => c.participantId === senderId)) {
+          // Already in this panel, as speaker or listener: the original starts a
+          // fresh panel rather than drawing anyone twice (CUnitPanelPage::AddLine
+          // checking last->HasMember). It is what gives a back-and-forth its
+          // panel-per-line rhythm.
+          startNew = true;
         }
 
         if (startNew) {
@@ -322,6 +456,11 @@ export class ComicLayoutEngine {
           panels.push(currentPanel);
           panelIndex++;
         }
+
+        // Note who this line addresses; it steers where people stand and who
+        // gets pulled into the panel to listen.
+        const addressed = this.detectTalkTos(rawText, idByName, senderId);
+        if (cIdx === 0) talkTos.set(senderId, addressed);
 
         // Add character to panel if not already present
         let charEntry = currentPanel!.characters.find(
@@ -353,12 +492,40 @@ export class ComicLayoutEngine {
           charEntry.isSpeaker = true;
         }
 
-        // Add balloon for this chunk
+        // Pull the people being spoken to into the panel as listeners, up to the
+        // original's five-body limit (CUnitPanel::AddTalkTos).
+        for (const targetId of talkTos.get(senderId) ?? []) {
+          if (currentPanel!.characters.length >= this.MAX_PANEL_BODIES) break;
+          if (currentPanel!.characters.some((c) => c.participantId === targetId)) continue;
+          const info = castById.get(targetId);
+          if (!info) continue;
+          currentPanel!.characters.push({
+            participantId: targetId,
+            screenName: info.screenName,
+            avatarName: info.avatarName,
+            avatarData: null,
+            emotion: EM_NEUTRAL,
+            intensity: 0,
+            isSpeaker: false,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            flip: false,
+            headX: 0,
+            headY: 0,
+            headTopY: 0,
+          });
+        }
+
+        // Add balloon for this chunk. Spoken text is upper-cased, which is how
+        // the original renders every balloon (CBalloon's Capitalize); narration
+        // boxes keep their own casing.
         currentPanel!.balloons.push({
           id: `balloon-${msg.id}-${cIdx}`,
           speakerParticipantId: senderId,
           speakerName: screenName,
-          text: chunkText,
+          text: balloonMode === 'action' ? chunkText : chunkText.toLocaleUpperCase(),
           mode: balloonMode,
           x: 0,
           y: 0,
@@ -370,14 +537,110 @@ export class ComicLayoutEngine {
       }
     }
 
-    // Position characters and balloons within each panel
+    // Settle the strip: a balloon that will not fit above the cast moves into a
+    // fresh panel, and a force-fitted balloon's leftover text follows it there.
+    // The original does this inline as each line arrives (CUnitPanelPage::AddLine
+    // starting a new panel when LayoutBalloons fails); doing it as a pass here
+    // reaches the same arrangement.
+    this.settlePanelOverflow(panels, width, height, defaultBackdrop, {
+      hysteresis: new Map(),
+      talkTos,
+      metricsOf: options.avatarMetrics,
+    });
+
+    // Final pass with a clean placement memory, so hysteresis reflects the
+    // panels as they finally stand rather than any speculative layout above.
+    const layoutCtx = this.createLayoutContext();
+    layoutCtx.talkTos = talkTos;
+    layoutCtx.metricsOf = options.avatarMetrics;
     panels.forEach((p) => {
       if (!p.isTitlePanel) {
-        this.layoutSinglePanel(p, width, height);
+        this.layoutSinglePanel(p, width, height, layoutCtx);
       }
     });
 
     return panels;
+  }
+
+  /**
+   * Repeatedly re-lay out the strip, splitting any panel whose balloons do not
+   * fit, until everything settles. Panels are renumbered afterwards.
+   */
+  private static settlePanelOverflow(
+    panels: ComicPanel[],
+    width: number,
+    height: number,
+    defaultBackdrop: string,
+    layoutCtx: PanelLayoutContext
+  ): void {
+    const MAX_SPLITS = 200;
+    let splits = 0;
+
+    for (let i = 0; i < panels.length && splits < MAX_SPLITS; i++) {
+      const panel = panels[i];
+      if (panel.isTitlePanel || panel.balloons.length === 0) continue;
+
+      const fits = this.layoutSinglePanel(panel, width, height, layoutCtx);
+
+      if (!fits && panel.balloons.length > 1) {
+        // Move the last balloon (and its speaker, if nobody else needs them)
+        // into a new panel and try this one again.
+        const moved = panel.balloons.pop()!;
+        const stillSpeaking = panel.balloons.some(
+          (b) => b.speakerParticipantId === moved.speakerParticipantId
+        );
+        const speaker = panel.characters.find(
+          (c) => c.participantId === moved.speakerParticipantId
+        );
+        if (!stillSpeaking && speaker) {
+          panel.characters = panel.characters.filter((c) => c !== speaker);
+        }
+        panels.splice(i + 1, 0, {
+          id: `${panel.id}-split`,
+          panelIndex: 0,
+          isTitlePanel: false,
+          backdropName: panel.backdropName || defaultBackdrop,
+          characters: speaker ? [{ ...speaker }] : [],
+          balloons: [moved],
+          timestamp: panel.timestamp,
+        });
+        splits++;
+        i--; // retry this panel now that it is lighter
+        continue;
+      }
+
+      // A force-fitted balloon may have handed us the tail of its text.
+      const last = panel.balloons[panel.balloons.length - 1];
+      if (last?.overflowText) {
+        const carried = last.overflowText;
+        last.overflowText = undefined;
+        const speaker = panel.characters.find(
+          (c) => c.participantId === last.speakerParticipantId
+        );
+        panels.splice(i + 1, 0, {
+          id: `${panel.id}-cont`,
+          panelIndex: 0,
+          isTitlePanel: false,
+          backdropName: panel.backdropName || defaultBackdrop,
+          characters: speaker ? [{ ...speaker }] : [],
+          balloons: [
+            {
+              ...last,
+              id: `${last.id}-cont`,
+              text: carried,
+              lines: undefined,
+              outline: undefined,
+              overflowText: undefined,
+            },
+          ],
+          timestamp: panel.timestamp,
+        });
+        splits++;
+      }
+    }
+
+    let index = 0;
+    for (const panel of panels) panel.panelIndex = index++;
   }
 
   /**
@@ -399,56 +662,78 @@ export class ComicLayoutEngine {
    */
   private static readonly MIN_ROUTE_WIDTH = 20;
   /**
-   * Gap left when docking a balloon under an earlier one. The original tucks the
-   * two together by 90 twips because its outline carries a tall wavy fringe;
-   * ours is tighter and carries a white nimbus, so it wants a small gap instead.
+   * How far a balloon tucks up under the one above it when they overlap
+   * horizontally. The wavy outlines interleave rather than collide, and the
+   * upper balloon is painted last so it stays legible.
+   * Ported from TOPBORDER + YBORDER + HWAVEHEIGHT (90 twips).
    */
-  private static readonly BALLOON_DOCK_GAP = 4;
+  private static readonly BALLOON_DOCK_TUCK = 6;
   /** Shortest stem worth drawing; below this the balloon is nudged up instead. */
   private static readonly MIN_STEM_HEIGHT = 14;
   /** How far the stem root is pulled inside the last text line's extent. */
   private static readonly STEM_ROOT_INSET = 10;
   /** Effectively infinite, for route-region intersection. */
   private static readonly FAR = 1e6;
-
   /**
-   * Padding between the text line boxes and the drawn outline. Kept here so the
-   * measured box and the painted outline are derived from the same numbers.
+   * Panel height over base body height. The original's LayoutAvatars uses
+   * unitHeight / 1.9, so an unzoomed body fills a little over half the panel.
    */
-  private static balloonPadding(mode: BalloonMode): { padX: number; padY: number; bleed: number; bleedY: number } {
-    if (mode === 'think') {
-      // The cloud path bulges 8px horizontally and 6px vertically past the boxes.
-      return { padX: 22, padY: 11, bleed: 8, bleedY: 6 };
-    }
-    return { padX: 14, padY: 7, bleed: 0, bleedY: 0 };
-  }
+  private static readonly BODY_HEIGHT_DIVISOR = 1.9;
+  /** Width over height for an avatar whose art has not loaded yet. */
+  private static readonly FALLBACK_ASPECT = 0.44;
+  /** Where the head ends, as a fraction of body height, before art loads. */
+  private static readonly FALLBACK_HEAD_BOTTOM_RATIO = 0.36;
+  /** Opening panels the camera leaves as wide shots. */
+  private static readonly ESTABLISHING_PANELS = 2;
+  /**
+   * Ceiling on the camera push-in. The head cap usually binds first; this stops
+   * an avatar with unusual proportions from filling the whole frame.
+   */
+  private static readonly MAX_CAMERA_ZOOM = 1.9;
+  /** Text short enough to keep on one line whatever else happens (ONELINETHRESHOLD). */
+  private static readonly ONE_LINE_THRESHOLD = 33;
+  /** Slack added to the estimated width so words are not wrapped too tightly. */
+  private static readonly BALLOON_WIDTH_SLACK = 13;
+  /** Balloon ink width (BALLOON_PEN, 28 twips) and the whisper halo (NIMBUS_PEN). */
+  private static readonly BALLOON_PEN = 1.9;
+  private static readonly NIMBUS_PEN = 6.7;
+
 
   /**
-   * Wrap the text for real and return the outline's true footprint.
+   * Wrap the text for real, build the hand-drawn outline around it, and report
+   * the box that outline occupies. Mirrors CBalloon::SetBBox / ComputeInternals:
+   * the original measures and shapes the balloon before negotiating positions,
+   * so layout and drawing can never disagree about how big it is.
    *
-   * Width is chosen by balancing the box rather than by counting characters:
-   * for text of total run length `len` wrapped at width w, the stack is about
-   * `len / w` lines tall, so w = sqrt(aspect * lineHeight * len) lands on a
-   * given aspect ratio. Comic balloons read best at roughly 2.2:1.
+   * Width comes from CUnitPanel::GetCloudEstimate. A very short line just gets
+   * its own width. Otherwise the text's area and the headroom above the speaker
+   * give a minimum width, and the balloon is then drawn somewhere between that
+   * and the full panel — the original rolls its seeded rand() here, which is why
+   * its balloons vary in shape rather than all coming out the same proportion.
    */
   static measureBalloon(
     text: string,
     mode: BalloonMode,
     panelWidth: number,
-    maxHeight?: number
-  ): { lines: string[]; width: number; height: number } {
-    const { padX, padY, bleed, bleedY } = this.balloonPadding(mode);
+    maxHeight?: number,
+    maxWidthOverride?: number,
+    rand?: MsvcRand
+  ): { lines: string[]; width: number; height: number; outline: BalloonOutline | null } {
     const ctx = getMeasureContext();
-    const maxOutlineWidth = Math.round(panelWidth * (mode === 'think' ? 0.54 : 0.5));
+    const maxOutlineWidth = maxWidthOverride ?? Math.round(panelWidth - 2 * this.BALLOON_MARGIN);
 
     if (!ctx) {
       // No DOM (tests/SSR): fall back to a character-count estimate.
-      const approxWidth = Math.min(maxOutlineWidth, Math.max(90, text.length * 7.5 + 2 * padX));
-      const approxLines = Math.max(1, Math.ceil((text.length * 7.2) / Math.max(40, approxWidth - 2 * padX)));
+      const approxWidth = Math.min(maxOutlineWidth, Math.max(90, text.length * 7.5 + 14));
+      const approxLines = Math.max(
+        1,
+        Math.ceil((text.length * 7.2) / Math.max(40, approxWidth - 14))
+      );
       return {
         lines: [text],
         width: approxWidth,
-        height: approxLines * BALLOON_LINE_HEIGHT + 2 * padY + 2 * bleedY,
+        height: approxLines * BALLOON_LINE_HEIGHT + 14,
+        outline: null,
       };
     }
 
@@ -459,41 +744,56 @@ export class ComicLayoutEngine {
       if (word) widestWord = Math.max(widestWord, ctx.measureText(word).width);
     }
 
-    const maxTextWidth = maxOutlineWidth - 2 * padX - 2 * bleed;
-    const balanced = Math.sqrt(2.2 * BALLOON_LINE_HEIGHT * runLength);
-    let wrapWidth = Math.max(
-      Math.min(widestWord, maxTextWidth),
-      Math.min(balanced, runLength, maxTextWidth)
-    );
+    // The outline adds roughly XBORDER either side of the text.
+    const maxTextWidth = maxOutlineWidth - 2 * XBORDER;
 
-    const chrome = 2 * padY + 2 * bleedY;
-    let lines = this.getWrappedLines(ctx, text, wrapWidth);
+    let goalWidth: number;
+    if (runLength <= this.ONE_LINE_THRESHOLD) {
+      goalWidth = runLength;
+    } else {
+      const area = 1.3 * runLength * (BALLOON_TEXT_HEIGHT + BALLOON_LINE_HEIGHT);
+      const potentialHeight = (maxHeight ?? BALLOON_LINE_HEIGHT * 6) + MINTAILHEIGHT;
+      let minWidth = potentialHeight > 0 ? area / potentialHeight : maxTextWidth;
+      minWidth = Math.max(minWidth, widestWord);
+      minWidth = Math.min(minWidth, maxTextWidth);
+      const spread = Math.max(0, maxTextWidth - minWidth);
+      goalWidth = minWidth + (rand ? rand.float() : 0.5) * spread;
+    }
+    // A little slack past the goal, but never wider than the text needs.
+    goalWidth = Math.min(goalWidth + this.BALLOON_WIDTH_SLACK, maxTextWidth);
+    goalWidth = Math.min(goalWidth, runLength + this.BALLOON_WIDTH_SLACK);
+    let wrapWidth = Math.max(Math.min(widestWord, maxTextWidth), goalWidth);
+
+    const shape = (wrap: number) => {
+      const lines = this.getWrappedLines(ctx, text, wrap);
+      const widths = lines.map((l) => ctx.measureText(l.trim()).width);
+      const outline = buildBalloonOutline(widths, BALLOON_FONT_METRICS);
+      return { lines, outline };
+    };
+
+    let built = shape(wrapWidth);
 
     // Too tall for the space above the speaker? Spend width to buy back height,
     // the way the original derives a minimum width from the text's area and the
     // headroom it has left (CUnitPanel::GetCloudEstimate).
     if (maxHeight !== undefined) {
-      const linesThatFit = Math.max(1, Math.floor((maxHeight - chrome) / BALLOON_LINE_HEIGHT));
-      while (lines.length > linesThatFit && wrapWidth < maxTextWidth) {
+      let guard = 0;
+      while (
+        built.outline.trueBox.top - built.outline.trueBox.bottom > maxHeight &&
+        wrapWidth < maxTextWidth &&
+        guard++ < 12
+      ) {
         wrapWidth = Math.min(maxTextWidth, wrapWidth * 1.18);
-        const widened = this.getWrappedLines(ctx, text, wrapWidth);
-        if (widened.length >= lines.length && wrapWidth >= maxTextWidth) {
-          lines = widened;
-          break;
-        }
-        lines = widened;
+        built = shape(wrapWidth);
       }
     }
 
-    let maxLineWidth = 0;
-    for (const line of lines) {
-      maxLineWidth = Math.max(maxLineWidth, ctx.measureText(line.trim()).width);
-    }
-
+    const box = built.outline.trueBox;
     return {
-      lines,
-      width: Math.ceil(maxLineWidth + 2 * padX + 2 * bleed),
-      height: Math.ceil(lines.length * BALLOON_LINE_HEIGHT + chrome),
+      lines: built.lines,
+      width: Math.ceil(box.right - box.left),
+      height: Math.ceil(box.top - box.bottom),
+      outline: built.outline,
     };
   }
 
@@ -533,65 +833,300 @@ export class ComicLayoutEngine {
     }
   }
 
+  /**
+   * Per-speaker memory of where they stood and which way they faced in the last
+   * panel, so the cast does not reshuffle from panel to panel.
+   * Ported from CAvatarX's m_lastDir / m_lastLeft / m_lastRight.
+   */
+  static createLayoutContext(): PanelLayoutContext {
+    return { hysteresis: new Map(), talkTos: new Map() };
+  }
+
+  private static hysteresisFor(ctx: PanelLayoutContext, id: string): CharacterHysteresis {
+    let h = ctx.hysteresis.get(id);
+    if (!h) {
+      h = { lastDir: false, lastLeft: null, lastRight: null };
+      ctx.hysteresis.set(id, h);
+    }
+    return h;
+  }
+
+  /**
+   * Decide the left-to-right order of the cast and which way each one faces.
+   *
+   * Ported from CUnitPanel::OrderAvatars / DoGreedyOrdering: characters are
+   * inserted one at a time, and every candidate slot and facing is scored by
+   * summing EvalPair over all pairs already placed. Lower is better. Someone
+   * addressing another character wants to stand next to them and face them
+   * (facing away costs 40, standing further away costs 4 per extra place), and
+   * a displacement penalty keeps the arrangement stable between panels.
+   */
+  private static orderCharacters(panel: ComicPanel, ctx: PanelLayoutContext | undefined): void {
+    const chars = panel.characters;
+    if (chars.length === 0) return;
+    if (chars.length === 1) {
+      chars[0].flip = ctx ? this.hysteresisFor(ctx, chars[0].participantId).lastDir : false;
+      if (ctx) this.hysteresisFor(ctx, chars[0].participantId).lastDir = chars[0].flip;
+      return;
+    }
+
+    const talkTosOf = (id: string): string[] => ctx?.talkTos.get(id) ?? [];
+    const lastDirOf = (id: string): boolean =>
+      ctx ? this.hysteresisFor(ctx, id).lastDir : false;
+
+    // `delta` is how many places b2 sits to the right of b1 (negative for left).
+    const evalPair = (
+      b1: ComicCharacterInPanel,
+      b2: ComicCharacterInPanel,
+      delta: number
+    ): number => {
+      let rating = 0;
+      let desiredDir: boolean;
+      if (delta > 0) {
+        desiredDir = false; // b2 is to the right, so b1 must face right
+      } else {
+        desiredDir = true;
+        delta = -delta;
+      }
+      const talk = talkTosOf(b1.participantId);
+      if (talk.length === 0) {
+        // Nobody in particular: a mild pull towards facing one another.
+        if (b1.flip !== desiredDir) rating += 4;
+        if (b2.flip === desiredDir) rating += 2;
+      } else {
+        for (const t of talk) {
+          if (t !== b2.participantId) continue;
+          if (b1.flip === desiredDir) rating += 4 * (delta - 1);
+          else rating += 40; // talking to someone while facing away
+          if (b2.flip === desiredDir) rating += 4;
+        }
+      }
+      return rating;
+    };
+
+    const displacementPenalty = (arr: ComicCharacterInPanel[]): number => {
+      if (!ctx) return 0;
+      let penalty = 0;
+      for (let i = 0; i < arr.length; i++) {
+        const h = this.hysteresisFor(ctx, arr[i].participantId);
+        if (i > 0 && h.lastRight !== arr[i - 1].participantId) penalty++;
+        if (i < arr.length - 1 && h.lastLeft !== arr[i + 1].participantId) penalty++;
+      }
+      return penalty;
+    };
+
+    const placed: ComicCharacterInPanel[] = [];
+
+    const scoreAll = (): number => {
+      let rating = 0;
+      for (let i = 0; i < placed.length; i++) {
+        for (let j = i + 1; j < placed.length; j++) {
+          rating += evalPair(placed[i], placed[j], j - i);
+          rating += evalPair(placed[j], placed[i], i - j);
+        }
+      }
+      return rating;
+    };
+
+    const evalPlacement = (
+      candidate: ComicCharacterInPanel,
+      index: number
+    ): { rating: number; dir: boolean } => {
+      placed.splice(index, 0, candidate);
+      const penalty = displacementPenalty(placed);
+      candidate.flip = false;
+      const facingRight = penalty + scoreAll();
+      candidate.flip = true;
+      const facingLeft = penalty + scoreAll();
+      placed.splice(index, 1);
+
+      if (facingRight < facingLeft) return { rating: facingRight, dir: false };
+      if (facingRight > facingLeft) return { rating: facingLeft, dir: true };
+      return { rating: facingRight, dir: lastDirOf(candidate.participantId) };
+    };
+
+    for (const candidate of chars) {
+      let bestRating = Infinity;
+      let bestPosition = 0;
+      let bestDir = false;
+      for (let slot = 0; slot <= placed.length; slot++) {
+        const { rating, dir } = evalPlacement(candidate, slot);
+        if (rating < bestRating) {
+          bestRating = rating;
+          bestPosition = slot;
+          bestDir = dir;
+        }
+      }
+      candidate.flip = bestDir;
+      placed.splice(bestPosition, 0, candidate);
+    }
+
+    panel.characters = placed;
+
+    if (ctx) {
+      for (let i = 0; i < placed.length; i++) {
+        const h = this.hysteresisFor(ctx, placed[i].participantId);
+        h.lastDir = placed[i].flip;
+        h.lastRight = i > 0 ? placed[i - 1].participantId : null;
+        h.lastLeft = i < placed.length - 1 ? placed[i + 1].participantId : null;
+      }
+    }
+  }
+
+  /**
+   * Size, scale and position the cast, and set the backdrop's source window.
+   * Ported from the second half of CUnitPanel::LayoutAvatars.
+   *
+   * Everyone is drawn at the same height, standing on the same floor, and the
+   * row is centred with equal gaps. Then the camera moves:
+   *
+   *  - Too wide for the panel? Everyone shrinks together and the backdrop stays
+   *    put — the wide shot.
+   *  - Room to spare, and this is not one of the opening establishing panels?
+   *    The camera pushes in until either the row fills the panel or the biggest
+   *    head reaches its limit, and the backdrop zooms with it. The cast's *top*
+   *    stays where it is, so a close-up crops legs off the bottom of the frame
+   *    rather than sliding the whole body down.
+   */
+  private static placeCast(
+    panel: ComicPanel,
+    panelWidth: number,
+    panelHeight: number,
+    layoutCtx?: PanelLayoutContext
+  ): void {
+    const numChars = panel.characters.length;
+    // maxBodyHeight: the original's unitHeight / 1.9.
+    const baseHeight = Math.floor(panelHeight / this.BODY_HEIGHT_DIVISOR);
+    const bodyTop = panelHeight - baseHeight;
+
+    if (numChars === 0) {
+      panel.backdropBox = this.backdropWindow(panelWidth, panelHeight, bodyTop, 1);
+      return;
+    }
+
+    const edgePad = 10;
+    const minGap = 6;
+    const usableWidth = panelWidth - 2 * edgePad;
+
+    // Per-character proportions, from the real artwork when it has loaded.
+    const metrics = panel.characters.map((char) => {
+      const m = layoutCtx?.metricsOf?.(char.avatarName) ?? null;
+      return {
+        aspect: m?.aspect ?? this.FALLBACK_ASPECT,
+        headTopRatio: m?.headTopRatio ?? this.HEAD_TOP_RATIO,
+        headBottomRatio: m?.headBottomRatio ?? this.FALLBACK_HEAD_BOTTOM_RATIO,
+      };
+    });
+
+    // Everyone scaled to the same height.
+    let heights = metrics.map(() => baseHeight);
+    let widths = metrics.map((m) => Math.max(1, Math.round(baseHeight * m.aspect)));
+    let rowWidth = widths.reduce((a, b) => a + b, 0);
+
+    let zoom = 1;
+    // Height everyone stands on before any zoom; the row's footing is derived
+    // from this, so a zoomed cast grows downward out of frame.
+    let footingHeight = baseHeight;
+    const maxRowWidth = usableWidth - minGap * (numChars + 1);
+
+    if (rowWidth > maxRowWidth) {
+      // Wide shot: shrink the whole cast to fit, feet still on the floor.
+      const reduction = maxRowWidth / rowWidth;
+      heights = heights.map((h) => Math.round(h * reduction));
+      widths = widths.map((w) => Math.round(w * reduction));
+      rowWidth = widths.reduce((a, b) => a + b, 0);
+      footingHeight = Math.max(...heights);
+    } else if (!this.isEstablishingPanel(panel)) {
+      const widthFactor = maxRowWidth / rowWidth;
+      // Cap the zoom so the largest head stays within the body height.
+      let maxHeadHeight = 0;
+      for (let i = 0; i < numChars; i++) {
+        maxHeadHeight = Math.max(maxHeadHeight, heights[i] * metrics[i].headBottomRatio);
+      }
+      const headFactor =
+        maxHeadHeight > 0 ? baseHeight / (maxHeadHeight * 1.2) : widthFactor;
+      zoom = Math.min(widthFactor, headFactor, this.MAX_CAMERA_ZOOM);
+      // The original ignores a zoom that would barely register.
+      if (zoom < 1.1) zoom = 1;
+      if (zoom !== 1) {
+        heights = heights.map((h) => Math.round(h * zoom));
+        widths = widths.map((w) => Math.round(w * zoom));
+        rowWidth = widths.reduce((a, b) => a + b, 0);
+      }
+    }
+
+    // The row is laid out on the pre-zoom footing, so a zoomed cast grows down
+    // out of the frame while their heads stay at the same height.
+    const rowTop = panelHeight - footingHeight;
+    const gap = (usableWidth - rowWidth) / (numChars + 1);
+    let x = edgePad + gap;
+    panel.characters.forEach((char, idx) => {
+      char.width = widths[idx];
+      char.height = heights[idx];
+      char.x = Math.round(x);
+      char.y = rowTop;
+      char.headX = char.x + Math.round(char.width * 0.5);
+      // Refined from the real pixels at draw time.
+      char.headTopY = char.y + Math.round(char.height * metrics[idx].headTopRatio);
+      char.headY =
+        char.y + Math.round(char.height * (metrics[idx].headBottomRatio * 0.55));
+      x += widths[idx] + gap;
+    });
+
+    panel.backdropBox = this.backdropWindow(panelWidth, panelHeight, rowTop, zoom);
+  }
+
+  /** True for the opening panels, which the original keeps as wide shots. */
+  private static isEstablishingPanel(panel: ComicPanel): boolean {
+    return panel.panelIndex > 0 && panel.panelIndex <= this.ESTABLISHING_PANELS;
+  }
+
+  /**
+   * The slice of backdrop art the panel shows, in panel pixels. Zooming shrinks
+   * the window about `fixedY` — the line the cast's heads stand on — so the
+   * background pushes in with them. Ported from CPanel::AdjustArtToCoord.
+   */
+  private static backdropWindow(
+    panelWidth: number,
+    panelHeight: number,
+    fixedY: number,
+    zoom: number
+  ): { left: number; top: number; right: number; bottom: number } {
+    if (zoom <= 1) {
+      return { left: 0, top: 0, right: panelWidth, bottom: panelHeight };
+    }
+    const windowHeight = panelHeight / zoom;
+    const top = fixedY * (1 - 1 / zoom);
+    return {
+      left: 0,
+      top,
+      right: panelWidth / zoom,
+      bottom: top + windowHeight,
+    };
+  }
+
+  /**
+   * Position the cast and the balloons in one panel.
+   *
+   * Returns false when a balloon simply will not fit above the speakers, which
+   * is the caller's cue to move it into a fresh panel — the original's
+   * CUnitPanel::LayoutBalloons reports overflow the same way. A panel holding a
+   * single oversized balloon is force-fitted instead, splitting the tail of the
+   * text into `overflowText` for the next panel to carry.
+   */
   static layoutSinglePanel(
     panel: ComicPanel,
     panelWidth: number,
-    panelHeight: number
-  ): void {
+    panelHeight: number,
+    layoutCtx?: PanelLayoutContext
+  ): boolean {
     const numChars = panel.characters.length;
-    const groundY = panelHeight - 12;
-    // Character height ~68% of panel height (matching authentic Comic Chat scale)
-    const maxCharHeight = Math.round(panelHeight * 0.68);
-    const aspect = 0.44;
 
-    if (numChars === 1) {
-      const char = panel.characters[0];
-      char.height = maxCharHeight;
-      char.width = Math.round(char.height * aspect);
-      char.x = Math.round((panelWidth - char.width) / 2);
-      char.y = groundY - char.height;
-      char.flip = false;
-      char.headX = char.x + Math.round(char.width * 0.5);
-      char.headY = char.y + Math.round(char.height * 0.24); // Initial head estimate
-      char.headTopY = char.y + Math.round(char.height * this.HEAD_TOP_RATIO);
-    } else if (numChars === 2) {
-      // Two characters facing each other
-      const char1 = panel.characters[0];
-      const char2 = panel.characters[1];
+    // Who stands where, and which way they face.
+    this.orderCharacters(panel, layoutCtx);
 
-      char1.height = maxCharHeight;
-      char1.width = Math.round(char1.height * aspect);
-      char1.x = Math.round(panelWidth * 0.08);
-      char1.y = groundY - char1.height;
-      char1.flip = false; // faces right
-      char1.headX = char1.x + Math.round(char1.width * 0.5);
-      char1.headY = char1.y + Math.round(char1.height * 0.24);
-      char1.headTopY = char1.y + Math.round(char1.height * this.HEAD_TOP_RATIO);
-
-      char2.height = maxCharHeight;
-      char2.width = Math.round(char2.height * aspect);
-      char2.x = Math.round(panelWidth * 0.92 - char2.width);
-      char2.y = groundY - char2.height;
-      char2.flip = true; // faces left
-      char2.headX = char2.x + Math.round(char2.width * 0.5);
-      char2.headY = char2.y + Math.round(char2.height * 0.24);
-      char2.headTopY = char2.y + Math.round(char2.height * this.HEAD_TOP_RATIO);
-    } else {
-      // 3 or more characters
-      const availableWidth = panelWidth - 24;
-      const slotWidth = availableWidth / numChars;
-
-      panel.characters.forEach((char, idx) => {
-        char.height = Math.round(maxCharHeight * 0.92);
-        char.width = Math.round(char.height * aspect);
-        char.x = Math.round(12 + idx * slotWidth + (slotWidth - char.width) / 2);
-        char.y = groundY - char.height;
-        char.flip = idx >= Math.floor(numChars / 2);
-        char.headX = char.x + Math.round(char.width * 0.5);
-        char.headY = char.y + Math.round(char.height * 0.24);
-        char.headTopY = char.y + Math.round(char.height * this.HEAD_TOP_RATIO);
-      });
-    }
+    // The camera.
+    this.placeCast(panel, panelWidth, panelHeight, layoutCtx);
 
     // ---- Balloon placement --------------------------------------------------
     // Ported from CUnitPanel::LayoutBalloons. Balloons dock from the top of the
@@ -604,8 +1139,14 @@ export class ComicLayoutEngine {
     const freeTop = this.BALLOON_TOP_MARGIN;
 
     const placed: ComicBalloon[] = [];
+    let everythingFits = true;
+    const soleBalloon = panel.balloons.length === 1;
+    // Seeded from the panel id, so a panel's balloon shapes stay put across
+    // re-renders while still varying from panel to panel.
+    const rand = new MsvcRand(seedFromId(panel.id));
 
     panel.balloons.forEach((balloon, idx) => {
+      balloon.overflowText = undefined;
       const speaker =
         panel.characters.find((c) => c.participantId === balloon.speakerParticipantId) ||
         panel.characters[idx % Math.max(1, numChars)];
@@ -653,9 +1194,12 @@ export class ComicLayoutEngine {
           balloon.text,
           balloon.mode,
           panelWidth,
-          headroom > 0 ? headroom : undefined
+          headroom > 0 ? headroom : undefined,
+          undefined,
+          rand
         );
         balloon.lines = measured.lines;
+        balloon.outline = measured.outline ?? undefined;
         balloon.width = Math.min(measured.width, freeRight - freeLeft);
         balloon.height = measured.height;
 
@@ -692,7 +1236,7 @@ export class ComicLayoutEngine {
           const overlaps =
             balloon.x < prior.x + prior.width && prior.x < balloon.x + balloon.width;
           if (overlaps) {
-            top = Math.max(top, prior.y + prior.height + this.BALLOON_DOCK_GAP);
+            top = Math.max(top, prior.y + prior.height - this.BALLOON_DOCK_TUCK);
           }
         }
         // Settled: the second pass would measure against the same headroom.
@@ -702,6 +1246,17 @@ export class ComicLayoutEngine {
       // Balloons hang from the top of the panel, as in the original, so they stay
       // as far off the cast as the panel allows and the stem does the reaching.
       balloon.y = top;
+
+      if (balloon.y + balloon.height > lowestBottom) {
+        if (soleBalloon) {
+          // Nothing to make room by moving, so widen it to the whole panel and,
+          // if it still overruns, hand the tail of the text to the next panel
+          // (CUnitPanel::ForceFitBalloon / CBalloon::TruncateAtLine).
+          this.forceFitBalloon(balloon, freeLeft, freeRight, freeTop, lowestBottom);
+        } else {
+          everythingFits = false;
+        }
+      }
 
       balloon.tailX = speaker ? speaker.headX : arrowX;
       balloon.tailY = speaker ? speaker.headTopY - this.STEM_CLEARANCE : balloon.y + balloon.height;
@@ -725,6 +1280,50 @@ export class ComicLayoutEngine {
     panel.balloons.forEach((balloon) => {
       this.resolveStemRoot(balloon);
     });
+
+    return everythingFits;
+  }
+
+  /**
+   * Last resort for a balloon that cannot fit above its speaker even alone:
+   * widen it to the full panel, then drop whole lines off the end until it fits,
+   * leaving the remainder in `overflowText` for the next panel.
+   */
+  private static forceFitBalloon(
+    balloon: ComicBalloon,
+    freeLeft: number,
+    freeRight: number,
+    freeTop: number,
+    lowestBottom: number
+  ): void {
+    const fullWidth = freeRight - freeLeft;
+    const available = Math.max(BALLOON_LINE_HEIGHT, lowestBottom - freeTop);
+
+    const remeasure = (text: string) =>
+      this.measureBalloon(text, balloon.mode, fullWidth, available, fullWidth);
+
+    let measured = remeasure(balloon.text);
+    if (measured.height > available && measured.lines.length > 1) {
+      // How much of the height is outline rather than text.
+      const chrome = measured.height - measured.lines.length * BALLOON_LINE_HEIGHT;
+      const linesThatFit = Math.max(1, Math.floor((available - chrome) / BALLOON_LINE_HEIGHT));
+      if (linesThatFit < measured.lines.length) {
+        const kept = measured.lines.slice(0, linesThatFit).join(' ').trim();
+        const rest = measured.lines.slice(linesThatFit).join(' ').trim();
+        balloon.text = `${kept}...`;
+        balloon.overflowText = `...${rest}`;
+        measured = remeasure(balloon.text);
+      }
+    }
+
+    balloon.lines = measured.lines;
+    balloon.outline = measured.outline ?? undefined;
+    balloon.width = Math.min(measured.width, fullWidth);
+    balloon.height = measured.height;
+    balloon.x = Math.max(freeLeft, Math.min(freeRight - balloon.width, balloon.x));
+    balloon.y = freeTop;
+    balloon.routeLeft = balloon.x;
+    balloon.routeRight = balloon.x + balloon.width;
   }
 
   /**
@@ -773,12 +1372,32 @@ export class ComicLayoutEngine {
   ): void {
     ctx.save();
 
-    // 1. Draw Background
+    // 1. Draw Background through the panel's camera window. The window is a
+    //    slice of the art expressed in panel pixels; it stretches to fill the
+    //    panel, so a smaller window means the camera has pushed in.
+    ctx.fillStyle = '#fbf9f4'; // warm paper tone
+    ctx.fillRect(0, 0, width, height);
     if (backdropCanvas) {
-      ctx.drawImage(backdropCanvas, 0, 0, width, height);
-    } else {
-      ctx.fillStyle = '#fbf9f4'; // warm paper tone
-      ctx.fillRect(0, 0, width, height);
+      const box = panel.backdropBox;
+      if (!box || (box.left === 0 && box.top === 0 && box.right === width && box.bottom === height)) {
+        ctx.drawImage(backdropCanvas, 0, 0, width, height);
+      } else {
+        const artW = backdropCanvas.width;
+        const artH = backdropCanvas.height;
+        const srcLeft = (box.left / width) * artW;
+        const srcTop = (box.top / height) * artH;
+        const srcW = ((box.right - box.left) / width) * artW;
+        const srcH = ((box.bottom - box.top) / height) * artH;
+        if (srcW > 0 && srcH > 0) {
+          // Draw the whole bitmap scaled and offset so the window lands on the
+          // panel; anything outside simply falls off the canvas.
+          const sx = width / srcW;
+          const sy = height / srcH;
+          ctx.drawImage(backdropCanvas, -srcLeft * sx, -srcTop * sy, artW * sx, artH * sy);
+        } else {
+          ctx.drawImage(backdropCanvas, 0, 0, width, height);
+        }
+      }
     }
 
     if (panel.isTitlePanel) {
@@ -852,10 +1471,11 @@ export class ComicLayoutEngine {
       this.drawBalloon(ctx, panel.balloons[i]);
     }
 
-    // 4. Draw Solid Black Comic Border
-    ctx.lineWidth = 3;
+    // 4. Panel border: a 60-twip pen on the edge, so half of it shows.
+    ctx.lineWidth = 2;
     ctx.strokeStyle = '#000000';
-    ctx.strokeRect(1.5, 1.5, width - 3, height - 3);
+    ctx.setLineDash([]);
+    ctx.strokeRect(1, 1, width - 2, height - 2);
 
     ctx.restore();
   }
@@ -1116,10 +1736,95 @@ export class ComicLayoutEngine {
   }
 
 
+  /**
+   * Map a balloon's local outline space (origin at the text block's top-left,
+   * y pointing up) into panel pixels.
+   */
+  private static outlineOrigin(balloon: ComicBalloon): { ox: number; oy: number } {
+    const box = balloon.outline!.trueBox;
+    return { ox: balloon.x - box.left, oy: balloon.y + box.top };
+  }
+
+  /**
+   * Cut the tail into the balloon's outline and return the pieces of the closed
+   * path: the opened outline plus the two arcs that sweep down to the stem tip.
+   * Ported from CBWoodringNormal::AddArrow.
+   */
+  private static buildBalloonTail(
+    balloon: ComicBalloon
+  ): { opened: ReturnType<typeof breakSpline>; arcInto: Pt[]; arcBack: Pt[] } | null {
+    const outline = balloon.outline;
+    if (!outline || balloon.mode === 'think' || balloon.mode === 'action') return null;
+    if (!(balloon.tailX > 0 && balloon.tailY > 0)) return null;
+
+    const { ox, oy } = this.outlineOrigin(balloon);
+    const { fInfo, spline } = outline;
+    // Stem tip in local space.
+    const tip: Pt = { x: balloon.tailX - ox, y: -(balloon.tailY - oy) };
+
+    let xbreak = (balloon.tailRootX ?? balloon.tailX) - ox;
+
+    // Pull the exit point onto the last line of text so the stem springs from
+    // under the words rather than from an empty corner.
+    const lastLine = fInfo.nLines - 1;
+    const bottomStart = fInfo.leftX[lastLine];
+    const bottomEnd = bottomStart + fInfo.widths[lastLine];
+    const routeLeft = (balloon.routeLeft ?? balloon.x) - ox;
+    const routeRight = (balloon.routeRight ?? balloon.x + balloon.width) - ox;
+    if (xbreak < bottomStart && bottomStart < routeRight - LARGEDELTA) {
+      xbreak = bottomStart + SMALLDELTA;
+    } else if (xbreak > bottomEnd && bottomEnd > routeLeft + LARGEDELTA) {
+      xbreak = bottomEnd - SMALLDELTA;
+    }
+    xbreak = Math.max(
+      outline.trueBox.left + 2,
+      Math.min(outline.trueBox.right - 2, xbreak)
+    );
+
+    // Guarantee the stem has somewhere to run.
+    if (outline.trueBox.bottom - tip.y < MINTAILHEIGHT) {
+      tip.y = outline.trueBox.bottom - MINTAILHEIGHT;
+    }
+
+    const opened = breakSpline(spline, xbreak, fInfo.bbox.bottom);
+    if (opened.cps.length < 3) return null;
+    const leftLip = opened.cps[opened.cps.length - 1];
+    const rightLip = opened.cps[0];
+    const mid = { x: (leftLip.x + rightLip.x) / 2, y: (leftLip.y + rightLip.y) / 2 };
+    const tailLen = Math.hypot(mid.x - tip.x, mid.y - tip.y);
+    const altitude = 0.05 * tailLen;
+    const sign = tip.x > leftLip.x ? 1 : -1;
+
+    const arcInto: Pt[] = [];
+    arcPoints(leftLip, tip, sign * altitude, arcInto);
+    const arcBack: Pt[] = [];
+    arcPoints(tip, rightLip, -sign * altitude, arcBack);
+    return { opened, arcInto, arcBack };
+  }
+
+  /** Lay the balloon's outline (with tail, if any) into the current path. */
+  private static traceBalloonPath(ctx: CanvasRenderingContext2D, balloon: ComicBalloon): void {
+    const outline = balloon.outline;
+    if (!outline) return;
+    const { ox, oy } = this.outlineOrigin(balloon);
+    const toCanvas = (p: Pt): [number, number] => [ox + p.x, oy - p.y];
+
+    const tail = this.buildBalloonTail(balloon);
+    ctx.beginPath();
+    if (tail) {
+      tail.opened.addToPath(ctx, toCanvas, true);
+      for (const p of tail.arcInto) ctx.lineTo(...toCanvas(p));
+      for (const p of tail.arcBack) ctx.lineTo(...toCanvas(p));
+    } else {
+      outline.spline.addToPath(ctx, toCanvas, true);
+    }
+    ctx.closePath();
+  }
+
   static drawBalloon(ctx: CanvasRenderingContext2D, balloon: ComicBalloon): void {
     ctx.save();
 
-    const { x, y, width, height, tailX, tailY, mode, text } = balloon;
+    const { x, y, width, height, mode, text } = balloon;
 
     if (mode === 'action') {
       // Narrative Box (Yellow/amber banner with black border)
@@ -1146,372 +1851,113 @@ export class ComicLayoutEngine {
       return;
     }
 
-    // Set font for line measurement and rendering
     ctx.font = balloonFontFor(mode);
 
-    // Reuse the wrap decided during layout so the painted outline is exactly the
-    // box that was negotiated against the other balloons.
-    const lines =
-      balloon.lines && balloon.lines.length > 0
-        ? balloon.lines
-        : this.getWrappedLines(ctx, text, Math.max(60, width - 24));
-    const lineHeight = BALLOON_LINE_HEIGHT;
-    const totalTextHeight = lines.length * lineHeight;
-    const startY = y + (height - totalTextHeight) / 2;
-    const centerX = x + width / 2;
-    const { padX, padY } = this.balloonPadding(mode);
-
-    const lineBoxes = lines.map((line, i) => {
-      const w = ctx.measureText(line.trim()).width;
-      return {
-        left: centerX - w / 2 - padX,
-        right: centerX + w / 2 + padX,
-        top: startY + i * lineHeight - (i === 0 ? padY : 0),
-        bottom: startY + (i + 1) * lineHeight + (i === lines.length - 1 ? padY : 0),
-      };
-    });
-
-    // 1. Build authentic Woodring hand-drawn hugging balloon path
-    if (mode === 'think') {
-      let minL = Infinity, maxR = -Infinity, minT = Infinity, maxB = -Infinity;
-      lineBoxes.forEach((b) => {
-        if (b.left < minL) minL = b.left;
-        if (b.right > maxR) maxR = b.right;
-        if (b.top < minT) minT = b.top;
-        if (b.bottom > maxB) maxB = b.bottom;
-      });
-      const cloudL = minL - 8;
-      const cloudR = maxR + 8;
-      const cloudT = minT - 6;
-      const cloudB = maxB + 6;
-      ctx.beginPath();
-      this.drawCloudPath(ctx, cloudL, cloudT, cloudR - cloudL, cloudB - cloudT);
-    } else {
-      const hasTail = tailX > 0 && tailY > 0;
-      this.drawHuggingSpeechBalloonPath(
-        ctx,
-        lineBoxes,
-        tailX,
-        tailY,
-        hasTail,
-        balloon.tailRootX
-      );
-    }
-
-    // 2. Pass 1: Solid White Fill + Nimbus (White Halo Outline)
-    ctx.fillStyle = '#ffffff';
-    ctx.fill();
-
-    ctx.save();
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 7;
-    ctx.setLineDash([]);
-    ctx.stroke();
-    ctx.restore();
-
-    // 3. Pass 2: Black Comic Ink Stroke
-    ctx.save();
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    if (mode === 'whisper') {
-      ctx.setLineDash([7, 4.5]);
-      ctx.lineWidth = 2.2;
-      ctx.strokeStyle = '#000000';
-    } else {
-      ctx.setLineDash([]);
-      ctx.lineWidth = 2.2;
-      ctx.strokeStyle = '#000000';
-    }
-    ctx.stroke();
-    ctx.restore();
-
-    // 4. Thought bubbles trailing from thought balloon to speaker head
-    if (mode === 'think' && tailX > 0 && tailY > 0) {
-      // Same reasoning as the speech stem: leave from the underside nearest the
-      // speaker and keep the trail descending, so it reads as coming down off the
-      // balloon rather than drifting sideways across the panel.
-      const bubbleRootX = Math.max(
-        x + 14,
-        Math.min(x + width - 14, balloon.tailRootX ?? tailX)
-      );
-      const bubbleRootY = y + height + 2;
-      const trailDy = Math.max(10, tailY - bubbleRootY);
-      const maxTrailDx = trailDy;
-      const trailDx = Math.max(-maxTrailDx, Math.min(maxTrailDx, tailX - bubbleRootX));
-      const steps = 4;
-      for (let i = 1; i <= steps; i++) {
-        const t = i / (steps + 1);
-        const bx = bubbleRootX + trailDx * t;
-        const by = bubbleRootY + trailDy * t;
-        // Small descending circles: ~6.5px down to ~2px radius (13px down to 4px diameter)
-        const r = 6.5 - (i - 1) * 1.5;
-
-        // White Nimbus for bubble
-        ctx.beginPath();
-        ctx.arc(bx, by, r + 2.5, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-
-        // Bubble fill & ink border
-        ctx.beginPath();
-        ctx.arc(bx, by, r, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-        ctx.lineWidth = 1.6;
-        ctx.strokeStyle = '#000000';
-        ctx.stroke();
-      }
-    }
-
-    // Dialogue Text centered line by line
-    ctx.setLineDash([]);
-    ctx.fillStyle = mode === 'whisper' ? '#222222' : '#000000';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-
-    lines.forEach((l, i) => {
-      ctx.fillText(l.trim(), centerX, startY + i * lineHeight);
-    });
-
-    ctx.restore();
-  }
-
-  // Draws authentic Microsoft Comic Chat speech / whisper balloon that hugs the text shape
-  static drawHuggingSpeechBalloonPath(
-    ctx: CanvasRenderingContext2D,
-    lineBoxes: { left: number; right: number; top: number; bottom: number }[],
-    tailX: number,
-    tailY: number,
-    hasTail: boolean,
-    preferredRootX?: number
-  ): void {
-    const n = lineBoxes.length;
-    if (n === 0) return;
-
-    const left = lineBoxes.map((b) => b.left);
-    const right = lineBoxes.map((b) => b.right);
-    const top = lineBoxes.map((b) => b.top);
-    const bottom = lineBoxes.map((b) => b.bottom);
-
-    // Smooth out negligible width differences (< 14px)
-    for (let i = 0; i < n - 1; i++) {
-      if (Math.abs(left[i] - left[i + 1]) < 14) {
-        const minL = Math.min(left[i], left[i + 1]);
-        left[i] = minL;
-        left[i + 1] = minL;
-      }
-      if (Math.abs(right[i] - right[i + 1]) < 14) {
-        const maxR = Math.max(right[i], right[i + 1]);
-        right[i] = maxR;
-        right[i + 1] = maxR;
-      }
-    }
-
-    const R = 10;
-    ctx.beginPath();
-
-    // 1. Top Edge of Line 0
-    const rTop = Math.min(R, (right[0] - left[0]) / 2, (bottom[0] - top[0]) / 2);
-    ctx.moveTo(left[0] + rTop, top[0]);
-    this.drawWavyLine(ctx, left[0] + rTop, top[0], right[0] - rTop, top[0], 1.0, 20);
-    ctx.quadraticCurveTo(right[0], top[0], right[0], top[0] + rTop);
-
-    // 2. Right Side down through all lines
-    for (let i = 0; i < n; i++) {
-      if (i < n - 1) {
-        const splitY = bottom[i];
-        const nextR = right[i + 1];
-        const currR = right[i];
-        const diff = currR - nextR;
-
-        if (Math.abs(diff) < 2) {
-          // Continuous straight edge
-          this.drawWavyLine(ctx, currR, top[i] + (i === 0 ? rTop : 0), currR, splitY, 1.0, 20);
-        } else if (diff > 0) {
-          // Line i is WIDER than line i+1 (steps inward to the left)
-          const stepR = Math.min(R, diff / 2, (bottom[i] - top[i]) / 2);
-          this.drawWavyLine(ctx, currR, top[i] + (i === 0 ? rTop : 0), currR, splitY - stepR, 1.0, 20);
-          ctx.quadraticCurveTo(currR, splitY, currR - stepR, splitY);
-          this.drawWavyLine(ctx, currR - stepR, splitY, nextR + stepR, splitY, 0.8, 16);
-          ctx.quadraticCurveTo(nextR, splitY, nextR, splitY + stepR);
-        } else {
-          // Line i is NARROWER than line i+1 (steps outward to the right)
-          const stepR = Math.min(R, -diff / 2, (bottom[i + 1] - top[i + 1]) / 2);
-          this.drawWavyLine(ctx, currR, top[i] + (i === 0 ? rTop : 0), currR, splitY, 1.0, 20);
-          ctx.quadraticCurveTo(currR, splitY, currR + stepR, splitY);
-          this.drawWavyLine(ctx, currR + stepR, splitY, nextR - stepR, splitY, 0.8, 16);
-          ctx.quadraticCurveTo(nextR, splitY, nextR, splitY + stepR);
-        }
-      } else {
-        // Last line bottom right corner
-        const rBot = Math.min(R, (right[n - 1] - left[n - 1]) / 2, (bottom[n - 1] - top[n - 1]) / 2);
-        const startY = n === 1 ? top[0] + rTop : top[n - 1] + R;
-        this.drawWavyLine(ctx, right[n - 1], startY, right[n - 1], bottom[n - 1] - rBot, 1.0, 20);
-        ctx.quadraticCurveTo(right[n - 1], bottom[n - 1], right[n - 1] - rBot, bottom[n - 1]);
-      }
-    }
-
-    // 3. Bottom Edge of Line n-1 (with Tail)
-    const lastIdx = n - 1;
-    const rBotLast = Math.min(R, (right[lastIdx] - left[lastIdx]) / 2, (bottom[lastIdx] - top[lastIdx]) / 2);
-    const botY = bottom[lastIdx];
-    const botLeft = left[lastIdx];
-    const botRight = right[lastIdx];
-
-    if (hasTail && tailX > 0 && tailY > 0) {
-      const tailBaseWidth = Math.min(18, Math.max(10, (botRight - botLeft) * 0.14));
-      const minRootX = botLeft + rBotLast + tailBaseWidth / 2 + 2;
-      const maxRootX = botRight - rBotLast - tailBaseWidth / 2 - 2;
-      // The layout picked an exit point in the middle of this balloon's free
-      // corridor; pull it onto the last line of text so the stem springs from
-      // under the words rather than from an empty corner.
-      const targetX =
-        preferredRootX !== undefined
-          ? preferredRootX
-          : botLeft + (botRight - botLeft) * Math.max(0.12, Math.min(0.88,
-              (tailX - botLeft) / Math.max(1, botRight - botLeft)));
-      const tailRootX = Math.max(minRootX, Math.min(maxRootX, targetX));
-
-      const tailRightX = tailRootX + tailBaseWidth / 2;
-      const tailLeftX = tailRootX - tailBaseWidth / 2;
-
-      this.drawWavyLine(ctx, botRight - rBotLast, botY, tailRightX, botY, 1.0, 20);
-
-      const dy = Math.max(12, tailY - botY);
-      // Hold the stem within 45 degrees of vertical, as the original does. The
-      // root was already moved to satisfy this; the cap only catches the cases
-      // where the balloon had no room to shift.
-      const maxDx = dy;
-      const dx = Math.max(-maxDx, Math.min(maxDx, tailX - tailRootX));
-      const halfBase = tailBaseWidth / 2;
-
-      // Concave Woodring stem: curves inward towards center spine immediately
-      const r_cp1 = { x: tailRootX + halfBase * 0.25 + dx * 0.25, y: botY + dy * 0.35 };
-      const r_cp2 = { x: tailRootX + halfBase * 0.05 + dx * 0.70, y: botY + dy * 0.75 };
-      const l_cp1 = { x: tailRootX - halfBase * 0.05 + dx * 0.70, y: botY + dy * 0.75 };
-      const l_cp2 = { x: tailRootX - halfBase * 0.25 + dx * 0.25, y: botY + dy * 0.35 };
-
-      ctx.bezierCurveTo(r_cp1.x, r_cp1.y, r_cp2.x, r_cp2.y, tailRootX + dx, botY + dy);
-      ctx.bezierCurveTo(l_cp1.x, l_cp1.y, l_cp2.x, l_cp2.y, tailLeftX, botY);
-
-      this.drawWavyLine(ctx, tailLeftX, botY, botLeft + rBotLast, botY, 1.0, 20);
-    } else {
-      this.drawWavyLine(ctx, botRight - rBotLast, botY, botLeft + rBotLast, botY, 1.0, 20);
-    }
-
-    ctx.quadraticCurveTo(botLeft, botY, botLeft, botY - rBotLast);
-
-    // 4. Left Side up through all lines
-    for (let i = n - 1; i >= 0; i--) {
-      if (i > 0) {
-        const splitY = top[i];
-        const prevL = left[i - 1];
-        const currL = left[i];
-        const diff = prevL - currL;
-
-        if (Math.abs(diff) < 2) {
-          this.drawWavyLine(ctx, currL, bottom[i] - (i === n - 1 ? rBotLast : 0), currL, splitY, 1.0, 20);
-        } else if (diff < 0) {
-          // Line i-1 is WIDER to the left than line i (prevL < currL) -> steps outward to the left as we go up
-          const stepR = Math.min(R, -diff / 2, (bottom[i - 1] - top[i - 1]) / 2);
-          this.drawWavyLine(ctx, currL, bottom[i] - (i === n - 1 ? rBotLast : 0), currL, splitY + stepR, 1.0, 20);
-          ctx.quadraticCurveTo(currL, splitY, currL - stepR, splitY);
-          this.drawWavyLine(ctx, currL - stepR, splitY, prevL + stepR, splitY, 0.8, 16);
-          ctx.quadraticCurveTo(prevL, splitY, prevL, splitY - stepR);
-        } else {
-          // Line i-1 is NARROWER to the left than line i (prevL > currL) -> steps inward to the right as we go up
-          const stepR = Math.min(R, diff / 2, (bottom[i] - top[i]) / 2);
-          this.drawWavyLine(ctx, currL, bottom[i] - (i === n - 1 ? rBotLast : 0), currL, splitY, 1.0, 20);
-          ctx.quadraticCurveTo(currL, splitY, currL + stepR, splitY);
-          this.drawWavyLine(ctx, currL + stepR, splitY, prevL - stepR, splitY, 0.8, 16);
-          ctx.quadraticCurveTo(prevL, splitY, prevL, splitY - stepR);
-        }
-      } else {
-        // Top line left edge up to top-left corner
-        const rTop0 = Math.min(R, (right[0] - left[0]) / 2, (bottom[0] - top[0]) / 2);
-        const startY = n === 1 ? bottom[0] - rBotLast : bottom[0] - R;
-        this.drawWavyLine(ctx, left[0], startY, left[0], top[0] + rTop0, 1.0, 20);
-        ctx.quadraticCurveTo(left[0], top[0], left[0] + rTop0, top[0]);
-      }
-    }
-
-    ctx.closePath();
-  }
-
-  // Draws a line segment with subtle hand-drawn organic waves
-  static drawWavyLine(
-    ctx: CanvasRenderingContext2D,
-    x1: number,
-    y1: number,
-    x2: number,
-    y2: number,
-    waveHeight: number = 1.2,
-    interval: number = 22
-  ): void {
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const dist = Math.hypot(dx, dy);
-    const nWaves = Math.max(1, Math.floor(dist / interval));
-
-    if (nWaves <= 1) {
-      ctx.lineTo(x2, y2);
+    if (!balloon.outline) {
+      // Layout ran without a DOM to measure with; nothing to trace.
+      ctx.restore();
       return;
     }
 
-    const waveLen = dist / nWaves;
-    const ux = dx / dist;
-    const uy = dy / dist;
-    const nx = -uy;
-    const ny = ux;
+    const { ox, oy } = this.outlineOrigin(balloon);
+    const { fInfo } = balloon.outline;
+    const lines = balloon.lines ?? [text];
 
-    for (let i = 1; i <= nWaves; i++) {
-      const endX = i === nWaves ? x2 : x1 + ux * (i * waveLen);
-      const endY = i === nWaves ? y2 : y1 + uy * (i * waveLen);
+    // 1. Outline. Only a whisper gets the fat white nimbus underneath — its
+    //    dashed edge would otherwise disappear into the artwork. A plain balloon
+    //    is white fill and one black line, as in the original.
+    this.traceBalloonPath(ctx, balloon);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
 
-      const midT = (i - 0.5) * waveLen;
-      const wave = (i % 2 === 1 ? 1 : -0.7) * waveHeight;
-      const cpx = x1 + ux * midT + nx * wave;
-      const cpy = y1 + uy * midT + ny * wave;
-
-      ctx.quadraticCurveTo(cpx, cpy, endX, endY);
+    if (mode === 'whisper') {
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = this.NIMBUS_PEN;
+      ctx.setLineDash([]);
+      ctx.stroke();
+      ctx.restore();
     }
+
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = this.BALLOON_PEN;
+    if (mode === 'whisper') ctx.setLineDash([6.7, 6.7]);
+    else ctx.setLineDash([]);
+    ctx.stroke();
+    ctx.restore();
+
+    // 2. Thought bubbles trail from the balloon down to the speaker.
+    if (mode === 'think') this.drawThinkBubbles(ctx, balloon);
+
+    // 3. Text, laid out on the same line boxes the outline was built around.
+    ctx.setLineDash([]);
+    ctx.fillStyle = mode === 'whisper' ? '#222222' : '#000000';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillText(
+        lines[i].trim(),
+        ox + (fInfo.leftX[i] ?? 0),
+        oy + (i + 0.5) * BALLOON_LINE_HEIGHT
+      );
+    }
+
+    ctx.restore();
   }
 
-  static drawCloudPath(
-    ctx: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    w: number,
-    h: number
-  ): void {
-    const cx = x + w / 2;
-    const cy = y + h / 2;
-    const rx = w / 2;
-    const ry = h / 2;
+  /**
+   * The chain of shrinking bubbles that connects a thought balloon to its
+   * thinker. Ported from CBWoodringThink::Draw.
+   */
+  private static drawThinkBubbles(ctx: CanvasRenderingContext2D, balloon: ComicBalloon): void {
+    const outline = balloon.outline;
+    if (!outline || !(balloon.tailX > 0 && balloon.tailY > 0)) return;
 
-    const numArcs = Math.max(12, Math.min(18, Math.round((w + h) / 22)));
-    for (let i = 0; i < numArcs; i++) {
-      const angle = (i * 2 * Math.PI) / numArcs;
-      const nextAngle = ((i + 1) * 2 * Math.PI) / numArcs;
-      const midAngle = (angle + nextAngle) / 2;
+    const entryX = balloon.tailRootX ?? balloon.x + balloon.width / 2;
+    const entryY = balloon.y + balloon.height;
+    const tipX = balloon.tailX;
+    const tipY = balloon.tailY;
 
-      const x1 = cx + Math.cos(angle) * (rx - 1);
-      const y1 = cy + Math.sin(angle) * (ry - 1);
-      const x2 = cx + Math.cos(nextAngle) * (rx - 1);
-      const y2 = cy + Math.sin(nextAngle) * (ry - 1);
+    const deltaY = tipY - entryY;
+    if (deltaY <= 0) return;
+    const nBubbles = Math.floor((deltaY + INTERBUBBLE) / (BUBBLEHEIGHT + INTERBUBBLE));
+    if (nBubbles <= 0) return;
 
-      const bulgeR = Math.min(rx, ry) * 0.22;
-      const cpx = cx + Math.cos(midAngle) * (rx + bulgeR);
-      const cpy = cy + Math.sin(midAngle) * (ry + bulgeR);
+    const spacing = nBubbles > 1 ? (deltaY - BUBBLEHEIGHT * nBubbles) / (nBubbles - 1) : 0;
+    // The chain is walked from the thinker up to the balloon, growing as it
+    // goes, so the bubble that meets the balloon is the widest one.
+    const dx = entryX - tipX;
+    const dy = -deltaY;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    let cx = tipX + (ux * BUBBLEHEIGHT) / 2;
+    let cy = tipY + (uy * BUBBLEHEIGHT) / 2;
+    const incX = ux * (BUBBLEHEIGHT + spacing);
+    const incY = uy * (BUBBLEHEIGHT + spacing);
+    const widthDelta = nBubbles > 1 ? (ENDBUBBLEWIDTH - BUBBLEHEIGHT) / (2 * (nBubbles - 1)) : 0;
+    let widthAdj = 0;
 
-      if (i === 0) {
-        ctx.moveTo(x1, y1);
-      }
-      ctx.quadraticCurveTo(cpx, cpy, x2, y2);
+    for (let i = 0; i < nBubbles; i++) {
+      const rx = BUBBLEHEIGHT / 2 + widthAdj;
+      const ry = BUBBLEHEIGHT / 2;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.lineWidth = this.BALLOON_PEN;
+      ctx.strokeStyle = '#000000';
+      ctx.stroke();
+
+      cx += incX;
+      cy += incY;
+      widthAdj += widthDelta;
     }
-    ctx.closePath();
   }
 
   static drawWrappedText(

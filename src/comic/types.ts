@@ -120,6 +120,8 @@ export interface BackdropData {
   canvas: HTMLCanvasElement;
 }
 
+import type { BalloonOutline } from './balloonSpline';
+
 export type BalloonMode = 'say' | 'whisper' | 'think' | 'action';
 
 export interface ComicBalloon {
@@ -148,6 +150,39 @@ export interface ComicBalloon {
   routeRight?: number;
   /** Where the stem leaves the balloon's underside, once negotiated. */
   tailRootX?: number;
+  /**
+   * The hand-drawn outline, built from the wrapped lines during layout. Drawing
+   * reuses it so the painted shape is exactly the one the layout negotiated.
+   */
+  outline?: BalloonOutline;
+  /**
+   * Text trimmed off a force-fitted balloon, to be carried into the next panel.
+   */
+  overflowText?: string;
+}
+
+/** A composited character pose plus the anchors the layout needs from it. */
+export interface RenderedCharacter {
+  canvas: HTMLCanvasElement;
+  /** Face anchor x within the composite (after any flip). */
+  headX: number;
+  /** Face anchor y within the composite. */
+  headY: number;
+  /** Topmost row holding ink — the top of the hair. */
+  headTopY: number;
+  /** Bottom edge of the head artwork within the composite. */
+  headBottomY: number;
+}
+
+/**
+ * An avatar's proportions as fractions of its composite height, known before
+ * anything is drawn so the panel camera can size the cast.
+ */
+export interface AvatarMetrics {
+  /** Composite width over height. */
+  aspect: number;
+  headTopRatio: number;
+  headBottomRatio: number;
 }
 
 export interface ComicCharacterInPanel {
@@ -188,4 +223,10 @@ export interface ComicPanel {
   timestamp: number;
   titleAvatars?: string[];
   starringMembers?: TitleStarringMember[];
+  /**
+   * Source window into the backdrop art, in panel pixels. The window is
+   * stretched to fill the panel, so a smaller window reads as the camera
+   * pushing in (CUnitPanel::AdjustArtToCoord).
+   */
+  backdropBox?: { left: number; top: number; right: number; bottom: number };
 }

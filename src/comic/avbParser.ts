@@ -848,7 +848,7 @@ export class AVBParser {
     faceRec: FaceRecord,
     torsoRec: TorsoRecord,
     flip: boolean
-  ): { canvas: HTMLCanvasElement; headX: number; headY: number } {
+  ): { canvas: HTMLCanvasElement; headX: number; headY: number; headBottomY: number } {
     const headPose = this.getPose(avatar, faceRec.poseID);
     const torsoPose = this.getPose(avatar, torsoRec.poseID);
 
@@ -856,7 +856,7 @@ export class AVBParser {
       const empty = document.createElement('canvas');
       empty.width = 100;
       empty.height = 100;
-      return { canvas: empty, headX: 50, headY: 20 };
+      return { canvas: empty, headX: 50, headY: 20, headBottomY: 45 };
     }
 
     const headCanvas = this.imageToCanvas(headPose.drawing);
@@ -877,7 +877,7 @@ export class AVBParser {
     canvas.width = totalWidth;
     canvas.height = totalHeight;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return { canvas, headX: totalWidth / 2, headY: 20 };
+    if (!ctx) return { canvas, headX: totalWidth / 2, headY: 20, headBottomY: totalHeight / 2 };
 
     // In MS Comic Chat:
     // Torso position in canvas: (-bitLeft, -bitTop)
@@ -901,6 +901,10 @@ export class AVBParser {
     let resultCanvas = canvas;
     let actualHeadX = headX + faceRec.faceX;
     let actualHeadY = headY + faceRec.faceY;
+    // Bottom edge of the head artwork within the composite. The camera uses it
+    // to keep a zoomed-in head from growing past the panel (headHeight in
+    // avatar.cpp's ComputeBodyGeometry).
+    const headBottomY = headY + headCanvas.height;
 
     if (flip) {
       const flippedCanvas = document.createElement('canvas');
@@ -916,7 +920,7 @@ export class AVBParser {
       actualHeadX = totalWidth - actualHeadX;
     }
 
-    return { canvas: resultCanvas, headX: actualHeadX, headY: actualHeadY };
+    return { canvas: resultCanvas, headX: actualHeadX, headY: actualHeadY, headBottomY };
   }
 
   // Composite a simple avatar into a single Canvas
@@ -924,13 +928,13 @@ export class AVBParser {
     avatar: AvatarData,
     bodyRec: SimpleBodyRecord,
     flip: boolean
-  ): { canvas: HTMLCanvasElement; headX: number; headY: number } {
+  ): { canvas: HTMLCanvasElement; headX: number; headY: number; headBottomY: number } {
     const pose = this.getPose(avatar, bodyRec.poseID);
     if (!pose?.drawing) {
       const empty = document.createElement('canvas');
       empty.width = 100;
       empty.height = 100;
-      return { canvas: empty, headX: 50, headY: 20 };
+      return { canvas: empty, headX: 50, headY: 20, headBottomY: 45 };
     }
 
     const drawingCanvas = this.imageToCanvas(pose.drawing);
@@ -952,6 +956,13 @@ export class AVBParser {
       headX = drawingCanvas.width - headX;
     }
 
-    return { canvas: resultCanvas, headX, headY };
+    // A simple avatar is one image, so the original just calls the top half the
+    // head (CAvatarSimple's headHeight = pose.h / 2).
+    return {
+      canvas: resultCanvas,
+      headX,
+      headY,
+      headBottomY: Math.floor(drawingCanvas.height / 2),
+    };
   }
 }

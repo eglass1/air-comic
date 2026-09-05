@@ -3,8 +3,10 @@ import { EmotionEngine } from './emotionEngine';
 import {
   AvatarData,
   AvatarType,
+  AvatarMetrics,
   BackdropData,
   DecodedImage,
+  RenderedCharacter,
   EM_NEUTRAL,
 } from './types';
 import { EMBEDDED_AVATARS, EMBEDDED_BACKDROPS } from './artData';
@@ -53,7 +55,8 @@ export class AvatarManager {
 
   private avatarCache: Map<string, AvatarData> = new Map();
   private backdropCache: Map<string, BackdropData> = new Map();
-  private characterCanvasCache: Map<string, { canvas: HTMLCanvasElement; headX: number; headY: number; headTopY: number }> = new Map();
+  private characterCanvasCache: Map<string, RenderedCharacter> = new Map();
+  private metricsCache: Map<string, AvatarMetrics> = new Map();
   private iconCanvasCache: Map<string, HTMLCanvasElement> = new Map();
 
   // Known built-in avatar list
@@ -312,13 +315,13 @@ export class AvatarManager {
     emotion: number = EM_NEUTRAL,
     intensity: number = 0.0,
     flip: boolean = false
-  ): { canvas: HTMLCanvasElement; headX: number; headY: number; headTopY: number } {
+  ): RenderedCharacter {
     const cacheKey = `${avatar.name}_${emotion.toFixed(2)}_${intensity.toFixed(2)}_${flip ? 'F' : 'N'}`;
     if (this.characterCanvasCache.has(cacheKey)) {
       return this.characterCanvasCache.get(cacheKey)!;
     }
 
-    let rendered: { canvas: HTMLCanvasElement; headX: number; headY: number };
+    let rendered: { canvas: HTMLCanvasElement; headX: number; headY: number; headBottomY: number };
 
     if (avatar.type === AvatarType.AT_COMPLEX) {
       const poseRecs = EmotionEngine.getFaceAndTorso(avatar, emotion, intensity);
@@ -333,7 +336,7 @@ export class AvatarManager {
         const empty = document.createElement('canvas');
         empty.width = 100;
         empty.height = 100;
-        rendered = { canvas: empty, headX: 50, headY: 20 };
+        rendered = { canvas: empty, headX: 50, headY: 20, headBottomY: 45 };
       }
     } else {
       // Simple avatar
@@ -344,13 +347,37 @@ export class AvatarManager {
         const empty = document.createElement('canvas');
         empty.width = 100;
         empty.height = 100;
-        rendered = { canvas: empty, headX: 50, headY: 20 };
+        rendered = { canvas: empty, headX: 50, headY: 20, headBottomY: 45 };
       }
     }
 
     const measured = { ...rendered, headTopY: AvatarManager.measureHeadTop(rendered.canvas) };
     this.characterCanvasCache.set(cacheKey, measured);
     return measured;
+  }
+
+  /**
+   * Proportions of an avatar's neutral pose, as fractions of the composite's
+   * height. The panel camera needs these before anything is drawn: how wide the
+   * body is, where the hair starts, and where the head ends.
+   */
+  getAvatarMetrics(avatarNameOrFilename: string): AvatarMetrics | null {
+    const cleanKey = avatarNameOrFilename.toLowerCase().replace(/\.avb$/, '');
+    const cached = this.metricsCache.get(cleanKey);
+    if (cached) return cached;
+
+    const avatar = this.getCachedAvatar(cleanKey);
+    if (!avatar) return null;
+
+    const rendered = this.renderCharacter(avatar, EM_NEUTRAL, 0, false);
+    const h = rendered.canvas.height || 1;
+    const metrics: AvatarMetrics = {
+      aspect: rendered.canvas.width / h,
+      headTopRatio: rendered.headTopY / h,
+      headBottomRatio: rendered.headBottomY / h,
+    };
+    this.metricsCache.set(cleanKey, metrics);
+    return metrics;
   }
 
   renderAvatarIcon(avatar: AvatarData): HTMLCanvasElement {
