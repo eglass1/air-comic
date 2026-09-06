@@ -17,7 +17,7 @@ import {
   adoptGenesis,
   applyRekey,
 } from '../services/v3/epochChain';
-import type { GenesisPacket, RekeyPacket } from '../services/v3/packets';
+import type { RoomGenesisPacket, RekeyPacket } from '../services/v3/types';
 import { directoryService } from '../services/v3/directory';
 
 installFakeWebSocket();
@@ -239,8 +239,8 @@ describe('reopen and restore rooms', () => {
     const removedTabId = crypto.randomUUID();
     const chain = createChainState(removedConv);
 
-    const genesis: GenesisPacket = {
-      type: 'genesis',
+    const genesis = {
+      type: 'room_genesis',
       convId: removedConv,
       packetId: 'gen-1',
       roomMode: 'private',
@@ -254,10 +254,10 @@ describe('reopen and restore rooms', () => {
       protocol: 'airthread/3',
       extension: 'core',
       signerId: creatorId,
-    };
+    } as unknown as RoomGenesisPacket;
     adoptGenesis(chain, genesis);
 
-    const e1: RekeyPacket = {
+    const e1 = {
       type: 'key',
       convId: removedConv,
       packetId: 'e1',
@@ -270,11 +270,11 @@ describe('reopen and restore rooms', () => {
       timestamp: Date.now() - 9000,
       members: [creatorId],
       keys: { [creatorId]: 'sealed' },
-    };
+    } as unknown as RekeyPacket;
     applyRekey(chain, e1);
 
     // Add me
-    const e2: RekeyPacket = {
+    const e2 = {
       type: 'key',
       convId: removedConv,
       packetId: 'e2',
@@ -288,11 +288,11 @@ describe('reopen and restore rooms', () => {
       timestamp: Date.now() - 8000,
       members: [creatorId, myId],
       keys: { [creatorId]: 'sealed', [myId]: 'sealed' },
-    };
+    } as unknown as RekeyPacket;
     applyRekey(chain, e2);
 
     // Remove me
-    const e3: RekeyPacket = {
+    const e3 = {
       type: 'key',
       convId: removedConv,
       packetId: 'e3',
@@ -306,7 +306,7 @@ describe('reopen and restore rooms', () => {
       timestamp: Date.now() - 7000,
       members: [creatorId],
       keys: { [creatorId]: 'sealed' },
-    };
+    } as unknown as RekeyPacket;
     applyRekey(chain, e3);
 
     // Save chain in indexedDB

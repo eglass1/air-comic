@@ -8,7 +8,7 @@
  * of this file change on every deploy: that is the signal browsers use to pick
  * up a new version. See the `aircomic-pwa` plugin in vite.config.ts.
  */
-const BUILD_ID = '061ef76793c1';
+const BUILD_ID = '1a0eaaa8d26e';
 
 const SHELL_CACHE = `aircomic-shell-${BUILD_ID}`;
 const FONT_CACHE = 'aircomic-fonts-v1';
