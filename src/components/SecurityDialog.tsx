@@ -21,6 +21,9 @@ import {
   Snackbar,
   IconButton,
   Tooltip,
+  TextField,
+  FormControlLabel,
+  Switch,
 } from '@mui/material';
 import SecurityIcon from '@mui/icons-material/Security';
 import KeyIcon from '@mui/icons-material/Key';
@@ -48,19 +51,30 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
     activeEpoch,
     isApproved,
     isRekeying,
-    channelOwnerName,
     participants,
     connectedPeersCount,
+    accelerationStatus,
     relayStatuses,
     refreshRelays,
     reconnectRelays,
     rekeyConversation,
-    rootFingerprint,
+    roomFingerprint,
+    memberCount,
+    capabilityGeneration,
+    relayUrls,
+    setRelayUrls,
+    webrtcEnabled,
+    setWebrtcEnabled,
     profile,
   } = useChat();
 
   const [snack, setSnack] = useState<string | null>(null);
   const [isReconnectingRelays, setIsReconnectingRelays] = useState(false);
+  const [relayDraft, setRelayDraft] = useState('');
+
+  useEffect(() => {
+    if (open) setRelayDraft(relayUrls.join('\n'));
+  }, [open, relayUrls]);
 
   useEffect(() => {
     if (open) {
@@ -214,7 +228,7 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
           <Box>
             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
               <Typography variant="subtitle2" color="primary" sx={{ fontWeight: 600 }}>
-                NOSTR SIGNALING RELAYS ({relayStatuses.filter((r) => r.status === 'connected').length}/{relayStatuses.length} CONNECTED)
+                NOSTR RELAYS ({relayStatuses.filter((r) => r.connected).length}/{relayStatuses.length} CONNECTED)
               </Typography>
               <Tooltip title="Reconnect signaling relays">
                 <span>
@@ -241,35 +255,130 @@ export const SecurityDialog: React.FC<SecurityDialogProps> = ({ open, onClose })
             <List dense sx={{ bgcolor: 'background.paper', borderRadius: 2, border: '1px solid', borderColor: 'divider', maxHeight: 160, overflowY: 'auto' }}>
               {relayStatuses.length === 0 ? (
                 <ListItem>
-                  <ListItemText secondary="Connecting to Nostr signaling relays..." />
+                  <ListItemText secondary="Connecting to Nostr relays..." />
                 </ListItem>
               ) : (
                 relayStatuses.map((r) => (
                   <ListItem key={r.url} secondaryAction={
-                    <Chip
-                      size="small"
-                      label={r.status.toUpperCase()}
-                      color={
-                        r.status === 'connected'
-                          ? 'success'
-                          : r.status === 'connecting'
-                          ? 'warning'
-                          : r.status === 'error'
-                          ? 'error'
-                          : 'default'
-                      }
-                      variant="outlined"
-                      sx={{ fontSize: '0.65rem', height: 20 }}
-                    />
+                    <Box sx={{ display: 'flex', gap: 0.5 }}>
+                      {/* Connected, writable and readable are distinct facts
+                          about a relay and are reported separately [A-01]. */}
+                      <Chip
+                        size="small"
+                        label={r.connected ? 'CONN' : 'DOWN'}
+                        color={r.connected ? 'success' : 'default'}
+                        variant="outlined"
+                        sx={{ fontSize: '0.6rem', height: 20 }}
+                      />
+                      <Chip
+                        size="small"
+                        label="W"
+                        title="Writable: a recent event was accepted"
+                        color={r.writable ? 'success' : 'default'}
+                        variant="outlined"
+                        sx={{ fontSize: '0.6rem', height: 20 }}
+                      />
+                      <Chip
+                        size="small"
+                        label="R"
+                        title="Readable: a subscription has produced events"
+                        color={r.readable ? 'success' : 'default'}
+                        variant="outlined"
+                        sx={{ fontSize: '0.6rem', height: 20 }}
+                      />
+                    </Box>
                   }>
                     <ListItemText
                       primary={r.url}
+                      secondary={r.lastError || undefined}
                       primaryTypographyProps={{ fontFamily: 'monospace', fontSize: '0.75rem' }}
+                      secondaryTypographyProps={{ fontSize: '0.65rem' }}
                     />
                   </ListItem>
                 ))
               )}
             </List>
+
+            {/* The relay list must be user-configurable [T-01][U-03]. */}
+            <Accordion disableGutters sx={{ mt: 1, bgcolor: 'transparent' }}>
+              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                  EDIT RELAY LIST
+                </Typography>
+              </AccordionSummary>
+              <AccordionDetails>
+                <TextField
+                  multiline
+                  minRows={4}
+                  fullWidth
+                  value={relayDraft}
+                  onChange={(e) => setRelayDraft(e.target.value)}
+                  placeholder={'wss://relay.example\nwss://another.example'}
+                  helperText="One wss:// URL per line. Leaving this empty restores the defaults."
+                  InputProps={{ sx: { fontFamily: 'monospace', fontSize: '0.75rem' } }}
+                />
+                <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={async () => {
+                      await setRelayUrls(relayDraft.split('\n'));
+                      setSnack('Relay list saved.');
+                    }}
+                  >
+                    Save relays
+                  </Button>
+                  <Button size="small" onClick={() => setRelayDraft(relayUrls.join('\n'))}>
+                    Reset
+                  </Button>
+                </Box>
+                <FormControlLabel
+                  sx={{ mt: 1 }}
+                  control={
+                    <Switch
+                      checked={webrtcEnabled}
+                      onChange={(e) => void setWebrtcEnabled(e.target.checked)}
+                      size="small"
+                    />
+                  }
+                  label={
+                    <Typography variant="caption">
+                      Use direct peer connections when possible (an optimisation only --
+                      rooms work over relays either way)
+                    </Typography>
+                  }
+                />
+              </AccordionDetails>
+            </Accordion>
+          </Box>
+
+          <Divider />
+
+          {/* Say plainly what is and is not protected [R-07]. */}
+          <Box>
+            <Typography variant="subtitle2" color="primary" sx={{ fontWeight: 600, mb: 1 }}>
+              WHAT THIS PROTECTS
+            </Typography>
+            <Alert severity="info" sx={{ py: 0.5, mb: 1 }}>
+              <Typography variant="caption" component="div">
+                <strong>Content.</strong> Private room messages are end-to-end encrypted; only
+                current members hold the key. Public room messages are not encrypted at all.
+              </Typography>
+            </Alert>
+            <Alert severity="warning" sx={{ py: 0.5, mb: 1 }}>
+              <Typography variant="caption" component="div">
+                <strong>Not metadata.</strong> Relays can see your IP address, when you are
+                active, how much you send, and which room pseudonym you publish under.
+                Direct peer connections reveal your network address to those peers.
+              </Typography>
+            </Alert>
+            <Alert severity="warning" sx={{ py: 0.5 }}>
+              <Typography variant="caption" component="div">
+                <strong>Not this device.</strong> Your keys, room secrets and message history
+                are stored unencrypted in this browser profile, protected only by your
+                operating-system account. Anyone with access to it has access to them.
+              </Typography>
+            </Alert>
           </Box>
 
           {/* Participants & Epoch Membership Accordion */}

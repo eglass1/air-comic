@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   Dialog,
   DialogTitle,
+  Alert,
   DialogContent,
   DialogActions,
   Button,
@@ -134,6 +135,11 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
         </DialogTitle>
 
         <DialogContent dividers sx={{ display: 'flex', flexDirection: 'column', gap: 2, minHeight: 420 }}>
+          {/* [PU-01]: say plainly what public costs, before someone joins. */}
+          <Alert severity="warning" sx={{ py: 0.5 }}>
+            Public rooms are <strong>not encrypted</strong>. Anything you say is stored on
+            public relays in the clear and can be read and kept by anyone.
+          </Alert>
           {/* Search & Tag Filter Bar */}
           <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}>
             <TextField

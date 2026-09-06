@@ -71,8 +71,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     approveJoinRequest,
     declineJoinRequest,
     sendJoinRequest,
-    claimConversation,
-    channelOwnerName,
     isRekeying,
     connectedPeersCount,
     channelTitle,
@@ -407,19 +405,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 Messages automatically generate real-time comic strips with avatars, word balloons, and emotional expressions.
               </Typography>
 
-              {activeEpoch === 0 && !isApproved && (
-                <Button
-                  variant="contained"
-                  color="primary"
-                  startIcon={<VpnKeyIcon />}
-                  onClick={claimConversation}
-                  disabled={isRekeying}
-                  sx={{ mb: 1.5, fontWeight: 700 }}
-                >
-                  Claim Channel
-                </Button>
-              )}
-
               <Chip
                 icon={<ContentCopyIcon />}
                 label="Copy Invite Link"
@@ -626,9 +611,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   Entry Request Sent & Pending Approval
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  {channelOwnerName
-                    ? `Waiting for ${channelOwnerName} or a group member to accept your request...`
-                    : 'Waiting for a group member to accept your request and send the conversation key...'}
+                  Waiting for a member to accept your request and send you the
+                  current epoch key...
                 </Typography>
               </Box>
             </Box>

@@ -7,7 +7,7 @@ import {
   Chip,
   Tooltip,
 } from '@mui/material';
-import LockIcon from '@mui/icons-material/Lock';
+import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import VerifiedIcon from '@mui/icons-material/Verified';
 import { ChatMessage, Participant } from '../types';
 import { ContactCardDialog } from './ContactCardDialog';
@@ -28,7 +28,7 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
   if (message.isSystem) {
     let chipColor: 'primary' | 'success' | 'warning' | 'error' | 'default' = 'default';
 
-    if (message.systemType === 'claim' || message.systemType === 'rekey') {
+    if (message.systemType === 'rekey') {
       chipColor = 'primary';
     } else if (message.systemType === 'approved' || message.systemType === 'join') {
       chipColor = 'success';
@@ -41,7 +41,7 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', my: 1, px: 2 }}>
         <Chip
-          icon={message.systemType === 'claim' || message.systemType === 'rekey' ? <VerifiedIcon sx={{ fontSize: '14px !important' }} /> : undefined}
+          icon={message.systemType === 'rekey' ? <VerifiedIcon sx={{ fontSize: '14px !important' }} /> : undefined}
           label={`${message.text} • ${formattedTime}`}
           size="small"
           variant="outlined"
@@ -59,10 +59,11 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
     );
   }
 
-  // Undecryptable Message
-  if (!message.decrypted) {
+  // A send that never reached a relay quorum. The message exists locally and
+  // is retried in the background; 'sent' never means 'read' [L-12][D-05].
+  if (message.sendState === 'failed') {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'flex-start', my: 1, px: 2 }}>
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', my: 1, px: 2 }}>
         <Paper
           variant="outlined"
           sx={{
@@ -74,19 +75,17 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-            <LockIcon color="error" fontSize="small" />
+            <ErrorOutlineIcon color="error" fontSize="small" />
             <Typography variant="caption" color="error.main" sx={{ fontWeight: 700 }}>
-              Encrypted Message (Key Epoch Unavailable)
+              Not delivered to any relay
             </Typography>
             <Typography variant="caption" color="text.secondary">
               {formattedTime}
             </Typography>
           </Box>
-          <Typography variant="body2" sx={{ fontStyle: 'italic', color: 'text.secondary' }}>
-            {message.text}
-          </Typography>
+          <Typography variant="body2">{message.text}</Typography>
           <Typography variant="caption" sx={{ display: 'block', mt: 0.5, fontSize: '0.7rem', color: 'text.secondary' }}>
-            Key ID: <code>{message.keyId}</code>
+            Saved here, but no relay accepted it. It will be retried while you stay connected.
           </Typography>
         </Paper>
       </Box>
@@ -98,7 +97,7 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message }) => {
   const participantStub: Participant = {
     participantId: message.senderId || 'unknown',
     screenName: message.sender.screenName,
-    publicKey: message.sender.publicKey || '',
+    publicKey: message.sender.signingPublicKey || '',
     signingPublicKey: message.sender.signingPublicKey || '',
     contactInfo: message.sender.contactInfo,
     lastSeen: message.timestamp,

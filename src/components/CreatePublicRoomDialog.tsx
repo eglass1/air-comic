@@ -90,8 +90,13 @@ export const CreatePublicRoomDialog: React.FC<CreatePublicRoomDialogProps> = ({ 
       </DialogTitle>
 
       <DialogContent dividers sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
-        <Alert severity="info" sx={{ py: 0.5 }}>
-          🌐 <strong>Public Directory Notice</strong>: Public rooms are published to the public directory and can be discovered by anyone. No invitation link or member approval is required to join.
+        {/* Public means world-readable, not merely open admission [PU-01]. */}
+        <Alert severity="warning" sx={{ py: 0.5 }}>
+          🌐 <strong>Public means world-readable.</strong> Messages in a public room are
+          <strong> not encrypted</strong>. They are stored on public relays in the clear, where
+          anyone -- including people who never join -- can read, copy and keep them
+          indefinitely. The room is listed in the public directory and needs no invitation
+          or approval to join.
         </Alert>
 
         {error && (

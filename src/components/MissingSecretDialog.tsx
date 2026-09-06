@@ -14,10 +14,10 @@ import LockIcon from '@mui/icons-material/Lock';
 import MeetingRoomIcon from '@mui/icons-material/MeetingRoom';
 import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
 import { useChat } from '../context/ChatContext';
-import { generateRandomRoomSecret } from '../services/crypto';
+import { generateRoomSecret } from '../services/v3/keys';
 
 export const MissingSecretDialog: React.FC = () => {
-  const { isSecretMissing, convId, provideRoomSecret, switchConversation } = useChat();
+  const { isSecretMissing, convId, provideRoomSecret, openTab } = useChat();
   const [inputText, setInputText] = useState<string>('');
   const [errorText, setErrorText] = useState<string>('');
 
@@ -32,7 +32,7 @@ export const MissingSecretDialog: React.FC = () => {
   };
 
   const handleCreateNew = () => {
-    switchConversation(crypto.randomUUID(), generateRandomRoomSecret());
+    openTab({ roomMode: 'private', roomSecret: generateRoomSecret(), isInitialCreator: true });
   };
 
   return (

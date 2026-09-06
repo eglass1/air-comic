@@ -80,11 +80,13 @@ export const Navbar: React.FC<NavbarProps> = ({
     favoriteRooms,
     connectionStatus,
     connectedPeersCount,
+    accelerationStatus,
+    pendingSendCount,
+    failedSendCount,
     activeEpoch,
     isApproved,
     isRekeying,
     pendingJoinRequests,
-    claimConversation,
     clearHistory,
     friends,
     roomMode,
@@ -238,15 +240,26 @@ export const Navbar: React.FC<NavbarProps> = ({
           {/* Combined Connection & Peers Status Indicator */}
           <Tooltip
             title={
+              // Relay connectivity and direct acceleration are separate facts
+              // and must never be conflated [W-04].
               !online
                 ? 'Offline - no network connection'
                 : connectionStatus !== 'connected'
-                ? 'Not Connected'
-                : connectedPeersCount === 0
-                ? 'Connected (no peers)'
-                : connectedPeersCount === 1
-                ? 'Connected (1 peer)'
-                : `Connected (${connectedPeersCount} peers)`
+                ? 'Nostr: reconnecting'
+                : [
+                    'Nostr: connected',
+                    accelerationStatus === 'active'
+                      ? `Direct: active (${connectedPeersCount} ${
+                          connectedPeersCount === 1 ? 'peer' : 'peers'
+                        })`
+                      : accelerationStatus === 'disabled'
+                      ? 'Direct: turned off'
+                      : 'Direct: unavailable (messages still flow over relays)',
+                    pendingSendCount > 0 ? `${pendingSendCount} sending` : null,
+                    failedSendCount > 0 ? `${failedSendCount} failed to send` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' | ')
             }
           >
             <Box

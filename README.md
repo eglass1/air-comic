@@ -11,7 +11,7 @@
 </picture>
 
 ### Multi-User Comic Strip Chat Client
-*Decentralized P2P • End-to-End Encrypted • Microsoft Comic Chat Modernized*
+*Relay-Backed • End-to-End Encrypted • Microsoft Comic Chat Modernized*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.txt)
 [![Distribution](https://img.shields.io/badge/Distribution-Single--File%20HTML-0070f3.svg)](docs/index.html)
@@ -59,23 +59,52 @@ I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScri
 
 ---
 
-## 🔒 Security & Peer-to-Peer Encryption
+## 🔒 Security, Networking & Encryption
 
-- **P2P Mesh WebRTC (Trystero)**: Ephemeral decentralized networking over WebRTC with Nostr/BitTorrent relay signaling.
-- **Dual Cryptographic Keypair Architecture**:
-  - **RSA-OAEP 2048-bit**: Asymmetric public-key encryption for AES-256-GCM conversation keys.
-  - **ECDSA P-256**: Digital signatures for authenticating identity hellos, rekeys, join requests, and room actions.
-- **Channel Governance & Rekeying**:
-  - Entry requests are gossiped to every member, so the prompt appears for all of them; whoever accepts first rekeys the room and clears the prompt everywhere else.
-  - Direct room invitations: invite a friend and they get a "would you like to join" prompt instead of a link. Accepting runs the normal join handshake, auto-approved by the inviter. Invitations for offline friends are held in IndexedDB and delivered when they next appear online.
-  - Group participant removal with instant rekey exclusion.
-- **Presence & Gossip Mesh**:
-  - Friends directory shows who is currently online, driven by low-rate replaceable Nostr announcements rather than per-peer heartbeats.
-  - Signed hellos, control packets and messages are relayed peer-to-peer with packet-id de-duplication, so a room stays consistent even when some peer pairs cannot form a direct WebRTC link.
-  - Newly joined peers back-fill recent history from whichever peers they can reach.
-- **IndexedDB Persistence**: Local storage for user profiles, keypairs, friends directory, and conversation logs.
+AirComic speaks **airthread/3**. Nostr relays are the authoritative transport for
+every room; WebRTC is an optional accelerator, never a requirement.
 
----
+- **Nostr-authoritative transport**: every message, membership change, room
+  setting, invitation and presence record travels through a shared pool of Nostr
+  relays. A room keeps working when no peer connection can be established at all.
+  A send counts as delivered only when a quorum of relays actually acknowledges
+  it, and pending sends are queued locally and retried across reloads.
+- **Optional direct acceleration**: the foreground private room may also form a
+  WebRTC mesh, which carries the byte-identical packet for lower latency. Its
+  rendezvous is derived from the room secret, so a conversation id alone reveals
+  nothing. If it fails, the room simply runs on relays. The status dot reports
+  relay connectivity and direct acceleration separately -- "connected" never
+  means "a peer was found".
+- **Identity**: RSA-OAEP 2048 for key transport and ECDSA P-256 for signatures.
+  Your identity is the SHA-256 of your signing key, so names are self-certifying;
+  there is no account and no registry.
+- **Private rooms**: content is end-to-end encrypted under a per-epoch AES-256-GCM
+  key, wrapped individually to each member. Every message and control packet is
+  signed, so one member cannot forge another's messages. Membership is a
+  validated chain: each transition must name the epoch it descends from, be
+  signed by a member of that epoch, and change the roster by exactly what it
+  claims. Competing transitions resolve deterministically.
+- **Removal actually removes**: removing someone rotates the room secret as well
+  as the key, so the room moves to a routing tag the removed member cannot
+  compute. The new capability is sealed to each remaining member and published
+  where offline members will still find it.
+- **Public rooms**: signed but **not encrypted**. Public means world-readable:
+  anything said there is stored on public relays in the clear. They need no
+  invitation or approval, are discoverable in the directory, and report
+  approximate occupancy from short-lived pseudonymous beacons.
+- **Presence is opt-in**: contacts see each other only after exchanging a random
+  presence capability. Removing a contact rotates it. Knowing someone's identity
+  is not enough to track when they are online.
+- **Room size**: private rooms have no member cap. Above 20 members direct
+  acceleration stops being attempted and the room runs on relays alone.
+
+### What this does not protect
+
+End-to-end encryption covers content, not metadata. Relays can see your IP
+address, when you are active, how much you send, and which per-room pseudonym you
+publish under; WebRTC peers learn each other's network addresses. Keys, room
+secrets and message history are stored unencrypted in the browser profile,
+protected only by your operating-system account.
 
 ## 📱 Install as an App (PWA)
 
@@ -87,7 +116,7 @@ AirComic ships as an installable PWA. Launched from its icon it opens standalone
 
 The install option hides itself once you are already running the installed app.
 
-Offline means *the app starts*, not *chat works*: AirComic is peer-to-peer, so with no network there are no peers. The status dot in the toolbar distinguishes the two -- red for no network connection, amber for a network but no relay mesh, green for connected (with the peer count).
+Offline means *the app starts*, not *chat works*: with no network there are no relays to reach. The status dot in the toolbar distinguishes the two -- red for no network connection, amber for a network but no relay, green for connected. Direct peer acceleration is reported separately, because it is an optimisation rather than a requirement.
 
 When a new version is deployed, the running app keeps working from its cached build and offers a **Reload** prompt; nothing swaps out mid-conversation, and nobody is stranded on an old build.
 
