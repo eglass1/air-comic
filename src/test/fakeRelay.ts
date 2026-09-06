@@ -60,6 +60,34 @@ export class FakeRelay {
     }
     this.events.push(event);
   }
+
+  /**
+   * NIP-01 stored-event replay: newest first, and each filter capped by its own
+   * `limit`. Replaying in insertion order shows a client a room's history in an
+   * order no real relay produces, which is exactly where ordering bugs hide.
+   *
+   * created_at has one-second resolution, so a test writes many events in the
+   * same second. Ties break on reverse insertion order -- the pessimistic
+   * reading of "newest first", and the one a client must cope with anyway.
+   */
+  stored(filters: Filter[]): NostrEvent[] {
+    const indexed = this.events.map((event, seq) => ({ event, seq }));
+    indexed.sort((a, b) => b.event.created_at - a.event.created_at || b.seq - a.seq);
+
+    const chosen = new Set<NostrEvent>();
+    for (const filter of filters) {
+      const limit = typeof filter.limit === 'number' ? filter.limit : Infinity;
+      let taken = 0;
+      for (const { event } of indexed) {
+        if (taken >= limit) break;
+        if (!this.matches(event, filter)) continue;
+        chosen.add(event);
+        taken += 1;
+      }
+    }
+
+    return indexed.filter(({ event }) => chosen.has(event)).map(({ event }) => event);
+  }
 }
 
 const registry = new Map<string, FakeRelay>();
@@ -150,10 +178,8 @@ export class FakeWebSocket {
     if (msg[0] === 'REQ') {
       const [, subId, ...filters] = msg as [string, string, ...Filter[]];
       this.subs.set(subId, filters);
-      for (const event of this.relay.events) {
-        if (filters.some((f) => this.relay!.matches(event, f))) {
-          this.emit(['EVENT', subId, event]);
-        }
+      for (const event of this.relay.stored(filters)) {
+        this.emit(['EVENT', subId, event]);
       }
       this.emit(['EOSE', subId]);
       return;

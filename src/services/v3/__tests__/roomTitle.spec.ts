@@ -105,6 +105,93 @@ describe('room title propagation -- [M-01]', () => {
     bobRoom.destroy();
   }, 20000);
 
+  it('adopts the title even when it arrives before the genesis that vouches for it', async () => {
+    // A first subscription replays the room newest-first, so the title lands
+    // before genesis. One relay, so no second delivery can paper over it: the
+    // packet is seen exactly once, and dedup makes that the only chance.
+    relayPool.configure([URLS[0]]);
+    await settle(50);
+
+    const convId = crypto.randomUUID();
+    const secret = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'a',
+      convId,
+      roomMode: 'private',
+      roomSecret: secret,
+      isInitialCreator: true,
+      channelTitle: 'The Grapevine',
+      database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    await settle(150);
+
+    const bobRoom = new RoomSession({
+      tabId: 'b',
+      convId,
+      roomMode: 'private',
+      roomSecret: secret,
+      // What the app passes for a room it has joined but cannot yet name.
+      channelTitle: 'Untitled Room',
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(200);
+
+    expect(bobRoom.channelTitle).toBe('The Grapevine');
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+    relayPool.configure(URLS);
+    await settle(50);
+  }, 30000);
+
+  it('shows the member who admitted you before they say anything', async () => {
+    const convId = crypto.randomUUID();
+    const secret = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'a',
+      convId,
+      roomMode: 'private',
+      roomSecret: secret,
+      isInitialCreator: true,
+      channelTitle: 'The Grapevine',
+      database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    await settle();
+
+    const bobRoom = new RoomSession({
+      tabId: 'b', convId, roomMode: 'private', roomSecret: secret, database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle();
+    await aliceRoom.approveJoinRequest(aliceRoom.pendingJoinRequests[0].requestId);
+    await settle(150);
+
+    expect(bobRoom.isApproved).toBe(true);
+
+    // Nobody has spoken yet, and the roster already knows who is here.
+    const alicesEntry = bobRoom.participants.find(
+      (p) => p.participantId === alice.participantId
+    );
+    expect(alicesEntry).toBeTruthy();
+    expect(alicesEntry!.screenName).toBe('Alice');
+    expect(alicesEntry!.isApproved).toBe(true);
+    // She just signed the admission, so she is genuinely here.
+    expect(alicesEntry!.status).toBe('online');
+    expect(bobRoom.participants.length).toBe(2);
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  }, 30000);
+
   it('a rename reaches a member already in the room', async () => {
     const convId = crypto.randomUUID();
     const secret = generateRoomSecret();

@@ -202,6 +202,8 @@ export class RoomSession {
   private genesis: RoomGenesisPacket | null = null;
   /** Timestamp of the newest room_metadata we have applied [M-01]. */
   private titleUpdatedAt = 0;
+  /** A title that arrived before there was a chain to judge its author by. */
+  private pendingMetadata: RoomMetadataPacket | null = null;
   private dedup: DedupLedger;
 
   private subscription: { close(): void; update(f: unknown[]): void } | null = null;
@@ -928,6 +930,76 @@ export class RoomSession {
     this.insertMessage(message, isBackfill);
   }
 
+  /**
+   * A rekey is the first thing a newly admitted member hears, and it names who
+   * admitted them. Without this the roster shows nobody but yourself until
+   * somebody happens to speak, even though the chain already says who is here.
+   */
+  private trackParticipantsFromRekey(packet: RekeyPacket) {
+    const selfId = this.profile?.participantId;
+    let changed = false;
+
+    const remember = (
+      participantId: string,
+      options: { screenName?: string; signingKey?: string; active?: boolean }
+    ) => {
+      if (!participantId || participantId === selfId) return;
+      const existing = this.participantsMap.get(participantId);
+      const name = options.screenName?.trim() || existing?.screenName || 'Anonymous';
+      const signing = options.signingKey
+        ? normalizePublicKey(options.signingKey)
+        : existing?.signingPublicKey ?? '';
+      // Membership is not evidence of being online; acting just now is.
+      const status: Participant['status'] = options.active
+        ? 'online'
+        : existing?.status ?? 'offline';
+      const approved = packet.members.includes(participantId);
+
+      if (
+        existing &&
+        existing.screenName === name &&
+        existing.signingPublicKey === signing &&
+        existing.status === status &&
+        existing.isApproved === approved
+      ) {
+        return;
+      }
+
+      this.participantsMap.set(participantId, {
+        participantId,
+        // The packet wraps a key to each member but carries nobody's public
+        // key, so this stays empty until they introduce themselves.
+        publicKey: existing?.publicKey ?? '',
+        signingPublicKey: signing,
+        screenName: name,
+        avatarName: existing?.avatarName || 'Armando',
+        contactInfo: existing?.contactInfo,
+        lastSeen: options.active ? packet.timestamp : existing?.lastSeen ?? packet.timestamp,
+        isSelf: false,
+        status,
+        isApproved: approved,
+      });
+      changed = true;
+    };
+
+    // The rest are known to be here, but not by name and not necessarily now.
+    packet.members.forEach((id) => remember(id, {}));
+    // These two are the only identities a rekey actually names.
+    remember(packet.signerId, {
+      screenName: packet.signerScreenName,
+      signingKey: packet.signerSigningPublicKey,
+      active: true,
+    });
+    if (packet.targetParticipantId) {
+      remember(packet.targetParticipantId, {
+        screenName: packet.targetScreenName,
+        active: true,
+      });
+    }
+
+    if (changed) this.commitParticipants();
+  }
+
   private trackParticipantFromMessage(payload: MessagePayload) {
     if (payload.senderId === this.profile?.participantId) return;
     const existing = this.participantsMap.get(payload.senderId);
@@ -996,10 +1068,16 @@ export class RoomSession {
   }
 
   /**
-   * Re-applies buffered control packets now that a new chain node exists.
-   * Repeats while progress is being made, since one link can unblock the next.
+   * Re-applies buffered control packets now that a new chain node exists, and
+   * re-judges a title that arrived before there was any chain to judge it by.
    */
   private async drainOrphans(): Promise<void> {
+    await this.drainOrphanControl();
+    await this.applyPendingMetadata();
+  }
+
+  /** Repeats while progress is being made, since one link can unblock the next. */
+  private async drainOrphanControl(): Promise<void> {
     for (let pass = 0; pass < 8; pass++) {
       const pending = this.orphanControl;
       if (pending.length === 0) return;
@@ -1033,6 +1111,8 @@ export class RoomSession {
     if (packet.action !== 'reshare') {
       await this.recordChainPacket(packet.packetId, packet.epoch, packet);
     }
+
+    this.trackParticipantsFromRekey(packet);
 
     const slot = await openRekeySlot(packet, this.profile.participantId, this.privateKey);
     if (slot) {
@@ -1150,6 +1230,7 @@ export class RoomSession {
     this.syncParticipantApproval();
     await this.persistChain();
     await this.persistConversation();
+    await this.drainOrphans();
     this.notify();
   }
 
@@ -1210,6 +1291,11 @@ export class RoomSession {
       if (policy === 'creator') {
         if (packet.setterId !== this.genesis?.creatorId) return;
       } else if (!this.setterWasMember(packet)) {
+        // A first subscription replays the room newest-first, so the title
+        // routinely lands before the genesis that would vouch for its author.
+        // Dedup means we only ever see a given packet once, so dropping it
+        // here loses the room's name for good -- hold it instead [M-01].
+        if (!this.genesis || this.chain.nodes.size === 0) this.deferMetadata(packet);
         return;
       }
     } else if (!this.publicRoomCreatorId || packet.setterId !== this.publicRoomCreatorId) {
@@ -1238,6 +1324,20 @@ export class RoomSession {
    * it, so someone arriving there has a creator and no roster. Epoch 1 is the
    * creator alone [PR-01], which is enough to accept the creator's own record.
    */
+  private deferMetadata(packet: RoomMetadataPacket): void {
+    if (!this.pendingMetadata || packet.timestamp > this.pendingMetadata.timestamp) {
+      this.pendingMetadata = packet;
+    }
+  }
+
+  /** Re-judges a held title once the chain can actually answer the question. */
+  private async applyPendingMetadata(): Promise<void> {
+    const held = this.pendingMetadata;
+    if (!held) return;
+    this.pendingMetadata = null;
+    await this.handleMetadata(held);
+  }
+
   private setterWasMember(packet: RoomMetadataPacket): boolean {
     if (membersAt(this.chain, packet.timestamp).includes(packet.setterId)) return true;
     return this.chain.nodes.size === 0 && packet.setterId === this.genesis?.creatorId;
