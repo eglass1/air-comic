@@ -29,7 +29,13 @@ import {
   importSigningPrivateKeyFromJwk,
   normalizePublicKey,
 } from '../services/crypto';
-import { getOrInitChannelTitle, getRandomChannelTitle } from '../utils/channelNameGenerator';
+import {
+  UNTITLED_CHANNEL_TITLE,
+  getOrInitChannelTitle,
+  getRandomChannelTitle,
+  getStoredChannelTitle,
+  rememberChannelTitle,
+} from '../utils/channelNameGenerator';
 import { db } from '../services/v3/db';
 import { relayPool } from '../services/nostr/relayPool';
 import { RoomSession, outbox } from '../services/v3/roomSession';
@@ -51,6 +57,47 @@ const STORAGE_KEY_TABS = 'aircomic_open_tabs';
 
 /** Shared so a room-less render does not hand consumers a new array each time. */
 const EMPTY_PARTICIPANTS: Participant[] = [];
+
+interface OpenTabConfig {
+  convId?: string;
+  roomMode?: RoomMode;
+  roomSecret?: string;
+  publicJoinToken?: string;
+  channelTitle?: string;
+  isInitialCreator?: boolean;
+}
+
+/**
+ * The room named by the current address, or null when the address names none.
+ * A join link is a normal URL, so it must work pasted into the address bar and
+ * not only through the join dialog.
+ */
+function readRoomFromLocation(): OpenTabConfig | null {
+  if (typeof window === 'undefined') return null;
+
+  const params = new URLSearchParams(window.location.search);
+  const convId = params.get('id')?.trim();
+  if (!convId) return null;
+
+  if (params.get('public') === '1' || params.get('public') === 'true') {
+    return {
+      convId,
+      roomMode: 'public',
+      publicJoinToken: params.get('join') || undefined,
+      isInitialCreator: false,
+    };
+  }
+
+  // An empty secret is deliberate: it means we genuinely cannot compute the
+  // routing tag, which is what the missing-secret dialog explains. Leaving it
+  // undefined would silently mint a new secret and a room nobody else is in.
+  return {
+    convId,
+    roomMode: 'private',
+    roomSecret: window.location.hash.match(/secret=([A-Za-z0-9_-]+)/)?.[1] ?? '',
+    isInitialCreator: false,
+  };
+}
 
 export interface QuickMessageTarget {
   participantId: string;
@@ -93,6 +140,7 @@ export interface ChatContextType {
   openQuickMessage: (target: QuickMessageTarget) => void;
   closeQuickMessage: () => void;
   dismissIncomingQuickMessage: () => void;
+  hideIncomingQuickMessage: () => void;
   replyToIncomingQuickMessage: () => void;
   sendQuickMessage: (text: string, emotion: number, intensity: number) => Promise<boolean>;
 
@@ -122,6 +170,9 @@ export interface ChatContextType {
   isInitialCreator: boolean;
   channelTitle: string;
   updateChannelTitle: (newTitle: string) => Promise<boolean>;
+  /** False when this identity may not rename the room, e.g. a public room
+   *  they did not create [PU-02]. */
+  canRenameRoom: boolean;
   /** Nostr connectivity only. Acceleration is reported separately [W-04]. */
   connectionStatus: 'connected' | 'connecting' | 'disconnected' | 'error';
   accelerationStatus: AccelerationStatus;
@@ -235,6 +286,61 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Sessions
   // --------------------------------------------------------------------------
 
+  const syncBrowserUrl = useCallback((tab: RoomTab) => {
+    if (typeof window === 'undefined') return;
+    if (tab.roomMode === 'public') {
+      window.history.replaceState(
+        null,
+        '',
+        `?id=${encodeURIComponent(tab.convId)}&public=1&join=${encodeURIComponent(
+          tab.publicJoinToken || ''
+        )}`
+      );
+    } else {
+      const search = `?id=${encodeURIComponent(tab.convId)}`;
+      const hash = tab.roomSecret ? `#secret=${encodeURIComponent(tab.roomSecret)}` : '';
+      window.history.replaceState(null, '', `${search}${hash}`);
+    }
+  }, []);
+
+  const persistTabs = useCallback((next: RoomTab[]) => {
+    try {
+      sessionStorage.setItem(STORAGE_KEY_TABS, JSON.stringify(next));
+    } catch {
+      /* session storage is a convenience only */
+    }
+  }, []);
+
+  /**
+   * A room's name and its secret are decided by the room, not by the tab that
+   * happens to display it: the title arrives in a room_metadata packet and the
+   * secret is replaced by every capability rotation. Push both back into the
+   * tab record so the tab strip, the restored session and the address bar all
+   * agree with what the session actually holds.
+   */
+  const syncTabFromSession = useCallback(
+    (session: RoomSession) => {
+      const current = tabsRef.current.find((t) => t.tabId === session.tabId);
+      if (!current) return;
+
+      const channelTitle = session.channelTitle?.trim() || current.channelTitle;
+      const roomSecret =
+        session.roomMode === 'private' && session.roomSecret
+          ? session.roomSecret
+          : current.roomSecret;
+      if (channelTitle === current.channelTitle && roomSecret === current.roomSecret) return;
+
+      const updated = { ...current, channelTitle, roomSecret };
+      const next = tabsRef.current.map((t) => (t.tabId === session.tabId ? updated : t));
+      tabsRef.current = next;
+      setTabs(next);
+      persistTabs(next);
+      rememberChannelTitle(updated.convId, channelTitle);
+      if (session.tabId === activeTabIdRef.current) syncBrowserUrl(updated);
+    },
+    [persistTabs, syncBrowserUrl]
+  );
+
   const getOrCreateSession = useCallback(
     (tab: RoomTab): RoomSession => {
       const existing = sessionsRef.current.get(tab.tabId);
@@ -251,7 +357,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           channelTitle: tab.channelTitle,
         },
         {
-          onStateChange: () => rerender(),
+          onStateChange: (s) => {
+            syncTabFromSession(s);
+            rerender();
+          },
           onNewMessage: (s) => {
             if (s.tabId !== activeTabIdRef.current) {
               setTabs((prev) =>
@@ -279,36 +388,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       return session;
     },
-    [rerender]
+    [rerender, syncTabFromSession]
   );
 
   const activeSession = sessionsRef.current.get(activeTabId) ?? null;
   const activeTab = tabs.find((t) => t.tabId === activeTabId) ?? null;
-
-  const syncBrowserUrl = useCallback((tab: RoomTab) => {
-    if (typeof window === 'undefined') return;
-    if (tab.roomMode === 'public') {
-      window.history.replaceState(
-        null,
-        '',
-        `?id=${encodeURIComponent(tab.convId)}&public=1&join=${encodeURIComponent(
-          tab.publicJoinToken || ''
-        )}`
-      );
-    } else {
-      const search = `?id=${encodeURIComponent(tab.convId)}`;
-      const hash = tab.roomSecret ? `#secret=${encodeURIComponent(tab.roomSecret)}` : '';
-      window.history.replaceState(null, '', `${search}${hash}`);
-    }
-  }, []);
-
-  const persistTabs = useCallback((next: RoomTab[]) => {
-    try {
-      sessionStorage.setItem(STORAGE_KEY_TABS, JSON.stringify(next));
-    } catch {
-      /* session storage is a convenience only */
-    }
-  }, []);
 
   /** Only one private room may hold the WebRTC mesh at a time [R-03]. */
   const switchTab = useCallback(
@@ -328,16 +412,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const openTab = useCallback(
-    (config: {
-      convId?: string;
-      roomMode?: RoomMode;
-      roomSecret?: string;
-      publicJoinToken?: string;
-      channelTitle?: string;
-      isInitialCreator?: boolean;
-    }): string => {
+    (config: OpenTabConfig): string => {
       const mode = config.roomMode || 'private';
       const convId = config.convId?.trim() || crypto.randomUUID();
+      const isInitialCreator = config.isInitialCreator ?? !config.convId;
 
       const existing = tabsRef.current.find(
         (t) =>
@@ -345,6 +423,16 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           (mode === 'private' || t.publicJoinToken === config.publicJoinToken)
       );
       if (existing) {
+        // A link that carries the secret repairs a room opened without one,
+        // rather than dropping the user back into the missing-secret dialog.
+        if (mode === 'private' && config.roomSecret && !existing.roomSecret) {
+          const repaired = { ...existing, roomSecret: config.roomSecret };
+          const next = tabsRef.current.map((t) => (t.tabId === existing.tabId ? repaired : t));
+          tabsRef.current = next;
+          setTabs(next);
+          persistTabs(next);
+          void sessionsRef.current.get(existing.tabId)?.provideRoomSecret(config.roomSecret);
+        }
         switchTab(existing.tabId);
         return existing.tabId;
       }
@@ -362,8 +450,13 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             : undefined,
         publicJoinToken:
           mode === 'public' ? config.publicJoinToken || generateRoomSecret() : undefined,
-        isInitialCreator: config.isInitialCreator ?? !config.convId,
-        channelTitle: config.channelTitle || getOrInitChannelTitle(convId),
+        isInitialCreator,
+        // Only a creator names a room. A joiner waits for the room's own
+        // metadata instead of generating a title nobody else can see [M-01].
+        channelTitle:
+          config.channelTitle?.trim() ||
+          getStoredChannelTitle(convId) ||
+          (isInitialCreator ? getOrInitChannelTitle(convId) : UNTITLED_CHANNEL_TITLE),
         unreadCount: 0,
       };
 
@@ -508,6 +601,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         restored = [];
       }
 
+      const urlRoom = readRoomFromLocation();
+
       if (restored.length > 0) {
         tabsRef.current = restored;
         setTabs(restored);
@@ -515,21 +610,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveTabId(restored[0].tabId);
         activeTabIdRef.current = restored[0].tabId;
         sessionsRef.current.get(restored[0].tabId)?.setForeground(true);
-      } else {
-        const params = new URLSearchParams(window.location.search);
-        const urlConvId = params.get('id') || '';
-        const isPublic = params.get('public') === '1' || params.get('public') === 'true';
-        const hashMatch = window.location.hash.match(/secret=([A-Za-z0-9_-]+)/);
 
-        openTabRef.current({
-          convId: urlConvId || undefined,
-          roomMode: isPublic ? 'public' : 'private',
-          publicJoinToken: isPublic ? params.get('join') || undefined : undefined,
-          // No secret in the URL of an existing room means we genuinely cannot
-          // compute its routing tag, which the missing-secret dialog explains.
-          roomSecret: isPublic ? undefined : hashMatch?.[1] ?? (urlConvId ? '' : undefined),
-          isInitialCreator: !urlConvId,
-        });
+        // A link pasted into the address bar of a window that already has rooms
+        // open is still a request to open that room: restoring the session must
+        // not swallow it. openTab switches to the room if it is already here.
+        if (urlRoom) openTabRef.current(urlRoom);
+        else syncBrowserUrl(restored[0]);
+      } else {
+        openTabRef.current(urlRoom ?? { roomMode: 'private', isInitialCreator: true });
       }
       rerender();
     })();
@@ -947,16 +1035,28 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const openQuickMessage = useCallback((target: QuickMessageTarget) => setQuickMessageTarget(target), []);
   const closeQuickMessage = useCallback(() => setQuickMessageTarget(null), []);
+  /**
+   * Acknowledged for good: the popup does not come back after a reload.
+   * Reserved for gestures that say the user actually read it.
+   */
   const dismissIncomingQuickMessage = useCallback(() => {
     setIncomingQuickMessage((current) => {
-      if (current) void db.ackQuickMessage(current.id, current.senderParticipantId);
+      if (current) {
+        void presenceService.ackQuickMessage(current.id, current.senderParticipantId);
+      }
       return null;
     });
   }, []);
+  /**
+   * Taken off the screen without acknowledging it. A click that lands anywhere
+   * else may well have been aimed at the page underneath, so the message is
+   * left unread and shown again on the next visit.
+   */
+  const hideIncomingQuickMessage = useCallback(() => setIncomingQuickMessage(null), []);
   const replyToIncomingQuickMessage = useCallback(() => {
     setIncomingQuickMessage((current) => {
       if (current) {
-        void db.ackQuickMessage(current.id, current.senderParticipantId);
+        void presenceService.ackQuickMessage(current.id, current.senderParticipantId);
         setQuickMessageTarget({
           participantId: current.senderParticipantId,
           screenName: current.senderScreenName,
@@ -1180,6 +1280,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     openQuickMessage,
     closeQuickMessage,
     dismissIncomingQuickMessage,
+    hideIncomingQuickMessage,
     replyToIncomingQuickMessage,
     sendQuickMessage,
 
@@ -1200,6 +1301,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isInitialCreator: activeSession?.isInitialCreator ?? false,
     channelTitle: activeSession?.channelTitle ?? activeTab?.channelTitle ?? '',
     updateChannelTitle: async (title) => (await activeSession?.updateChannelTitle(title)) ?? false,
+    canRenameRoom: activeSession?.canRenameRoom ?? false,
     connectionStatus: activeSession?.connectionStatus ?? 'connecting',
     accelerationStatus: activeSession?.accelerationStatus ?? 'unavailable',
     connectedPeersCount: activeSession?.connectedPeersCount ?? 0,

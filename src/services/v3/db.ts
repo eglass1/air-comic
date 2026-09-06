@@ -22,7 +22,7 @@ import type {
 } from './types';
 
 const DB_NAME = 'AirComicDB_v3';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const LEGACY_DB_NAME = 'AirComicDB_v2';
 
 const PREAPPROVAL_TTL_MS = 7 * 24 * 3600 * 1000;
@@ -86,6 +86,11 @@ export interface ConversationRecord {
   activeKeyId: string;
   isCreator: boolean;
   channelTitle: string;
+  /** Timestamp of the room_metadata that set `channelTitle` [M-01]. */
+  titleUpdatedAt?: number;
+  /** The identity a public room's directory listing names, if we have read
+   *  one. The only identity allowed to rename it [PU-02]. */
+  publicRoomCreatorId?: string;
   historyPolicy: HistoryPolicy;
   metadataPolicy: MetadataPolicy;
   genesisPacketId?: string;
@@ -186,6 +191,21 @@ export interface FavoriteRoomRecord {
   savedAt: number;
 }
 
+/**
+ * One signed control packet that the membership chain was built from, kept so
+ * it can be republished onto a route that has never carried it [PR-07].
+ */
+export interface ChainPacketRecord {
+  /** `${convId}::${packetId}` */
+  id: string;
+  convId: string;
+  packetId: string;
+  epoch: number;
+  /** RoomGenesisPacket, RekeyPacket or CapabilityRotationPacket, as received. */
+  packet: unknown;
+  savedAt: number;
+}
+
 export interface QuickMessageAckRecord {
   id: string;
   senderParticipantId?: string;
@@ -211,51 +231,67 @@ export class DatabaseService {
       request.onupgradeneeded = () => {
         const db = request.result;
 
-        db.createObjectStore('profile', { keyPath: 'id' });
+        // Guarded, so a version bump adds stores to an existing profile rather
+        // than failing on the ones already there.
+        const store = (name: string, options: IDBObjectStoreParameters) =>
+          db.objectStoreNames.contains(name)
+            ? request.transaction!.objectStore(name)
+            : db.createObjectStore(name, options);
+        const index = (s: IDBObjectStore, name: string, keyPath: string) => {
+          if (!s.indexNames.contains(name)) s.createIndex(name, keyPath, { unique: false });
+        };
 
-        const friends = db.createObjectStore('friends', { keyPath: 'id' });
-        friends.createIndex('participantId', 'participantId', { unique: false });
+        store('profile', { keyPath: 'id' });
 
-        const messages = db.createObjectStore('messages', { keyPath: 'id' });
-        messages.createIndex('convId', 'convId', { unique: false });
-        messages.createIndex('timestamp', 'timestamp', { unique: false });
+        const friends = store('friends', { keyPath: 'id' });
+        index(friends, 'participantId', 'participantId');
 
-        const keys = db.createObjectStore('keys', { keyPath: 'id' });
-        keys.createIndex('convId', 'convId', { unique: false });
+        const messages = store('messages', { keyPath: 'id' });
+        index(messages, 'convId', 'convId');
+        index(messages, 'timestamp', 'timestamp');
 
-        db.createObjectStore('conversations', { keyPath: 'convId' });
+        const keys = store('keys', { keyPath: 'id' });
+        index(keys, 'convId', 'convId');
+
+        store('conversations', { keyPath: 'convId' });
 
         // Validated membership chain per room, so a reload does not have to
         // rebuild it from relays [L-05][G-03].
-        db.createObjectStore('membershipHeads', { keyPath: 'convId' });
+        store('membershipHeads', { keyPath: 'convId' });
+
+        // The signed packets the chain was built from. A capability rotation
+        // moves the room to a route carrying none of them, so the rotating
+        // member has to be able to republish the whole transcript [PR-07].
+        const transcript = store('chainPackets', { keyPath: 'id' });
+        index(transcript, 'convId', 'convId');
 
         // Time-aware dedup, replacing v2's FIFO ledger [X-06][O-10].
-        const processed = db.createObjectStore('processedPackets', { keyPath: 'id' });
-        processed.createIndex('convId', 'convId', { unique: false });
-        processed.createIndex('firstSeenAt', 'firstSeenAt', { unique: false });
+        const processed = store('processedPackets', { keyPath: 'id' });
+        index(processed, 'convId', 'convId');
+        index(processed, 'firstSeenAt', 'firstSeenAt');
 
         // Durable publish queue: persist before publish [D-01][A-05].
-        const outbox = db.createObjectStore('nostrOutbox', { keyPath: 'packetId' });
-        outbox.createIndex('state', 'state', { unique: false });
-        outbox.createIndex('nextAttemptAt', 'nextAttemptAt', { unique: false });
+        const outbox = store('nostrOutbox', { keyPath: 'packetId' });
+        index(outbox, 'state', 'state');
+        index(outbox, 'nextAttemptAt', 'nextAttemptAt');
 
-        const cursors = db.createObjectStore('relayCursors', { keyPath: 'id' });
-        cursors.createIndex('routingTag', 'routingTag', { unique: false });
+        const cursors = store('relayCursors', { keyPath: 'id' });
+        index(cursors, 'routingTag', 'routingTag');
 
-        db.createObjectStore('presenceCapability', { keyPath: 'id' });
-        db.createObjectStore('settings', { keyPath: 'id' });
+        store('presenceCapability', { keyPath: 'id' });
+        store('settings', { keyPath: 'id' });
 
-        const favorites = db.createObjectStore('favorites', { keyPath: 'id' });
-        favorites.createIndex('savedAt', 'savedAt', { unique: false });
+        const favorites = store('favorites', { keyPath: 'id' });
+        index(favorites, 'savedAt', 'savedAt');
 
-        const invites = db.createObjectStore('invites', { keyPath: 'inviteId' });
-        invites.createIndex('recipientParticipantId', 'recipientParticipantId', { unique: false });
+        const invites = store('invites', { keyPath: 'inviteId' });
+        index(invites, 'recipientParticipantId', 'recipientParticipantId');
 
-        const preapprovals = db.createObjectStore('preapprovals', { keyPath: 'id' });
-        preapprovals.createIndex('convId', 'convId', { unique: false });
+        const preapprovals = store('preapprovals', { keyPath: 'id' });
+        index(preapprovals, 'convId', 'convId');
 
-        const acks = db.createObjectStore('quickMessageAcks', { keyPath: 'id' });
-        acks.createIndex('ackedAt', 'ackedAt', { unique: false });
+        const acks = store('quickMessageAcks', { keyPath: 'id' });
+        index(acks, 'ackedAt', 'ackedAt');
       };
 
       request.onsuccess = () => {
@@ -444,6 +480,18 @@ export class DatabaseService {
 
   async saveChain(chain: StoredChain): Promise<void> {
     await this.tx('membershipHeads', 'readwrite', (s) => s.put(chain));
+  }
+
+  /** Epoch order, so a replay walks the chain forwards. Genesis is epoch 0. */
+  async getChainPackets(convId: string): Promise<ChainPacketRecord[]> {
+    const rows = await this.all<ChainPacketRecord>('chainPackets', 'convId', convId);
+    return rows.sort((a, b) => a.epoch - b.epoch || a.savedAt - b.savedAt);
+  }
+
+  async saveChainPacket(record: Omit<ChainPacketRecord, 'id' | 'savedAt'>): Promise<void> {
+    await this.tx('chainPackets', 'readwrite', (s) =>
+      s.put({ ...record, id: `${record.convId}::${record.packetId}`, savedAt: Date.now() })
+    );
   }
 
   // --- Dedup ---------------------------------------------------------------

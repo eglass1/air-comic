@@ -195,4 +195,57 @@ describe('quick messages are signed -- closes v2 [O-06][N-03]', () => {
     await aliceService.stop();
     await bobService.stop();
   }, 30000);
+
+  it('replays until acknowledged, then stops', async () => {
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const aliceSign = await importSigningPrivateKeyFromJwk(alice.signingPrivateKeyJwk);
+    // One browser profile across three visits.
+    const bobDb = freshDb();
+
+    const aliceService = new PresenceService(freshDb());
+    await aliceService.start(alice);
+
+    const firstVisit: string[] = [];
+    const bobService = new PresenceService(bobDb);
+    bobService.setCallbacks({ onQuickMessage: (m) => firstVisit.push(m.id) });
+    await bobService.start(bob);
+    await settle();
+
+    const message = await buildQuickMessage({
+      senderParticipantId: alice.participantId,
+      senderScreenName: 'Alice', senderAvatarName: 'Armando',
+      senderPublicKey: alice.publicKeyBase64,
+      senderSigningPublicKey: alice.signingPublicKeyBase64,
+      recipientParticipantId: bob.participantId,
+      text: 'knock knock', emotion: 0, intensity: 0.5, signingPrivateKey: aliceSign,
+    });
+    await aliceService.sendQuickMessage(bob.participantId, bob.publicKeyBase64, message);
+    await settle(150);
+    expect(firstVisit).toEqual([message.id]);
+    await bobService.stop();
+
+    // Bob clicked past it without reading it. The sealed record is still on the
+    // relay, so the next visit is expected to show it again.
+    const secondVisit: string[] = [];
+    const reopened = new PresenceService(bobDb);
+    reopened.setCallbacks({ onQuickMessage: (m) => secondVisit.push(m.id) });
+    await reopened.start(bob);
+    await settle(200);
+    expect(secondVisit).toEqual([message.id]);
+
+    // This time he acknowledged it.
+    await reopened.ackQuickMessage(message.id, alice.participantId);
+    await reopened.stop();
+
+    const thirdVisit: string[] = [];
+    const again = new PresenceService(bobDb);
+    again.setCallbacks({ onQuickMessage: (m) => thirdVisit.push(m.id) });
+    await again.start(bob);
+    await settle(200);
+    expect(thirdVisit).toEqual([]);
+
+    await aliceService.stop();
+    await again.stop();
+  }, 30000);
 });

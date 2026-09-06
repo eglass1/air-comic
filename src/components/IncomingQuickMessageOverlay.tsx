@@ -13,12 +13,13 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
   const {
     incomingQuickMessage,
     dismissIncomingQuickMessage,
+    hideIncomingQuickMessage,
     replyToIncomingQuickMessage,
   } = useChat();
 
   const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
 
-  // Handle Escape key to dismiss
+  // Escape takes it off the screen without marking it read.
   useEffect(() => {
     if (!incomingQuickMessage) {
       setImageDataUrl(null);
@@ -27,13 +28,13 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        dismissIncomingQuickMessage();
+        hideIncomingQuickMessage();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [incomingQuickMessage, dismissIncomingQuickMessage]);
+  }, [incomingQuickMessage, hideIncomingQuickMessage]);
 
   // Render character & comic balloon to an offscreen canvas and capture as image
   useEffect(() => {
@@ -188,7 +189,7 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
 
   return (
     <Box
-      onClick={dismissIncomingQuickMessage}
+      onClick={hideIncomingQuickMessage}
       sx={{
         position: 'fixed',
         inset: 0,
@@ -216,18 +217,25 @@ export const IncomingQuickMessageOverlay: React.FC = () => {
           gap: 1,
         }}
       >
-        {/* Rendered 50% scale avatar & comic word balloon */}
+        {/* Rendered 50% scale avatar & comic word balloon. Clicking the
+            character is the one gesture that means "I have read this", so it
+            is also the only one that stops the message coming back. */}
         {imageDataUrl && (
           <Box
             component="img"
             src={imageDataUrl}
             alt="Quick Message"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              dismissIncomingQuickMessage();
+            }}
+            title="Click to Dismiss"
             sx={{
               display: 'block',
               maxWidth: '90vw',
               maxHeight: '65vh',
               objectFit: 'contain',
-              pointerEvents: 'none',
+              cursor: 'pointer',
               filter: 'drop-shadow(0 6px 20px rgba(0,0,0,0.4))',
             }}
           />

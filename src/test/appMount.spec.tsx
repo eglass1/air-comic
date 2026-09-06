@@ -171,4 +171,60 @@ describe('application mount', () => {
     expect(container!.querySelectorAll('*').length).toBeGreaterThan(20);
     expect(realErrors()).toEqual([]);
   }, 30000);
+
+  it('opens the room named by the address even with rooms already restored', async () => {
+    const { ChatProvider, useChat } = await import('../context/ChatContext');
+    const { generateRoomSecret } = await import('../services/v3/keys');
+
+    // A window that already has a room open, as a reload or a second link
+    // pasted into the same tab would find it.
+    const restoredConvId = crypto.randomUUID();
+    sessionStorage.setItem(
+      'aircomic_open_tabs',
+      JSON.stringify([
+        {
+          tabId: crypto.randomUUID(),
+          convId: restoredConvId,
+          roomMode: 'private',
+          roomSecret: generateRoomSecret(),
+          isInitialCreator: true,
+          channelTitle: 'The Grapevine',
+          unreadCount: 0,
+        },
+      ])
+    );
+
+    const linkedConvId = crypto.randomUUID();
+    const linkedSecret = generateRoomSecret();
+    window.history.replaceState(null, '', `?id=${linkedConvId}#secret=${linkedSecret}`);
+
+    let snapshot: ReturnType<typeof useChat> | null = null;
+    const Probe = () => {
+      snapshot = useChat();
+      return null;
+    };
+
+    await act(async () => {
+      render(
+        <ChatProvider>
+          <Probe />
+        </ChatProvider>
+      );
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+
+    const chat = snapshot!;
+    // The restored room is still there, and the link is what we are looking at.
+    expect(chat.tabs.some((t) => t.convId === restoredConvId)).toBe(true);
+    expect(chat.convId).toBe(linkedConvId);
+    expect(chat.roomMode).toBe('private');
+    // The link carried the secret, so the room is reachable rather than stuck
+    // behind the missing-secret dialog.
+    expect(chat.isSecretMissing).toBe(false);
+
+    sessionStorage.removeItem('aircomic_open_tabs');
+    window.history.replaceState(null, '', '/');
+  }, 30000);
 });

@@ -206,6 +206,67 @@ describe('strong removal -- [Q-06][PR-07]', () => {
     bobRoom.destroy();
   }, 20000);
 
+  it('admits a brand-new member on the route the removal moved to', async () => {
+    const convId = crypto.randomUUID();
+    const secret = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const carol = await makeProfile('Carol');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'a', convId, roomMode: 'private', roomSecret: secret, isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    await settle();
+
+    const bobRoom = new RoomSession({
+      tabId: 'b', convId, roomMode: 'private', roomSecret: secret, database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle();
+    await aliceRoom.approveJoinRequest(aliceRoom.pendingJoinRequests[0].requestId);
+    await settle();
+    expect(bobRoom.isApproved).toBe(true);
+
+    await aliceRoom.removeParticipant(bob.participantId);
+    await settle(150);
+    const newRoute = aliceRoom.routingTag;
+
+    // Carol has never seen this room. Her link carries the rotated secret, so
+    // the only route she can compute is one that never carried the epochs
+    // between genesis and the head [PR-07].
+    const carolRoom = new RoomSession({
+      tabId: 'c', convId, roomMode: 'private', roomSecret: aliceRoom.roomSecret, database: freshDb(),
+    });
+    await carolRoom.init(carol);
+    await settle(150);
+
+    expect(carolRoom.routingTag).toBe(newRoute);
+    expect(carolRoom.isApproved).toBe(false);
+
+    const request = aliceRoom.pendingJoinRequests.find(
+      (r) => r.sender.participantId === carol.participantId
+    );
+    expect(request).toBeTruthy();
+    await aliceRoom.approveJoinRequest(request!.requestId);
+    await settle(200);
+
+    // The admission rekey names the rotation as its parent, so Carol can only
+    // apply it if she walked the whole transcript first.
+    expect(aliceRoom.memberCount).toBe(2);
+    expect(carolRoom.isApproved).toBe(true);
+    expect(carolRoom.activeEpoch).toBe(aliceRoom.activeEpoch);
+
+    // And she is a full member, not merely listed as one.
+    await carolRoom.sendMessage('made it in');
+    await settle(150);
+    expect(aliceRoom.messages.some((m) => m.text === 'made it in')).toBe(true);
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+    carolRoom.destroy();
+  }, 30000);
+
   it('a remaining member who was offline recovers the rotation on return', async () => {
     const convId = crypto.randomUUID();
     const secret = generateRoomSecret();

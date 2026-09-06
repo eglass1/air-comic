@@ -39,6 +39,7 @@ export const T_INBOX = 'aircomic-inbox';
 
 /** Stable `d` tag prefixes for the packets that must be findable in one query. */
 export const D_GENESIS_PREFIX = 'genesis:';
+export const D_METADATA_PREFIX = 'meta:';
 export const D_PUBLIC_PRESENCE_PREFIX = 'presence:';
 
 // ============================================================================

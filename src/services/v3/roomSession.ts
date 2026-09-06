@@ -28,6 +28,7 @@ import { historyFilters, roomFilters, dTagFilters } from '../nostr/subscriptions
 import {
   CHAT_RETENTION_SEC,
   D_GENESIS_PREFIX,
+  D_METADATA_PREFIX,
   JOIN_REQUEST_MAX_ATTEMPTS,
   JOIN_REQUEST_RETRY_MS,
   LIVE_PAST_WINDOW_MS,
@@ -90,6 +91,7 @@ import {
 } from './packets';
 import { byteLength } from './validate';
 import {
+  buildPublicRoomDescriptor,
   directoryService,
   occupancyBucket,
   PublicRoomPresenceBeacon,
@@ -106,6 +108,7 @@ import type {
   Participant,
   PacketClass,
   PendingJoinRequest,
+  PublicRoomDescriptorPacket,
   RekeyPacket,
   RoomGenesisPacket,
   RoomMetadataPacket,
@@ -179,6 +182,8 @@ export class RoomSession {
   public roomFingerprint = '';
   public pendingJoinRequests: PendingJoinRequest[] = [];
   public isSecretMissing = false;
+  /** A public room answers to its directory listing's creator alone [PU-02]. */
+  public publicRoomCreatorId: string | null = null;
   public pendingSendCount = 0;
   public failedSendCount = 0;
   public collisions = 0;
@@ -195,6 +200,8 @@ export class RoomSession {
   private keysMap: Map<string, KeyRecord> = new Map();
   private chain: ChainState;
   private genesis: RoomGenesisPacket | null = null;
+  /** Timestamp of the newest room_metadata we have applied [M-01]. */
+  private titleUpdatedAt = 0;
   private dedup: DedupLedger;
 
   private subscription: { close(): void; update(f: unknown[]): void } | null = null;
@@ -214,6 +221,7 @@ export class RoomSession {
   private orphanControl: Array<RekeyPacket | CapabilityRotationPacket> = [];
   private unsubHealth: (() => void) | null = null;
   private unsubOutbox: (() => void) | null = null;
+  private publicDescriptor: PublicRoomDescriptorPacket | null = null;
   private beacon: PublicRoomPresenceBeacon | null = null;
   private occupancyTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -304,6 +312,8 @@ export class RoomSession {
       this.capabilityGeneration = stored.capabilityGeneration;
       this.previousRoutes = stored.previousRoutingTags ?? [];
       this.channelTitle = stored.channelTitle || this.channelTitle;
+      this.titleUpdatedAt = stored.titleUpdatedAt ?? 0;
+      this.publicRoomCreatorId = stored.publicRoomCreatorId ?? null;
       if (stored.isCreator) this.isInitialCreator = true;
     }
 
@@ -349,12 +359,19 @@ export class RoomSession {
       // Public rooms have no join request, epoch, rekey or roster [PU-05].
       await this.persistConversation();
       await this.startOccupancy();
+      // Only then go and ask the directory who owns the room -- the room is
+      // usable while that query is in flight.
+      await this.loadPublicRoomAuthority();
+      if (this.isInitialCreator) await this.publishRoomMetadata();
     }
 
     // Anchor the chain before replaying history: without genesis, every rekey
     // is unvalidatable and would be buffered rather than applied [L-05].
     if (this.roomMode === 'private') await this.fetchGenesis();
     await this.catchUpHistory();
+    // The room's own name, so a member who arrived by link shows what everyone
+    // else shows instead of inventing one locally [M-01].
+    await this.fetchRoomMetadata();
     this.notify();
   }
 
@@ -379,6 +396,69 @@ export class RoomSession {
     };
     void refresh();
     this.occupancyTimer = setInterval(() => void refresh(), PUBLIC_PRESENCE_REFRESH_MS);
+  }
+
+  /**
+   * Establishes who may rename this public room. The directory descriptor is
+   * signed by a key only the creator holds, so the identity it names is the
+   * one authority a room with no roster has [PU-02].
+   */
+  private async loadPublicRoomAuthority(): Promise<void> {
+    if (this.roomMode !== 'public' || !this.profile) return;
+
+    if (this.isInitialCreator) this.publicRoomCreatorId = this.profile.participantId;
+    if (!this.publicRoomId) return;
+
+    const descriptor = await directoryService.fetchRoom(this.publicRoomId);
+    if (!descriptor || descriptor.convId !== this.convId) return;
+
+    this.publicDescriptor = descriptor;
+    this.publicRoomCreatorId = descriptor.creatorId;
+    await this.persistConversation();
+    this.notify();
+  }
+
+  /** True when this identity is allowed to rename the room [PU-02][M-01]. */
+  get canRenameRoom(): boolean {
+    if (this.roomMode === 'private') return this.isApproved;
+    return (
+      this.publicRoomCreatorId !== null &&
+      this.publicRoomCreatorId === this.profile?.participantId
+    );
+  }
+
+  /**
+   * Keeps the directory listing and the room title the same thing. Only the
+   * creator can do this at all -- the descriptor's Nostr key is derived from
+   * their signing key, so nobody else's republish would replace it.
+   */
+  private async republishPublicDescriptor(name: string): Promise<void> {
+    const previous = this.publicDescriptor;
+    if (!previous || !this.profile || !this.signingPrivateKey) return;
+    if (previous.creatorId !== this.profile.participantId) return;
+
+    const descriptor = await buildPublicRoomDescriptor({
+      publicRoomId: previous.publicRoomId,
+      convId: previous.convId,
+      publicJoinToken: previous.publicJoinToken,
+      name,
+      description: previous.description,
+      creatorId: previous.creatorId,
+      creatorScreenName: previous.creatorScreenName,
+      creatorSigningPublicKey: previous.creatorSigningPublicKey,
+      signingPrivateKey: this.signingPrivateKey,
+      relayUrls: previous.relayUrls,
+      language: previous.language,
+      tags: previous.tags,
+      historyPolicy: previous.historyPolicy,
+      createdAt: previous.createdAt,
+    });
+
+    this.publicDescriptor = descriptor;
+    await directoryService.publishDescriptor({
+      descriptor,
+      signingPrivateKeyJwk: this.profile.signingPrivateKeyJwk,
+    });
   }
 
   private addSelfParticipant() {
@@ -502,6 +582,7 @@ export class RoomSession {
 
     this.genesis = genesis;
     adoptGenesis(this.chain, genesis);
+    await this.recordChainPacket(genesis.packetId, 0, genesis);
     await this.publishControl(genesis, genesis.packetId, {
       dTag: D_GENESIS_PREFIX + this.routingTag,
     });
@@ -521,6 +602,9 @@ export class RoomSession {
       return;
     }
 
+    // Without this the room has no name anyone else can discover, and every
+    // joiner falls back to a locally generated one [M-01].
+    await this.publishRoomMetadata();
     await this.persistConversation(true);
   }
 
@@ -538,6 +622,8 @@ export class RoomSession {
       activeKeyId: this.activeKeyId,
       isCreator,
       channelTitle: this.channelTitle,
+      titleUpdatedAt: this.titleUpdatedAt,
+      publicRoomCreatorId: this.publicRoomCreatorId ?? undefined,
       historyPolicy: this.genesis?.historyPolicy ?? 'from_admission',
       metadataPolicy: this.genesis?.metadataPolicy ?? 'members',
       genesisPacketId: this.genesis?.packetId,
@@ -895,6 +981,7 @@ export class RoomSession {
     if (!adoptGenesis(this.chain, packet)) return;
 
     this.genesis = packet;
+    await this.recordChainPacket(packet.packetId, 0, packet);
     await this.persistChain();
     await this.persistConversation();
     await this.drainOrphans();
@@ -939,6 +1026,12 @@ export class RoomSession {
         this.bufferOrphan(packet);
       }
       return;
+    }
+
+    // A reshare re-delivers key material without adding a node, so it is not
+    // part of the transcript a newcomer has to walk.
+    if (packet.action !== 'reshare') {
+      await this.recordChainPacket(packet.packetId, packet.epoch, packet);
     }
 
     const slot = await openRekeySlot(packet, this.profile.participantId, this.privateKey);
@@ -1005,6 +1098,8 @@ export class RoomSession {
       }
       return;
     }
+
+    await this.recordChainPacket(packet.packetId, packet.newEpoch, packet);
 
     const secrets = await openRotationSlot(packet, this.profile.participantId, this.privateKey);
     if (!secrets) {
@@ -1114,16 +1209,72 @@ export class RoomSession {
     if (this.roomMode === 'private') {
       if (policy === 'creator') {
         if (packet.setterId !== this.genesis?.creatorId) return;
-      } else if (!membersAt(this.chain, packet.timestamp).includes(packet.setterId)) {
+      } else if (!this.setterWasMember(packet)) {
         return;
       }
+    } else if (!this.publicRoomCreatorId || packet.setterId !== this.publicRoomCreatorId) {
+      // A public room is world-writable on the wire, so the title has to be
+      // pinned to the identity its listing names. With no listing to read we
+      // leave the name alone rather than take anyone's word for it [PU-02].
+      return;
     }
 
-    if (packet.title?.trim() && packet.title.trim() !== this.channelTitle) {
-      this.channelTitle = packet.title.trim();
-      await this.persistConversation();
-      this.notify();
-    }
+    // History replays newest-first and relays hand back records in no
+    // particular order, so an older record must never undo a newer rename.
+    if (packet.timestamp <= this.titleUpdatedAt) return;
+
+    const title = packet.title?.trim();
+    if (!title) return;
+
+    this.titleUpdatedAt = packet.timestamp;
+    const changed = title !== this.channelTitle;
+    this.channelTitle = title;
+    await this.persistConversation();
+    if (changed) this.notify();
+  }
+
+  /**
+   * A rotation republishes genesis on the new route but not the epochs behind
+   * it, so someone arriving there has a creator and no roster. Epoch 1 is the
+   * creator alone [PR-01], which is enough to accept the creator's own record.
+   */
+  private setterWasMember(packet: RoomMetadataPacket): boolean {
+    if (membersAt(this.chain, packet.timestamp).includes(packet.setterId)) return true;
+    return this.chain.nodes.size === 0 && packet.setterId === this.genesis?.creatorId;
+  }
+
+  /**
+   * Publishes the current title on a stable `d` tag, so one query finds the
+   * room's name whether it was just created, renamed, or is being joined from
+   * a link years later [M-01].
+   */
+  private async publishRoomMetadata(): Promise<boolean> {
+    if (!this.profile || !this.signingPrivateKey) return false;
+    const title = this.channelTitle.trim();
+    if (!title) return false;
+
+    const packet = await buildRoomMetadata({
+      convId: this.convId,
+      publicRoomId: this.publicRoomId ?? undefined,
+      title,
+      setterId: this.profile.participantId,
+      setterSigningPublicKey: this.profile.signingPublicKeyBase64,
+      signingPrivateKey: this.signingPrivateKey,
+    });
+
+    // Claim it locally first: our own echo is then an older-or-equal record.
+    this.titleUpdatedAt = Math.max(this.titleUpdatedAt, packet.timestamp);
+    return this.publishControl(packet, undefined, {
+      dTag: D_METADATA_PREFIX + this.routingTag,
+    });
+  }
+
+  /** Fetches the room title from its stable tag [M-01]. */
+  private async fetchRoomMetadata(): Promise<void> {
+    const events = await relayPool.query(
+      dTagFilters([D_METADATA_PREFIX + this.routingTag], 5)
+    );
+    for (const event of events) await this.handleHistoricalEvent(event);
   }
 
   // --------------------------------------------------------------------------
@@ -1322,6 +1473,8 @@ export class RoomSession {
       const outcome = applyRekey(this.chain, packet);
       if (!outcome.accepted) return false;
 
+      await this.recordChainPacket(packet.packetId, packet.epoch, packet);
+
       this.keysMap.set(keyId, {
         keyId,
         epoch: params.epoch,
@@ -1414,6 +1567,8 @@ export class RoomSession {
       const outcome = applyCapabilityRotation(this.chain, packet);
       if (!outcome.accepted) return false;
 
+      await this.recordChainPacket(packet.packetId, packet.newEpoch, packet);
+
       // Publish on the OLD route, where every remaining member -- including any
       // that are offline -- is already looking [PR-07] step 4.
       await this.publishControl(packet, packet.packetId);
@@ -1456,12 +1611,12 @@ export class RoomSession {
       await this.subscribeRoom();
       this.watchPreviousRoutes();
 
-      // Genesis must exist on the new route so a joiner can anchor the chain.
-      if (this.genesis) {
-        await this.publishControl(this.genesis, this.genesis.packetId, {
-          dTag: D_GENESIS_PREFIX + this.routingTag,
-        });
-      }
+      // Genesis alone is not enough: a newcomer arriving here has to walk the
+      // chain from genesis to the head to validate their own admission, and
+      // every link is on a route they cannot reach [PR-07].
+      await this.republishChainTranscript();
+      // Same for the title: the old `meta:` tag is unreachable from here on.
+      await this.publishRoomMetadata();
 
       this.syncParticipantApproval();
       await this.persistChain();
@@ -1484,6 +1639,49 @@ export class RoomSession {
       }
     }
     if (changed) this.commitParticipants();
+  }
+
+  /**
+   * Keeps the signed packet a chain node was built from. The chain state alone
+   * cannot be republished -- the packets are signed by their original authors
+   * and only they carry the wrapped key slots [PR-07].
+   */
+  private async recordChainPacket(
+    packetId: string,
+    epoch: number,
+    packet: RoomGenesisPacket | RekeyPacket | CapabilityRotationPacket
+  ): Promise<void> {
+    if (this.roomMode !== 'private') return;
+    try {
+      await this.db.saveChainPacket({ convId: this.convId, packetId, epoch, packet });
+    } catch {
+      /* a transcript we cannot store only costs a future joiner a retry */
+    }
+  }
+
+  /**
+   * Re-publishes genesis and every membership transition onto the route we
+   * have just moved to. The packets keep their own signatures, so a newcomer
+   * validates the chain exactly as they would on the original route; only the
+   * envelope around them is re-encrypted, under the new root key.
+   *
+   * The envelope gets a fresh packetId: reusing the original would look like
+   * one packetId with two different bodies to everyone who already holds it.
+   */
+  private async republishChainTranscript(): Promise<void> {
+    if (this.roomMode !== 'private') return;
+
+    if (this.genesis) {
+      await this.publishControl(this.genesis, undefined, {
+        dTag: D_GENESIS_PREFIX + this.routingTag,
+      });
+    }
+
+    for (const record of await this.db.getChainPackets(this.convId)) {
+      const packet = record.packet as { type?: string } | null;
+      if (!packet?.type || packet.type === 'room_genesis') continue;
+      await this.publishControl(packet);
+    }
   }
 
   private async persistChain(): Promise<void> {
@@ -1588,20 +1786,18 @@ export class RoomSession {
   async updateChannelTitle(title: string): Promise<boolean> {
     const clean = title.trim();
     if (!clean || !this.profile || !this.signingPrivateKey) return false;
+    // Refuse rather than rename locally into a name nobody else will accept.
+    if (this.roomMode === 'public' && !this.canRenameRoom) return false;
 
     this.channelTitle = clean;
+    // Publishing queues the event rather than waiting on the relays, so the
+    // rename is on screen immediately either way.
+    const published = await this.publishRoomMetadata();
+    // The directory listing is the room's public name; it must not go stale.
+    if (this.roomMode === 'public') await this.republishPublicDescriptor(clean);
     await this.persistConversation();
     this.notify();
-
-    const packet = await buildRoomMetadata({
-      convId: this.convId,
-      publicRoomId: this.publicRoomId ?? undefined,
-      title: clean,
-      setterId: this.profile.participantId,
-      setterSigningPublicKey: this.profile.signingPublicKeyBase64,
-      signingPrivateKey: this.signingPrivateKey,
-    });
-    return this.publishControl(packet);
+    return published;
   }
 
   // --------------------------------------------------------------------------

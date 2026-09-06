@@ -75,6 +75,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     connectedPeersCount,
     channelTitle,
     updateChannelTitle,
+    canRenameRoom,
     roomMode,
   } = useChat();
 
@@ -96,6 +97,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   useEffect(() => {
     setTitleInput(channelTitle);
   }, [channelTitle]);
+
+  useEffect(() => {
+    if (!canRenameRoom) setIsEditingTitle(false);
+  }, [canRenameRoom]);
 
   const handleSaveTitle = async () => {
     const trimmed = titleInput.trim();
@@ -242,22 +247,30 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 display: 'flex',
                 alignItems: 'center',
                 gap: 0.5,
-                cursor: 'pointer',
+                cursor: canRenameRoom ? 'pointer' : 'default',
                 p: 0.3,
                 borderRadius: 1,
-                '&:hover': { bgcolor: 'action.hover' },
+                ...(canRenameRoom ? { '&:hover': { bgcolor: 'action.hover' } } : {}),
               }}
-              onClick={() => {
-                setTitleInput(channelTitle);
-                setIsEditingTitle(true);
-              }}
+              onClick={
+                canRenameRoom
+                  ? () => {
+                      setTitleInput(channelTitle);
+                      setIsEditingTitle(true);
+                    }
+                  : undefined
+              }
             >
               <Typography variant="body2" sx={{ fontWeight: 800, color: 'text.primary' }}>
                 {channelTitle}
               </Typography>
-              <Tooltip title="Edit Channel Title">
-                <EditIcon sx={{ fontSize: 15, color: 'text.secondary', opacity: 0.7 }} />
-              </Tooltip>
+              {/* A public room is renamed by whoever created it, and nobody
+                  else, so there is no pencil to offer the rest [PU-02]. */}
+              {canRenameRoom && (
+                <Tooltip title="Edit Channel Title">
+                  <EditIcon sx={{ fontSize: 15, color: 'text.secondary', opacity: 0.7 }} />
+                </Tooltip>
+              )}
             </Box>
           )}
         </Box>

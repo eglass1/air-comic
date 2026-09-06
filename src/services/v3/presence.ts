@@ -253,6 +253,11 @@ export class PresenceService {
       inboxNostrScope(profile.participantId)
     );
 
+    // A quick message lives on the relay until it expires, so an inbox replay
+    // is normal. Acknowledgements are what make a dismissal stick across a
+    // reload -- without seeding them the same popup returns every visit.
+    for (const id of await this.db.getQuickMessageAcks()) this.handledQuickMsgIds.add(id);
+
     const stored = await this.db.getPresenceCapability();
     if (stored) {
       this.capability = stored.capability;
@@ -517,6 +522,12 @@ export class PresenceService {
 
   markInviteHandled(inviteId: string) {
     this.handledInviteIds.add(inviteId);
+  }
+
+  /** Suppresses a quick message for good, here and after the next reload. */
+  async ackQuickMessage(id: string, senderParticipantId?: string): Promise<void> {
+    this.handledQuickMsgIds.add(id);
+    await this.db.ackQuickMessage(id, senderParticipantId);
   }
 
   private subscribeInbox() {

@@ -162,22 +162,43 @@ export function getRandomChannelTitle(): string {
 }
 
 /**
- * Get or initialize a random channel title for a specific conversation ID.
- * Persists in localStorage if available.
+ * Shown for a room we have joined but whose real name has not arrived yet.
+ * Never generate one: a name invented locally is a name only we can see.
  */
-export function getOrInitChannelTitle(convId: string): string {
-  const key = `aircomic_channel_title_${convId}`;
-  const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
-  if (saved && saved.trim()) {
-    return saved.trim();
-  }
-  const generated = getRandomChannelTitle();
+export const UNTITLED_CHANNEL_TITLE = 'Untitled Room';
+
+const titleKey = (convId: string) => `aircomic_channel_title_${convId}`;
+
+/** The last title we saw for this room, or null if we have never seen one. */
+export function getStoredChannelTitle(convId: string): string | null {
   try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(key, generated);
-    }
+    const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(titleKey(convId)) : null;
+    return saved?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Caches a title so a reload shows the right name before the relays answer. */
+export function rememberChannelTitle(convId: string, title: string): void {
+  const clean = title.trim();
+  if (!clean) return;
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(titleKey(convId), clean);
   } catch (err) {
     console.warn('Failed to save channel title to localStorage:', err);
   }
+}
+
+/**
+ * Get or initialize a random channel title for a specific conversation ID.
+ * Only ever call this for a room we are creating -- the creator's choice is
+ * what gets published, and a joiner must adopt it rather than roll its own.
+ */
+export function getOrInitChannelTitle(convId: string): string {
+  const saved = getStoredChannelTitle(convId);
+  if (saved) return saved;
+  const generated = getRandomChannelTitle();
+  rememberChannelTitle(convId, generated);
   return generated;
 }

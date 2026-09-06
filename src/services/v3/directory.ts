@@ -18,7 +18,7 @@ import {
   verifyNostrEvent,
   type NostrEvent,
 } from '../nostr/nostrEvent';
-import { topicFilters } from '../nostr/subscriptions';
+import { dTagFilters, topicFilters } from '../nostr/subscriptions';
 import {
   D_PUBLIC_PRESENCE_PREFIX,
   MAX_ENVELOPE_BYTES,
@@ -158,6 +158,46 @@ export class DirectoryService {
     }
 
     return live.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /**
+   * One room's listing, addressed by its stable `d` tag rather than pulled out
+   * of the whole directory. The descriptor is what says who created the room,
+   * which is the only authority a public room has [PU-02].
+   */
+  async fetchRoom(publicRoomId: string): Promise<PublicRoomDescriptorPacket | null> {
+    const events = await relayPool.query(dTagFilters([publicRoomId], 10), { timeoutMs: 6000 });
+
+    let newest: PublicRoomDescriptorPacket | null = null;
+    let tombstone: PublicRoomTombstonePacket | null = null;
+
+    for (const event of events) {
+      const parsed = safeParse(event.content, MAX_ENVELOPE_BYTES) as { type?: string } | null;
+      if (!parsed?.type) continue;
+
+      if (parsed.type === 'public_room_descriptor') {
+        const descriptor = parsed as PublicRoomDescriptorPacket;
+        if (descriptor.publicRoomId !== publicRoomId) continue;
+        if (descriptor.protocol !== PROTOCOL || descriptor.extension !== EXT_PUBLIC_ROOMS) continue;
+        if (!(await verifyPublicRoomDescriptor(descriptor, publicRoomId))) continue;
+        if (!newest || descriptor.updatedAt > newest.updatedAt) newest = descriptor;
+      } else if (parsed.type === 'public_room_tombstone') {
+        const closed = parsed as PublicRoomTombstonePacket;
+        if (closed.publicRoomId !== publicRoomId) continue;
+        if (!(await verifyPublicRoomTombstone(closed))) continue;
+        if (!tombstone || closed.closedAt > tombstone.closedAt) tombstone = closed;
+      }
+    }
+
+    if (!newest) return null;
+    if (
+      tombstone &&
+      tombstone.closedAt >= newest.updatedAt &&
+      tombstone.creatorId === newest.creatorId
+    ) {
+      return null;
+    }
+    return newest;
   }
 
   /**

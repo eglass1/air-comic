@@ -314,6 +314,153 @@ describe('directory -- [Q-08]', () => {
   }, 20000);
 });
 
+describe('public room naming -- [PU-02][M-01]', () => {
+  async function listRoom(profile: UserProfile, name: string) {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const publicRoomId = await derivePublicRoomId(convId, joinToken);
+    const signingPrivateKey = await importSigningPrivateKeyFromJwk(profile.signingPrivateKeyJwk);
+    const descriptor = await buildPublicRoomDescriptor({
+      publicRoomId, convId, publicJoinToken: joinToken, name, description: 'a room',
+      creatorId: profile.participantId, creatorScreenName: profile.screenName,
+      creatorSigningPublicKey: profile.signingPublicKeyBase64, signingPrivateKey,
+    });
+    await directoryService.publishDescriptor({
+      descriptor, signingPrivateKeyJwk: profile.signingPrivateKeyJwk,
+    });
+    return { convId, joinToken, publicRoomId };
+  }
+
+  it('the creator renames the room, and the listing follows', async () => {
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const { convId, joinToken, publicRoomId } = await listRoom(alice, 'Corner Booth');
+    await settle();
+
+    const aliceRoom = new RoomSession({
+      tabId: 'ca', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, channelTitle: 'Corner Booth', database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    const bobRoom = new RoomSession({
+      tabId: 'cb', convId, roomMode: 'public', publicJoinToken: joinToken, database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+
+    expect(aliceRoom.canRenameRoom).toBe(true);
+    expect(bobRoom.publicRoomCreatorId).toBe(alice.participantId);
+
+    expect(await aliceRoom.updateChannelTitle('Diner Talk')).toBe(true);
+    await settle(200);
+
+    expect(bobRoom.channelTitle).toBe('Diner Talk');
+    // The directory is the room's public name; it must not be left behind.
+    const listed = await directoryService.fetchRoom(publicRoomId);
+    expect(listed?.name).toBe('Diner Talk');
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  }, 30000);
+
+  it('anyone else is refused, on their own screen and on everyone elses', async () => {
+    const alice = await makeProfile('Alice');
+    const mallory = await makeProfile('Mallory');
+    const bob = await makeProfile('Bob');
+    const { convId, joinToken, publicRoomId } = await listRoom(alice, 'Corner Booth');
+    await settle();
+
+    const aliceRoom = new RoomSession({
+      tabId: 'ra', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, channelTitle: 'Corner Booth', database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    // Mallory declares herself the creator on her own machine. The listing,
+    // which she cannot replace, says otherwise.
+    const malloryRoom = new RoomSession({
+      tabId: 'rm', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await malloryRoom.init(mallory);
+    const bobRoom = new RoomSession({
+      tabId: 'rb', convId, roomMode: 'public', publicJoinToken: joinToken, database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+
+    expect(malloryRoom.canRenameRoom).toBe(false);
+    expect(await malloryRoom.updateChannelTitle('Hijacked')).toBe(false);
+    await settle(200);
+
+    expect(malloryRoom.channelTitle).not.toBe('Hijacked');
+    expect(aliceRoom.channelTitle).toBe('Corner Booth');
+    expect(bobRoom.channelTitle).toBe('Corner Booth');
+    const listed = await directoryService.fetchRoom(publicRoomId);
+    expect(listed?.name).toBe('Corner Booth');
+
+    aliceRoom.destroy();
+    malloryRoom.destroy();
+    bobRoom.destroy();
+  }, 30000);
+
+  it('remembers who the listing named when the directory goes quiet', async () => {
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const { convId, joinToken } = await listRoom(alice, 'Corner Booth');
+    await settle();
+
+    // Bob reads the listing once, on a normal visit.
+    const bobDb = freshDb();
+    const first = new RoomSession({
+      tabId: 'pa1', convId, roomMode: 'public', publicJoinToken: joinToken, database: bobDb,
+    });
+    await first.init(bob);
+    await settle(150);
+    expect(first.publicRoomCreatorId).toBe(alice.participantId);
+    first.destroy();
+
+    // He comes back with every relay down, so there is no listing to read.
+    relays.forEach((r) => { r.offline = true; });
+    relayPool.configure(URLS);
+    await settle(50);
+
+    const second = new RoomSession({
+      tabId: 'pa2', convId, roomMode: 'public', publicJoinToken: joinToken, database: bobDb,
+    });
+    await second.init(bob);
+    await settle(150);
+
+    expect(second.publicRoomCreatorId).toBe(alice.participantId);
+    second.destroy();
+
+    relays.forEach((r) => { r.offline = false; });
+    relayPool.configure(URLS);
+    await settle(50);
+  }, 30000);
+
+  it('with no listing to read, nobody renames the room', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+
+    // A room reached by link whose descriptor has expired or was never
+    // published: there is no authority to check a rename against.
+    const room = new RoomSession({
+      tabId: 'na', convId, roomMode: 'public', publicJoinToken: joinToken,
+      channelTitle: 'Corner Booth', database: freshDb(),
+    });
+    await room.init(alice);
+    await settle(150);
+
+    expect(room.publicRoomCreatorId).toBeNull();
+    expect(room.canRenameRoom).toBe(false);
+    expect(await room.updateChannelTitle('Anything At All')).toBe(false);
+    expect(room.channelTitle).toBe('Corner Booth');
+
+    room.destroy();
+  }, 20000);
+});
+
 describe('approximate occupancy -- [PU-04][X-12]', () => {
   it('buckets counts rather than reporting a precise figure', () => {
     expect(occupancyBucket(0)).toBe('0');
