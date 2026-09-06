@@ -1,0 +1,1459 @@
+================================================================================
+AIRCOMIC -- NETWORK AND ENCRYPTION PROTOCOL REFERENCE
+================================================================================
+
+Document purpose
+    A complete, as-built description of every network path and every
+    cryptographic operation in AirComic, written so that it can be marked up by
+    a reviewer and handed back as a change specification.
+
+    Every construct is given a stable reference tag (e.g. [K-03], [P-11],
+    [T-02]). Please annotate against those tags -- an instruction of the form
+    "[K-03]: replace HKDF-SHA-256 with Argon2id, 64 MiB / 3 iterations" is
+    directly implementable without further discussion.
+
+    Section 12 lists observations and open questions that a redesign would
+    probably want to rule on. They are stated neutrally; no change is implied
+    unless you ask for one.
+
+Scope
+    Covered:     WebRTC signalling, relay usage, peer transport, room key
+                 management, packet formats, signatures, presence, directory,
+                 invitations, history sync, at-rest storage.
+    Not covered: comic rendering, avatar/backdrop binary parsers, UI state, the
+                 service-worker cache policy (except where it touches network).
+
+Protocol identifiers currently on the wire
+    Base protocol            "airthread/2"
+    Extension (public rooms) "airthread/2-public-rooms"
+    Extension (presence)     "airthread/2-presence"
+    Trystero appId           "airthread-protocol-v2"
+
+    Note the historical name: the wire protocol is still "airthread", the
+    product is "AirComic". Nothing derives from the product name.
+
+Source of truth for this document
+    src/services/crypto.ts          1355 lines -- all primitives, all packet
+                                    builders/verifiers, all KDFs
+    src/services/roomSession.ts     1848 lines -- per-room state machine,
+                                    membership, gossip, rekey, history sync
+    src/services/trystero.ts         314 lines -- WebRTC transport wrapper
+    src/services/presence.ts         588 lines -- Nostr presence + sealed inbox
+    src/services/publicDirectory.ts  308 lines -- Nostr public room directory
+    src/services/relays.ts            28 lines -- relay URL selection
+    src/services/db.ts               678 lines -- IndexedDB persistence
+    src/types/index.ts               556 lines -- every wire type
+    src/context/ChatContext.tsx     1589 lines -- orchestration, URL join, invites
+    node_modules/@trystero-p2p/core/dist/*.mjs  -- third-party transport
+                                    behaviour, summarised in section 3
+
+Version pinning at time of writing
+    trystero 0.25.4 (re-exports @trystero-p2p/core + @trystero-p2p/nostr)
+    @noble/secp256k1 3.2.0  (Schnorr signing for Nostr events)
+    Everything else uses the browser WebCrypto API (crypto.subtle).
+
+
+================================================================================
+1. ARCHITECTURE AT A GLANCE
+================================================================================
+
+There is no AirComic server. Three independent network surfaces exist:
+
+  (A) WebRTC mesh -- the only path that carries chat content between peers in a
+      room. Peer-to-peer DataChannels, full mesh, with application-level
+      re-flooding so a partial mesh still converges.
+
+  (B) Nostr relays as WebRTC signalling rendezvous -- used by Trystero to
+      exchange SDP offers/answers and ICE candidates. Ephemeral.
+
+  (C) Nostr relays as a durable store -- used directly by AirComic (not through
+      Trystero) for three things: presence announcements, the public-room
+      directory, and a sealed per-user inbox for invitations and quick
+      messages. These are NIP-33 parameterised replaceable events, kind 30078.
+
+  Plus: STUN servers for NAT traversal (Google + Cloudflare, Trystero
+  defaults). No TURN server is configured -- see [T-06].
+
+Layering on the WebRTC path, private room, chat message:
+
+    plaintext JSON payload  (PlaintextMessagePayload)
+      -> AES-256-GCM under the current epoch key, AAD-bound   [K-06]
+      -> EncryptedNetworkEnvelope JSON
+      -> Trystero action framing + 16 KiB chunking
+      -> WebRTC DataChannel  (DTLS 1.2/1.3, SCTP)
+      -> UDP/TCP
+
+Layering on the Nostr path, invitation:
+
+    RoomInvitePayload, ECDSA-signed                            [P-12]
+      -> JSON array wrapper {type:'invite_bundle', invites:[...]}
+      -> hybrid seal: fresh AES-256-GCM key, RSA-OAEP to recipient  [K-09]
+      -> SealedEnvelope JSON
+      -> Nostr event content, Schnorr-signed by a derived secp256k1 key [K-05]
+      -> WebSocket (wss://) to up to 5 relays
+
+
+================================================================================
+2. IDENTITY AND KEY MATERIAL
+================================================================================
+
+--------------------------------------------------------------------------------
+[K-01] User identity keypairs
+--------------------------------------------------------------------------------
+Where:  crypto.ts:167 generateUserKeyPair()
+Storage: IndexedDB 'profile' store, keyPath 'id', single record id
+        'current_user'. Generated on first run (db.ts), never rotated by any
+        code path.
+
+Two keypairs are generated per user, both extractable:
+
+  Encryption keypair
+      Algorithm    RSA-OAEP
+      Modulus      2048 bits
+      Exponent     65537 (0x010001)
+      Hash         SHA-256
+      Usages       encrypt, decrypt, wrapKey, unwrapKey
+      Public form  SPKI, standard Base64 (not base64url) -> publicKeyBase64
+      Private form JWK (privateKeyJwk) and PKCS#8 PEM (privateKeyPem)
+
+  Signing keypair
+      Algorithm    ECDSA
+      Curve        P-256 (secp256r1)
+      Hash         SHA-256 (specified at sign/verify time)
+      Usages       sign, verify
+      Public form  SPKI, standard Base64 -> signingPublicKeyBase64
+      Private form JWK and PKCS#8 PEM
+
+Both private keys are stored in IndexedDB in plaintext (JWK and PEM). There is
+no passphrase, no OS keychain, no non-extractable key option in use.
+
+--------------------------------------------------------------------------------
+[K-02] participantId -- the canonical identity
+--------------------------------------------------------------------------------
+Where:  crypto.ts:124 getParticipantId()
+
+    participantId = base64url( SHA-256( SPKI bytes of ECDSA signing pubkey ) )
+
+    Normalisation before hashing (crypto.ts:95 normalizePublicKey): strip PEM
+    armour if present, strip all whitespace. The Base64 is then decoded to raw
+    SPKI DER before hashing.
+
+Result: 43 characters, unpadded base64url.
+
+This binding is enforced on receipt in EVERY signed packet verifier: the
+verifier recomputes SHA-256 over the signing key carried in the packet and
+rejects the packet if it does not equal the claimed participantId. See
+crypto.ts:614, 662, 734, 958, 1004, 1043, 1097, 1141, 1202, 1252, 1288.
+
+Consequence: a participantId is a self-certifying name. There is no registry,
+no uniqueness check, no revocation, and no way to change screen name without
+keeping the same participantId (screen names are free-form and unauthenticated
+beyond being inside a signed packet).
+
+--------------------------------------------------------------------------------
+[K-03] Public key fingerprint (display only)
+--------------------------------------------------------------------------------
+Where:  crypto.ts:131 getPublicKeyFingerprint()
+    SHA-256 over SPKI DER, rendered as uppercase hex, colon-separated, all 32
+    bytes. Shown in the contact card / security dialog for out-of-band
+    comparison. Not used in any protocol decision.
+
+--------------------------------------------------------------------------------
+[K-04] Trystero transport peer id (selfId)
+--------------------------------------------------------------------------------
+Where:  @trystero-p2p/core/dist/utils.mjs:6-7
+    selfId = 20 characters drawn from a 62-character alphabet using
+    Math.random() -- NOT a CSPRNG. One value per page load, shared across all
+    rooms in that tab.
+
+    ~119 bits of alphabet-space but sourced from a non-cryptographic PRNG.
+
+The peerId is bound to the participantId only by being included inside the
+signed hello [P-01]. roomSession.ts treats a hello as "direct" (rather than
+relayed) exactly when hello.peerId === the Trystero meta.peerId the message
+arrived on (roomSession.ts:625-628, 676).
+
+--------------------------------------------------------------------------------
+[K-05] Derived Nostr identity
+--------------------------------------------------------------------------------
+Where:  crypto.ts:1341 deriveNostrSecretKey()
+
+    seed = SHA-256( "airthread-nostr-identity-v1:" + jwk.d + ":" + jwk.x )
+    while seed is not in [1, n-1] for secp256k1 order n:  seed = SHA-256(seed)
+    (max 32 attempts, then throw)
+
+    The resulting 32 bytes are the secp256k1 secret key used to Schnorr-sign
+    every Nostr event this user publishes on the presence/inbox path.
+
+Properties: stable across sessions and devices that share the profile, which is
+what allows NIP-33 replaceable events to supersede rather than accumulate. It
+is also a durable, publicly visible pseudonym that links all of a user's
+presence announcements, outgoing invite bundles, and outgoing quick messages
+together across every relay. It is derived from -- and therefore only as
+private as -- the ECDSA private key material.
+
+Contrast: publicDirectory.ts:25 generates a FRESH ephemeral schnorr.keygen()
+per page load for directory publishes, so public-room descriptors are not
+linked to the author's stable Nostr pubkey.
+
+--------------------------------------------------------------------------------
+[K-06] Symmetric content encryption
+--------------------------------------------------------------------------------
+Where:  crypto.ts:451 encryptSymmetric / :475 decryptSymmetric
+        crypto.ts:496 createEncryptedEnvelope / :530 decryptEnvelope
+
+    Cipher      AES-256-GCM
+    IV          12 random bytes from crypto.getRandomValues(), fresh per call
+    Tag         default 128-bit, appended by WebCrypto
+    AAD         a string, encoded UTF-8:
+
+        "airthread/2:{convId}:{packetId}:{keyId}:{senderId}:{timestamp}"
+
+    Ciphertext and IV are both base64url on the wire.
+
+The AAD binds each ciphertext to its envelope header, so a header field cannot
+be rewritten without breaking the tag. Note what is NOT in the AAD: the
+recipient, the epoch number, and the protocol extension.
+
+--------------------------------------------------------------------------------
+[K-07] Asymmetric key transport
+--------------------------------------------------------------------------------
+Where:  crypto.ts:546 encryptAsymmetric / :558 decryptAsymmetric
+    RSA-OAEP (SHA-256, MGF1-SHA-256, empty label) over a raw 32-byte AES key.
+    Output base64url. Used to wrap epoch keys in rekey packets [P-03] and to
+    wrap the per-message key in a sealed envelope [K-09].
+
+--------------------------------------------------------------------------------
+[K-08] Digital signatures
+--------------------------------------------------------------------------------
+Where:  crypto.ts:288 signData / :301 verifySignature
+
+    ECDSA P-256 with SHA-256, WebCrypto raw (r||s, 64-byte) signature form,
+    base64url encoded.
+
+    The signed string is always:  DOMAIN_TAG + canonicalStringify(packet minus
+    its own signature field).
+
+    Domain tags in use (crypto.ts):
+        AIRTHREAD_HELLO_V2:
+        AIRTHREAD_JOIN_REQUEST_V2:
+        AIRTHREAD_REKEY_V2:
+        AIRTHREAD_STATE_SUMMARY_V2:
+        AIRTHREAD_PUBLIC_ROOM_DESCRIPTOR_V2:
+        AIRTHREAD_PUBLIC_ROOM_TOMBSTONE_V2:
+        AIRTHREAD_PUBLIC_ROOM_METADATA_V2:
+        AIRTHREAD_PUBLIC_MESSAGE_V2:
+        AIRTHREAD_JOIN_DECISION_V2:
+        AIRTHREAD_PRESENCE_V2:
+        AIRTHREAD_ROOM_INVITE_V2:
+        AIRTHREAD_INVITE_RESPONSE_V2:
+
+    Verification failure is caught and returns false (crypto.ts:323-326); it never
+    throws to the caller.
+
+--------------------------------------------------------------------------------
+[K-09] Sealed envelope (hybrid, one recipient)
+--------------------------------------------------------------------------------
+Where:  crypto.ts:1301 sealForParticipant / :1326 openSealedEnvelope
+Type:   SealedEnvelope (types/index.ts)
+
+    1. Generate a fresh AES-256-GCM key.
+    2. AAD = "airthread/2-presence:{recipientParticipantId}:{senderParticipantId}:{timestamp}"
+    3. ciphertext = AES-GCM(key, payloadStr, AAD), random 12-byte IV.
+    4. encryptedKey = RSA-OAEP(recipient public key, raw AES key).
+
+    Wire fields: type 'sealed', protocol, extension, recipientParticipantId,
+    senderParticipantId, encryptedKey, iv, data, timestamp.
+
+The envelope itself carries NO signature. senderParticipantId is an
+unauthenticated claim inside a structure anyone can construct, because the
+recipient's RSA public key is public. Payloads carried inside it are
+individually signed (invites, invite responses) EXCEPT quick messages
+-- see [P-15] and observation [O-06].
+
+--------------------------------------------------------------------------------
+[K-10] Canonical JSON
+--------------------------------------------------------------------------------
+Where:  crypto.ts:106 canonicalStringify()
+
+    - null and non-objects -> JSON.stringify
+    - arrays -> element order preserved, recursive
+    - objects -> keys with value === undefined dropped, remaining keys sorted
+      with the default Array.prototype.sort (UTF-16 code-unit order), each
+      emitted as JSON.stringify(key) + ":" + canonicalStringify(value)
+
+    No number normalisation, no Unicode normalisation of strings, no depth or
+    size limit. Verifiers re-serialise the received object, so any field the
+    sender omitted and the receiver's type declares as optional simply is not
+    present on either side.
+
+    Important: the verifier signs over whatever fields are actually present in
+    the parsed object. A field added by an attacker that the application later
+    ignores would break the signature (good), but a field the application reads
+    and the signer never set cannot exist without breaking the signature (also
+    good). There is no allow-list of permitted keys.
+
+
+================================================================================
+3. TRANSPORT: TRYSTERO / WEBRTC  (third-party behaviour)
+================================================================================
+
+AirComic wraps Trystero in src/services/trystero.ts. The facts below are read
+out of the vendored @trystero-p2p 0.25.4 sources and matter because the room
+password AirComic derives is consumed here.
+
+--------------------------------------------------------------------------------
+[T-01] Room join configuration
+--------------------------------------------------------------------------------
+Where:  trystero.ts:52-79
+
+    joinRoom({
+      appId: 'airthread-protocol-v2',
+      password: <derived signalling password>,      [K-11]/[K-12]
+      relayConfig: { redundancy: 12, urls: SIGNALING_RELAY_URLS }
+    }, convId)
+
+    roomId passed to Trystero is the raw convId (a UUIDv4 for rooms created in
+    app, or whatever string arrived in the ?id= URL parameter).
+
+    Note: redundancy is 12 but SIGNALING_RELAY_URLS contains at most 10 entries
+    -- see [T-05] and observation [O-09].
+
+--------------------------------------------------------------------------------
+[T-02] Relay topic derivation (NOT password-dependent)
+--------------------------------------------------------------------------------
+Where:  core/dist/strategy.mjs:81-83, core/dist/utils.mjs:29,54
+
+    rootTopicPlaintext = "Trystero@airthread-protocol-v2@" + convId
+    rootTopic          = SHA-1(rootTopicPlaintext), each byte rendered
+                         base-36 and concatenated
+    selfTopic          = SHA-1(rootTopicPlaintext + "@" + selfId), same encoding
+
+    Nostr event kind   = (sum of char codes of topic) mod 10000 + 20000
+    Nostr tag          = ["x", <topic>]
+    Subscription       REQ with {kinds:[kind], since: now, "#x":[topic]}
+
+    The topic depends only on appId and convId -- NOT on the password. Anyone
+    who learns a convId can compute the topic and watch, on any relay, how many
+    peers announce for that room and when. convId travels in the URL query
+    string (?id=...), i.e. it is not treated as secret by the app. See
+    observation [O-01].
+
+--------------------------------------------------------------------------------
+[T-03] Signalling encryption (what the password actually protects)
+--------------------------------------------------------------------------------
+Where:  core/dist/crypto.mjs
+
+    key = AES-GCM key imported from SHA-256( password + ":" + appId + ":" + roomId )
+
+    Single SHA-256. No PBKDF2/HKDF/Argon stretching, no salt beyond the appId
+    and roomId. This is acceptable here only because AirComic feeds it a
+    full-entropy 256-bit derived value ([K-11]/[K-12]) rather than a
+    user-chosen password.
+
+    encrypt(): random 16-byte IV (note: 16, not the 12 recommended for GCM),
+    wire form "b1,b2,...,b16$<base64 ciphertext>".
+
+    Only the SDP string of an offer/answer is encrypted (strategy.mjs:88-93).
+    The announce payload -- {peerId: selfId, ...} -- is published to the root
+    topic in cleartext.
+
+--------------------------------------------------------------------------------
+[T-04] Password handshake over the DataChannel
+--------------------------------------------------------------------------------
+Where:  core/dist/handshake.mjs:5-26
+
+    Initiator sends a 36-char random challenge; responder returns
+    SHA-256(challenge + ":" + password + ":" + appId + ":" + roomId) as hex;
+    initiator compares. One-directional: the responder never challenges the
+    initiator. A peer that cannot answer is dropped before any application
+    action fires.
+
+    Consequence: knowledge of the room password is required to reach any
+    AirComic action handler over WebRTC -- including the ones that carry
+    plaintext application data ([P-01] hello, [P-08]/[P-09]/[P-10] state sync,
+    [P-15] quick message).
+
+--------------------------------------------------------------------------------
+[T-05] Relay selection
+--------------------------------------------------------------------------------
+Where:  src/services/relays.ts
+
+    PREFERRED_RELAYS (hard-coded, in order):
+        wss://relay.damus.io
+        wss://nos.lol
+        wss://relay.nostr.band
+        wss://purplerelay.com
+        wss://relay.snort.social
+    FALLBACK_RELAYS  = first 6 of trystero's defaultRelayUrls
+    ALL_RELAYS       = dedup(PREFERRED ++ FALLBACK)
+
+    SIGNALING_RELAY_URLS  = ALL_RELAYS.slice(0, 10)   -- WebRTC signalling
+    DIRECTORY_RELAY_URLS  = ALL_RELAYS.slice(0, 8)    -- directory + presence
+    PresenceService uses  DIRECTORY_RELAY_URLS.slice(0, 5)  (MAX_RELAYS = 5)
+
+    The list is identical for every client by design (the comment at
+    relays.ts:4-11 explains that Trystero's own per-room slicing left clients
+    with no relay in common). Users cannot configure relays from the UI;
+    PublicDirectoryService.getRelayUrls accepts a customRelays argument and
+    PublicRoomDescriptorPacket carries a relayUrls field, but no caller
+    currently supplies either.
+
+--------------------------------------------------------------------------------
+[T-06] ICE configuration
+--------------------------------------------------------------------------------
+Where:  core/dist/peer.mjs:302 (Trystero defaults; AirComic passes no override)
+
+    stun:stun.l.google.com:19302
+    stun:stun1.l.google.com:19302
+    stun:stun2.l.google.com:19302
+    stun:stun.cloudflare.com:3478
+
+    No TURN. Peers behind symmetric NAT or restrictive firewalls will fail to
+    form a direct link. AirComic compensates at the application layer with
+    packet re-flooding ([P-16] gossip) rather than with relayed media.
+
+--------------------------------------------------------------------------------
+[T-07] DataChannel framing
+--------------------------------------------------------------------------------
+Where:  core/dist/action-wire.mjs
+
+    Messages are chunked at (16 KiB - header). Chunks carry an action tag, a
+    nonce, progress flags and optional metadata. Trystero adds no encryption of
+    its own on the DataChannel -- confidentiality there is DTLS plus whatever
+    AirComic applies on top.
+
+--------------------------------------------------------------------------------
+[T-08] Actions registered by AirComic
+--------------------------------------------------------------------------------
+Where:  trystero.ts:68-115
+
+    action name     payload type                   app-layer protection
+    -----------     ----------------------------   ----------------------------
+    'hello'         IdentityHelloPacket            ECDSA-signed, PLAINTEXT
+    'control'       EncryptedNetworkEnvelope       AES-GCM (root/public key)
+    'chat'          EncryptedNetworkEnvelope       AES-GCM (epoch/public key)
+    'state_summary' StateSummaryPacket             ECDSA-signed, PLAINTEXT
+    'state_request' StateRequestPacket             PLAINTEXT, UNSIGNED
+    'state_chunk'   StateChunkPacket               PLAINTEXT wrapper around
+                                                   already-encrypted envelopes
+    'quick_msg'     QuickMessagePayload            PLAINTEXT, UNSIGNED
+
+    "PLAINTEXT" means plaintext relative to the room key -- these still ride
+    inside DTLS and are only reachable by a peer that passed [T-04].
+
+--------------------------------------------------------------------------------
+[T-09] Relay health reporting
+--------------------------------------------------------------------------------
+Where:  trystero.ts:225-291
+
+    A 1-second interval polls getRelaySockets(), attaches open/close/error
+    listeners to any socket not yet monitored, and maps readyState to
+    connected / connecting / disconnected / error. Status changes are
+    de-duplicated by a joined "url:status" key before firing the callback.
+    Drives the toolbar status dot (red = no network, amber = network but no
+    relay, green = connected).
+
+
+================================================================================
+4. ROOM ADDRESSING AND KEY DERIVATION
+================================================================================
+
+Two room modes exist and they have materially different security models.
+
+    PRIVATE room:  addressed by (convId, roomSecret). Membership is gated;
+                   content is encrypted under a per-epoch key that is
+                   RSA-wrapped to each member individually.
+    PUBLIC  room:  addressed by (convId, publicJoinToken). Anyone who can read
+                   the directory can join; content is encrypted under a key
+                   derived from the join token, i.e. it is obfuscation of a
+                   public channel rather than confidentiality.
+
+--------------------------------------------------------------------------------
+[K-11] Private room: room secret and derived keys
+--------------------------------------------------------------------------------
+    convId      crypto.randomUUID() at room creation (ChatContext.tsx:481),
+                or supplied by the joiner via ?id=.
+    roomSecret  crypto.ts:333 generateRandomRoomSecret() --
+                16 random bytes (128 bits) -> base64url, 22 chars.
+
+Root Control Key -- crypto.ts:345 deriveRootKeyV2()
+
+    HKDF-SHA-256
+      IKM   = UTF-8( roomSecret.trim() )
+      salt  = SHA-256( UTF-8( "airthread:" + convId.trim().toLowerCase() ) )
+      info  = UTF-8( "airthread-root-key-v2" )
+      L     = 256 bits
+      out   = AES-GCM key, extractable, [encrypt, decrypt]
+    keyId "root-v2", epoch 0.
+
+Signalling password -- crypto.ts:384 deriveTrysteroPassword()
+
+    HKDF-SHA-256
+      IKM   = UTF-8( roomSecret.trim() )
+      salt  = SHA-256( UTF-8( "airthread-signaling:" + convId.trim().toLowerCase() ) )
+      info  = UTF-8( "airthread-trystero-password-v2" )
+      L     = 256 bits
+      out   = base64url string, handed to Trystero as `password` [T-03]/[T-04]
+
+Root key fingerprint (roomSession.ts:244-250): SHA-256 of the raw root key,
+first 4 bytes, uppercase hex, colon-separated. Displayed in the security
+dialog.
+
+The roomSecret is therefore the single credential for a private room. It
+grants, all at once: the ability to complete the Trystero handshake, the
+ability to decrypt all control traffic, and the ability to decrypt any message
+sent under root-v2.
+
+Invite URL form (roomSession.ts:181-187):
+    {origin}{pathname}?id={convId}#secret={roomSecret}
+The secret is in the URL fragment, so it is not sent to the static host in the
+HTTP request. It is still written into window.history via replaceState
+(ChatContext.tsx:362-374) and is therefore in browser history and in anything
+that captures the address bar.
+
+--------------------------------------------------------------------------------
+[K-12] Public room: join token and derived keys
+--------------------------------------------------------------------------------
+    convId           crypto.randomUUID() at creation (ChatContext.tsx:664)
+    publicJoinToken  generateRandomRoomSecret() -- same 128-bit generator
+
+publicRoomId -- crypto.ts:824 derivePublicRoomId()
+
+    base64url( SHA-256( "airthread-public-room-v2:" + convId.toLowerCase()
+                        + ":" + publicJoinToken ) )
+    Used as the Nostr 'd' tag for the directory entry.
+
+Public signalling password -- crypto.ts:838 derivePublicSignalingPassword()
+
+    HKDF-SHA-256
+      IKM  = publicJoinToken.trim()
+      salt = SHA-256("airthread-public-signaling:" + convId.toLowerCase())
+      info = "airthread-public-trystero-password-v2"
+      L    = 256 -> base64url
+
+Public transport key -- crypto.ts:874 derivePublicTransportKey()
+
+    HKDF-SHA-256
+      IKM  = publicJoinToken.trim()
+      salt = SHA-256("airthread-public-content:" + convId.toLowerCase())
+      info = "airthread-public-transport-key-v2"
+      L    = 256 -> AES-GCM key
+    keyId "public-v2", epoch 0, permanent -- public rooms never rekey
+    (roomSession.ts:1505 returns early from rekeyConversation).
+
+Because the descriptor published to the directory contains publicJoinToken in
+cleartext ([P-05]), the transport key of a listed public room is public. Public
+rooms rely on per-message ECDSA signatures ([P-14]) for authenticity, not on
+the transport key for confidentiality.
+
+Public invite URL: {origin}{pathname}?id={convId}&public=1&join={token}
+
+--------------------------------------------------------------------------------
+[K-13] Epoch keys (private rooms)
+--------------------------------------------------------------------------------
+Where:  roomSession.ts:1504-1588 rekeyConversation()
+
+    keyId = "epoch-{N}-{first 8 chars of a UUID}"
+    key   = crypto.subtle.generateKey(AES-GCM, 256), fresh random
+    epoch = previous activeEpoch + 1
+
+    The key is RSA-OAEP-wrapped once per member and shipped inside a signed
+    RekeyPacket [P-03], which is itself carried in an envelope encrypted under
+    the ROOT key (roomSession.ts:1550-1558) so that every secret-holder can see
+    the packet even if they cannot open their own slot.
+
+    The parent key id is recorded (parentKeyId) forming a chain, but nothing
+    validates the chain -- see observation [O-04].
+
+Epoch keys are persisted (roomSession.ts:335 persistEpochKey) to the IndexedDB
+'keys' store in raw base64url form. Root and public transport keys are NOT
+persisted because they are re-derivable. Retention: newest 50 per conversation
+(db.ts:36 MAX_STORED_CONVERSATION_KEYS).
+
+Key restore on reload -- roomSession.ts:366 restoreStoredKeys(): the highest
+epoch key found is adopted as active, and its recorded `members` list is
+replayed into approvedMembers. If that list contains the local participantId,
+the user is marked approved without re-handshaking. This is the mechanism by
+which membership survives a reload.
+
+
+================================================================================
+5. PACKET CATALOGUE
+================================================================================
+
+Every type below is declared in src/types/index.ts. "Signed over" gives the
+exact string fed to ECDSA.
+
+--------------------------------------------------------------------------------
+[P-00] EncryptedNetworkEnvelope -- the outer wire form for chat and control
+--------------------------------------------------------------------------------
+    { protocol:'airthread/2', type:'encrypted', convId, packetId, keyId,
+      iv, data, senderId, timestamp }
+
+    packetId   caller-supplied or crypto.randomUUID(); doubles as the dedup key
+    keyId      'root-v2' | 'public-v2' | 'epoch-N-xxxxxxxx'
+    iv/data    base64url, see [K-06]
+    senderId   participantId, claimed -- authenticated only indirectly by the
+               AAD binding plus possession of the key
+
+--------------------------------------------------------------------------------
+[P-01] IdentityHelloPacket -- 'hello' action, PLAINTEXT on the wire
+--------------------------------------------------------------------------------
+Builder crypto.ts:575, verifier crypto.ts:614.
+    Fields: type, protocol, convId, peerId, participantId, screenName,
+            avatarName?, publicKey, signingPublicKey, contactInfo?, nonce,
+            timestamp, roomMode?, signature
+    nonce   base64url of 16 random bytes -- the gossip dedup key
+    Signed over "AIRTHREAD_HELLO_V2:" + canonicalStringify(unsigned)
+    Verify also enforces SHA-256(signingPublicKey) === participantId.
+
+    contactInfo (free-text name/email/phone/address from the profile) is
+    included for private rooms and suppressed for public rooms
+    (roomSession.ts:445).
+
+    Re-announced every HELLO_REANNOUNCE_MS = 25 s, swept every
+    PRESENCE_SWEEP_MS = 15 s (roomSession.ts:57-63).
+
+--------------------------------------------------------------------------------
+[P-02] JoinRequestPacket -- inside a control envelope
+--------------------------------------------------------------------------------
+Builder crypto.ts:627, verifier crypto.ts:662.
+    { type:'join_request', protocol, requestId (UUID), convId,
+      sender:{participantId, screenName, avatarName?, publicKey,
+              signingPublicKey, contactInfo?}, timestamp, signature }
+    Signed over "AIRTHREAD_JOIN_REQUEST_V2:" + canonical(unsigned).
+    The envelope's packetId is set to requestId (roomSession.ts:1346) so
+    retransmissions of the same request dedup room-wide.
+
+--------------------------------------------------------------------------------
+[P-03] RekeyPacket -- inside a control envelope encrypted under root-v2
+--------------------------------------------------------------------------------
+Builder crypto.ts:675, verifier crypto.ts:734, opener crypto.ts:746.
+    { type:'key', protocol, convId, packetId, keyId, epoch, parentKeyId,
+      signerId, signerPublicKey, signerSigningPublicKey, signerScreenName,
+      timestamp, action?, targetParticipantId?, targetScreenName?,
+      members[], keys{participantId -> base64url RSA-OAEP(raw AES key)},
+      signature }
+    members is deduplicated and sorted before signing.
+    action is one of 'claim' | 'add' | 'remove' | 'rekey' (advisory only --
+    no handler branches on it).
+    Signed over "AIRTHREAD_REKEY_V2:" + canonical(unsigned), and the signer's
+    participantId is bound to its signing key.
+
+    Handling: roomSession.ts:1132. Notably --
+      * The packet is relayed onward whether or not the local user has a slot.
+      * If the local user has NO slot and epoch > activeEpoch and they were
+        approved, they self-demote to unapproved and restart the join loop
+        (roomSession.ts:1146-1158). This is the removal mechanism.
+      * Adoption never steps backwards: activeKeyId/activeEpoch update only
+        when rekey.epoch >= activeEpoch (roomSession.ts:1179).
+      * Every id in members is added to approvedMembers locally.
+
+--------------------------------------------------------------------------------
+[P-04] JoinDecisionPacket -- inside a control envelope
+--------------------------------------------------------------------------------
+Builder crypto.ts:1113, verifier crypto.ts:1141.
+    { type:'join_decision', protocol, convId, requestId, targetParticipantId,
+      decision:'approved'|'declined', deciderId, deciderScreenName,
+      deciderSigningPublicKey, timestamp, signature }
+    Handler roomSession.ts:1094: ignores 'declined' entirely, requires the
+    decider to be in approvedMembers for private rooms, and adds the target to
+    approvedMembers. Purpose is to clear the prompt on every member's screen
+    once any one member has admitted the requester.
+
+--------------------------------------------------------------------------------
+[P-05] PublicRoomDescriptorPacket -- Nostr directory, kind 30078
+--------------------------------------------------------------------------------
+Builder crypto.ts:907, verifier crypto.ts:958.
+    { type, protocol, extension:'airthread/2-public-rooms', descriptorVersion:1,
+      publicRoomId, convId, publicJoinToken, name (<=80), description (<=500),
+      creatorId, creatorScreenName, creatorSigningPublicKey,
+      createdAt, updatedAt, expiresAt, relayUrls[], language, tags[] (<=10,
+      each <=32), historyPolicy:'peer_sync'|'none', contentPolicy:'public',
+      signature }
+    Default lifetime 30 minutes (options.lifetimeMinutes, crypto.ts:926).
+    Verification additionally recomputes publicRoomId from (convId, token) and
+    requires contentPolicy === 'public'.
+    Nostr tags: ['d', publicRoomId], ['t','airthread-public-room'],
+                ['p', ephemeral pubkey], ['expiration', expiresAtSec]
+
+--------------------------------------------------------------------------------
+[P-06] PublicRoomTombstonePacket
+--------------------------------------------------------------------------------
+Builder crypto.ts:978, verifier crypto.ts:1004. Same 'd' tag as the descriptor,
+so it replaces it on the relay when published by the same Nostr pubkey. A
+tombstone wins over a descriptor when closedAt >= descriptor.updatedAt
+(publicDirectory.ts:205-208). Because the directory publisher key is ephemeral
+per page load ([K-05] note), a creator on a new page load publishes under a
+different Nostr pubkey and therefore does NOT replace their earlier event --
+see observation [O-08].
+
+--------------------------------------------------------------------------------
+[P-07] PublicRoomMetadataPacket
+--------------------------------------------------------------------------------
+Builder crypto.ts:1015, verifier crypto.ts:1043. Defined and verifiable but no
+caller currently creates or consumes it -- dead protocol surface today.
+
+--------------------------------------------------------------------------------
+[P-08] StateSummaryPacket -- 'state_summary' action, PLAINTEXT, signed
+--------------------------------------------------------------------------------
+Builder crypto.ts:773, verifier crypto.ts:806.
+    { type, protocol, convId, participantId, activeEpoch, activeKeyId,
+      membershipHeadPacketId (always ''), controlPacketIds (always []),
+      newestMessageTimestamp, messageCount, recentMessageIds[], timestamp,
+      signature }
+    recentMessageIds: last 200 message ids (MAX_SYNC_MESSAGE_IDS).
+    Verification needs the sender's signing key from the roster; if the hello
+    has not arrived the summary is parked in deferredSummaries and replayed
+    once it does (roomSession.ts:1256-1261, 655-659).
+
+    Note this leaks, to anyone holding the room password, the local activeEpoch,
+    activeKeyId, message count and the ids of the last 200 messages -- before
+    that peer has been admitted to the room.
+
+--------------------------------------------------------------------------------
+[P-09] StateRequestPacket -- 'state_request' action, PLAINTEXT, UNSIGNED
+--------------------------------------------------------------------------------
+    { type, protocol, convId, requesterId, wantedControlPacketIds[],
+      wantedMessageIds[], sinceTimestamp?, timestamp }
+    Handler roomSession.ts:1280 gates on
+    approvedMembers.has(packet.requesterId) for private rooms. requesterId is
+    an unsigned claim -- see observation [O-07]. The reply is only ever
+    already-encrypted envelopes, so a spoofed request yields ciphertext the
+    requester still cannot open unless they hold the epoch key.
+
+--------------------------------------------------------------------------------
+[P-10] StateChunkPacket -- 'state_chunk' action, PLAINTEXT wrapper
+--------------------------------------------------------------------------------
+    { type, protocol, convId, responderId, controlPackets[] (always empty),
+      messageEnvelopes[], timestamp }
+    Limits: MAX_CHUNK_ENVELOPES = 40 per chunk, MAX_CHUNKS_PER_REQUEST = 5, so
+    at most 200 envelopes answer one request. Each envelope is fed back through
+    the normal decrypt path with isBackfill = true (no notification, no
+    re-flood).
+
+--------------------------------------------------------------------------------
+[P-11] RosterGossipPacket -- inside a control envelope
+--------------------------------------------------------------------------------
+    { type:'roster', protocol, convId, hellos: IdentityHelloPacket[], timestamp }
+    Carries verbatim signed hellos so peers with no direct WebRTC link still
+    learn about each other. MAX_ROSTER_HELLOS = 64 per packet. Each hello is
+    re-verified on ingest; only hellos whose nonce is unseen count as 'new' and
+    are re-flooded, which terminates the flood.
+
+--------------------------------------------------------------------------------
+[P-12] RoomInvitePayload -- inside a SealedEnvelope on Nostr
+--------------------------------------------------------------------------------
+Builder crypto.ts:1211, verifier crypto.ts:1252.
+    { type:'room_invite', protocol, extension:'airthread/2-presence', inviteId,
+      convId, roomMode, roomSecret?, publicJoinToken?, channelTitle,
+      recipientParticipantId,
+      inviter:{participantId, screenName, avatarName?, publicKey,
+               signingPublicKey, contactInfo?}, timestamp, signature }
+
+    THE ROOM SECRET TRAVELS INSIDE THIS PACKET. Its confidentiality rests
+    entirely on the RSA-OAEP seal [K-09] to the recipient's public key.
+
+    Acceptance checks (presence.ts:487-495): recipient matches self, inviter
+    participantId equals the sealed envelope's claimed senderParticipantId,
+    inviteId not already handled, signature valid.
+
+    Invites are published as a BUNDLE -- one replaceable event per
+    (sender, recipient) holding the sender's whole outstanding invite set, so
+    republishing supersedes rather than appends (presence.ts:218-244).
+    Cleared by publishing an empty bundle.
+
+--------------------------------------------------------------------------------
+[P-13] RoomInviteResponsePayload -- inside a SealedEnvelope on Nostr
+--------------------------------------------------------------------------------
+Builder crypto.ts:1261, verifier crypto.ts:1288. Published to
+inboxTag(inviter) + "~r".
+
+--------------------------------------------------------------------------------
+[P-14] PlaintextMessagePayload -- the innermost chat payload
+--------------------------------------------------------------------------------
+    { type:'message', protocol, extension?, roomMode?, publicRoomId?, msgId,
+      convId, senderId, sender:{screenName, avatarName?, signingPublicKey,
+      contactInfo?}, timestamp, text, keyId, emotion?, emotionIntensity?,
+      balloonMode?, signature? }
+
+    PUBLIC rooms: signature is REQUIRED and verified (crypto.ts:1054/1097,
+    "AIRTHREAD_PUBLIC_MESSAGE_V2:"), with the senderId-to-signing-key binding
+    enforced. Unsigned or badly-signed public messages are dropped
+    (roomSession.ts:919-923).
+
+    PRIVATE rooms: NO signature is produced (roomSession.ts:1659-1673) and none
+    is checked (roomSession.ts:943-969). Authorship rests on possession of the
+    epoch key plus the AAD binding of senderId. Any member can therefore forge
+    a message attributed to any other member. See observation [O-02].
+
+--------------------------------------------------------------------------------
+[P-15] QuickMessagePayload -- two delivery paths, different protection
+--------------------------------------------------------------------------------
+    { type:'quick_message', id, senderParticipantId, senderScreenName,
+      senderAvatarName, senderPublicKey, senderSigningPublicKey,
+      recipientParticipantId, text, emotion, intensity, timestamp }
+    No signature field exists on the type.
+
+    Path 1 -- WebRTC 'quick_msg' action (ChatContext.tsx:304-312,
+    roomSession.ts:1727): sent in the clear over the DataChannel to a peer in a
+    shared room. Receiver checks only that recipientParticipantId matches self
+    (roomSession.ts:1720-1725).
+
+    Path 2 -- Nostr sealed inbox (presence.ts:278-303): sealed to the
+    recipient's RSA key, published to inboxTag(recipient) + "~qm" with a
+    1-hour expiration tag. Receiver checks recipient match and a local
+    already-seen set (presence.ts:509-516). No signature check and no
+    cross-check of senderParticipantId against the envelope.
+
+    Both paths are dispatched for the same message when both are available.
+    Dedup relies on the payload id plus the IndexedDB 'quickMessageAcks' store
+    (7-day TTL, db.ts:23).
+
+--------------------------------------------------------------------------------
+[P-16] PresencePacket -- Nostr, kind 30078
+--------------------------------------------------------------------------------
+Builder crypto.ts:1174, verifier crypto.ts:1202.
+    { type:'presence', protocol, extension:'airthread/2-presence',
+      participantId, screenName, avatarName?, publicKey, signingPublicKey,
+      status:'online'|'away'|'offline', timestamp, signature }
+    Tags: ['d', presenceTag], ['t','airthread-presence'],
+          ['expiration', now + 900 s]
+
+--------------------------------------------------------------------------------
+[P-17] ChannelTitlePacket -- inside a control envelope, UNSIGNED
+--------------------------------------------------------------------------------
+    { type:'channel_title', protocol, convId, title, setterId,
+      setterScreenName, timestamp }
+    No signature field, no verification (roomSession.ts:1036). Any holder of
+    the room key can rename the room; the value is written straight to
+    localStorage. Idempotence stops the relay loop (a title equal to the
+    current one is not forwarded).
+
+
+================================================================================
+6. ROOM LIFECYCLE AND MEMBERSHIP STATE MACHINE (PRIVATE ROOMS)
+================================================================================
+
+--------------------------------------------------------------------------------
+[F-01] Creation
+--------------------------------------------------------------------------------
+    convId = randomUUID, roomSecret = 128-bit random ([K-11]).
+    Creator sets isApproved = true, adds itself to approvedMembers, seeds the
+    keysMap with root-v2 (members = [self]), and persists
+    {convId, roomSecret, epoch, keyId, isCreator:true} to the 'conversations'
+    store so a reload does not demote the owner to a guest
+    (roomSession.ts:258-274).
+
+    activeKeyId starts at 'root-v2'. If the creator sends messages before
+    anyone is admitted, those messages are encrypted under the ROOT key and are
+    therefore readable by anyone who later obtains the room secret, admitted or
+    not (roomSession.ts:1654). See observation [O-03].
+
+--------------------------------------------------------------------------------
+[F-02] Joining with the secret but no approval
+--------------------------------------------------------------------------------
+    1. Derive root key + signalling password from (secret, convId).
+    2. Join the Trystero room. The password handshake [T-04] succeeds because
+       the secret is known -- so the joiner is on the mesh immediately, before
+       any membership decision.
+    3. Exchange signed hellos [P-01]; receive roster gossip [P-11]; receive
+       state summaries [P-08] from every member.
+    4. Emit a signed JoinRequestPacket [P-02] inside a root-key control
+       envelope, broadcast and also targeted at each newly seen peer.
+    5. Retry loop: JOIN_REQUEST_RETRY_MS = 8 s, JOIN_REQUEST_MAX_ATTEMPTS = 24
+       (~3.2 min of broadcast retries). Only broadcasts consume the budget;
+       a targeted request to a peer that just appeared does not
+       (roomSession.ts:1329). A new peer arrival resets the budget to 0
+       (roomSession.ts:551-555). The UI can reset it via retryJoinRequest().
+
+    During this window the unapproved joiner can already decrypt every control
+    packet (root key) and any root-key message traffic, and can read every
+    state summary. It cannot decrypt epoch-key traffic.
+
+--------------------------------------------------------------------------------
+[F-03] Approval
+--------------------------------------------------------------------------------
+Where:  roomSession.ts:1425 approveJoinRequest()
+
+    Every existing member sees the request and is prompted. Whoever accepts
+    first:
+      - adds the requester to approvedMembers and the participants map, taking
+        the requester's public key from the SIGNED request rather than from the
+        roster (roomSession.ts:1445-1458);
+      - calls rekeyConversation() -> new epoch key wrapped to every member
+        [P-03];
+      - broadcasts a JoinDecisionPacket [P-04] so the prompt clears everywhere.
+
+    Auto-approval: if the requester was invited by this user
+    (autoApproveIds, seeded from the invite flow and from the IndexedDB
+    'preapprovals' store), the request is granted with no prompt
+    (roomSession.ts:1075-1081). Pre-approvals have a 7-day TTL
+    (db.ts:30 PREAPPROVAL_TTL_MS).
+
+    Decline is LOCAL ONLY (roomSession.ts:1462): it removes the prompt for that
+    one user and records the requester in declinedRequesters, but does not tell
+    anyone else, so another member may still admit them. There is no negative
+    consensus.
+
+    Concurrency: two members approving simultaneously produce two competing
+    epoch N+1 keys. Resolution is last-writer-wins by arrival order, bounded by
+    the "never step backwards" rule (roomSession.ts:1179). Members can transiently
+    diverge; the epoch-key store plus the reshare path [F-05] repairs it.
+
+--------------------------------------------------------------------------------
+[F-04] Removal
+--------------------------------------------------------------------------------
+Where:  roomSession.ts:1493 removeParticipant()
+
+    The remover deletes the target locally and rekeys, omitting the target from
+    members and keys. The target learns it was removed only by observing a
+    higher-epoch rekey with no slot for itself [P-03], at which point it
+    self-demotes and starts asking to rejoin.
+
+    Forward secrecy: the removed member cannot read epoch N+1 traffic. It still
+    holds the roomSecret, so it can still complete the Trystero handshake,
+    remain on the mesh, read all control traffic, read state summaries, and
+    send join requests -- indefinitely. There is no secret rotation on removal.
+    See observation [O-05].
+
+--------------------------------------------------------------------------------
+[F-05] Key repair for a stranded member
+--------------------------------------------------------------------------------
+Where:  roomSession.ts:1357 reshareActiveKeyTo()
+
+    If a member that is already in approvedMembers keeps sending join requests,
+    the rekey that admitted them was lost. Rather than starting a new epoch,
+    any member re-wraps the CURRENT epoch key to them and broadcasts it as a
+    RekeyPacket with the same keyId/epoch and action 'add'. Idempotent, so
+    several members can answer without racing.
+
+    The target's public key is taken from the signed join request, not the
+    roster. Rate-limited per target by KEY_RESHARE_MIN_INTERVAL_MS = 10 s.
+
+--------------------------------------------------------------------------------
+[F-06] Presence and eviction inside a room
+--------------------------------------------------------------------------------
+    HELLO_REANNOUNCE_MS       25 s   re-broadcast own hello
+    PRESENCE_SWEEP_MS         15 s   sweep timer cadence
+    PARTICIPANT_STALE_MS      90 s   no proof of life -> shown offline
+    PARTICIPANT_EVICT_MS     600 s   non-member dropped from roster entirely
+    (approved members are never evicted, only marked offline)
+
+--------------------------------------------------------------------------------
+[F-07] Bounds and caches
+--------------------------------------------------------------------------------
+    MAX_TRACKED_PACKET_IDS   4000   dedup ledger (FIFO eviction)
+    MAX_SEEN_HELLO_NONCES    2000   gossip dedup (FIFO eviction)
+    MAX_CACHED_ENVELOPES      500   history re-serve cache (FIFO eviction)
+    MAX_SYNC_MESSAGE_IDS      200   ids advertised / requested per summary
+    MAX_CHUNK_ENVELOPES        40   envelopes per state chunk
+    MAX_CHUNKS_PER_REQUEST      5   chunks per request
+    MAX_ROSTER_HELLOS          64   hellos per roster packet
+
+    All eviction is FIFO by insertion order with no time component, so a
+    sufficiently chatty room can evict a packet id and then re-accept a replay
+    of that packet. See observation [O-10].
+
+
+================================================================================
+7. GOSSIP AND FLOOD CONTROL
+================================================================================
+
+[G-01] Dedup ledger -- roomSession.ts:734 markProcessed(). A packetId is
+    accepted once. Chat and control envelopes both check it before any work.
+    The sender claims its own packetId at send time so a relayed copy coming
+    back is dropped.
+
+[G-02] Chat re-flood -- roomSession.ts:811 forwardEnvelope(). After a chat
+    envelope decrypts successfully it is re-sent verbatim to every other
+    connected peer. Backfilled messages are not re-flooded.
+
+[G-03] Control re-flood -- roomSession.ts:1022. A control packet is forwarded
+    ONLY if its handler returned shouldForward = true, i.e. only after it
+    verified. Bad input is never amplified. Roster packets are the exception:
+    they are regenerated locally from newly-learned hellos rather than relayed
+    verbatim.
+
+[G-04] Hello flood -- bounded by the 16-byte nonce in every hello. A hello
+    whose nonce is in seenHelloNonces is 'stale' and stops there.
+
+[G-05] Reachability model -- because every accepted packet is re-flooded, a
+    room converges as long as the peer graph is connected, even when
+    individual pairs cannot form a direct WebRTC link (the normal case behind
+    symmetric NAT with no TURN, [T-06]).
+
+Cost note: with N peers all directly connected, one message produces N-1 direct
+sends plus N-1 re-floods per receiving peer -- O(N^2) DataChannel messages,
+de-duplicated at the receiver. There is no adaptive suppression.
+
+
+================================================================================
+8. HISTORY SYNCHRONISATION
+================================================================================
+
+[H-01] On peer join and on each direct hello, the local peer sends a signed
+    StateSummaryPacket [P-08] listing the ids of its most recent 200 messages.
+    Suppressed if the local user is not approved (roomSession.ts:1226).
+
+[H-02] The receiver diffs against its own processed-packet ledger and asks for
+    the missing ids with a StateRequestPacket [P-09].
+
+[H-03] The responder answers from envelopeCache (500 newest) or from the
+    message log, in StateChunkPackets [P-10] of 40 envelopes, at most 5 chunks.
+
+[H-04] Received envelopes go through the normal decrypt path with
+    isBackfill = true: inserted in timestamp order, persisted, but no new
+    message notification and no re-flood.
+
+[H-05] Because envelopes are re-served verbatim, a backfilled message encrypted
+    under an older epoch still opens for anyone who holds that epoch key -- which
+    is why up to 50 epoch keys per conversation are retained on disk.
+
+[H-06] A newly admitted member therefore receives history from BEFORE it joined,
+    to the extent that history is still cached by the peers it reaches. There
+    is no policy switch for this on private rooms; PublicRoomDescriptorPacket
+    has a historyPolicy field ('peer_sync' | 'none') but no code reads it.
+
+
+================================================================================
+9. PRESENCE, DIRECTORY AND INVITATIONS (NOSTR PATH)
+================================================================================
+
+All three use Nostr kind 30078 (NIP-33 parameterised replaceable) so a relay
+keeps only the newest event per (pubkey, kind, d-tag).
+
+--------------------------------------------------------------------------------
+[N-01] Routing tags
+--------------------------------------------------------------------------------
+Where: crypto.ts:1161, 1168
+    presenceTag = base64url(SHA-256("airthread-presence-v1:" + participantId))
+    inboxTag    = base64url(SHA-256("airthread-inbox-v1:"    + participantId))
+    responseTag = inboxTag + "~r"
+    quickMsgTag = inboxTag + "~qm"
+
+    These are hashes of an identifier that is itself public (participantId is
+    in every hello and every public message), so they are derivable by anyone
+    who has ever seen the user. They are obfuscation of the index, not a
+    capability. See observation [O-11].
+
+--------------------------------------------------------------------------------
+[N-02] Presence publishing
+--------------------------------------------------------------------------------
+Where: presence.ts
+    Event kind 30078, tags [['d',presenceTag], ['t','airthread-presence'],
+    ['expiration', now+900]], content = JSON of the signed PresencePacket.
+    Signed at the Nostr layer by the derived secp256k1 key [K-05] and at the
+    application layer by ECDSA [P-16].
+
+    PRESENCE_REPUBLISH_MS   120 s   re-announce cadence
+    PRESENCE_FRESH_MS       330 s   older than this counts as offline
+    PRESENCE_SWEEP_MS        30 s   ageing sweep
+    PRESENCE_TTL_SEC        900 s   relay expiration tag
+    RECONNECT_BASE_MS      4000, doubling to RECONNECT_MAX_MS 60000
+    MAX_RELAYS                 5
+
+    A 'pagehide' handler publishes status 'offline' on a best-effort basis; the
+    freshness window is what actually retires a peer.
+
+    Subscriptions: one REQ 'ac-presence' filtered by kinds + '#d' over every
+    watched friend's presence tag; one REQ 'ac-inbox' over the local
+    inbox/response/quickmsg tags. Both are re-issued on every reconnect and
+    whenever the friends list changes.
+
+    Acceptance (presence.ts:436-465): parse, verify ECDSA signature, confirm
+    the 'd' tag maps to the claimed participantId in the local watch list,
+    reject if older than the record already held.
+
+--------------------------------------------------------------------------------
+[N-03] Public room directory
+--------------------------------------------------------------------------------
+Where: publicDirectory.ts
+    Publish: one WebSocket per relay in DIRECTORY_RELAY_URLS (8), 4-second
+    timeout, ['EVENT', event]. successCount counts sockets that opened, not
+    relays that acknowledged with OK -- see observation [O-12].
+
+    Fetch: REQ with {kinds:[30078], '#t':['airthread-public-room'], limit:150},
+    4-second timeout per relay, closed on EOSE. Every descriptor is
+    signature-verified, publicRoomId is recomputed, expiry is checked with a
+    60-second clock-skew allowance, entries are merged by publicRoomId keeping
+    the newest updatedAt, and tombstones suppress descriptors when
+    closedAt >= updatedAt. Results sorted newest-first.
+
+    The Nostr signing key here is EPHEMERAL per page load (publicDirectory.ts:25),
+    which is deliberate for unlinkability but breaks replaceability across
+    sessions [O-08].
+
+--------------------------------------------------------------------------------
+[N-04] Invitation flow, end to end
+--------------------------------------------------------------------------------
+    1. Inviter picks a friend. A PendingInviteRecord goes into the IndexedDB
+       'invites' store with status 'queued'; a RoomPreapprovalRecord goes into
+       'preapprovals'; the live session is armed with setAutoApprove.
+    2. All queued invites for that recipient are built into signed
+       RoomInvitePayloads [P-12], wrapped as {type:'invite_bundle', invites},
+       sealed [K-09] to the recipient's RSA key, and published to
+       d = inboxTag(recipient) with a 7-day expiration.
+    3. If the recipient is offline the bundle simply sits on the relay; the
+       presence callback re-dispatches when they come online.
+    4. Recipient's 'ac-inbox' subscription delivers it. They open the seal,
+       validate each invite, and are prompted.
+    5. Accepting opens the room (running the normal [F-02] join handshake, which
+       the inviter auto-approves), adds the inviter to the friends store, and
+       publishes a signed RoomInviteResponsePayload [P-13] to
+       inboxTag(inviter) + "~r".
+    6. The inviter deletes the invite record, re-stamps the pre-approval so its
+       7-day window runs from acceptance, arms every session on that room, and
+       republishes or clears the bundle.
+
+    Replay handling: handled inviteIds are kept in localStorage under
+    `aircomic_handled_invites_{participantId}`, capped at the most recent 200
+    (presence.ts:538-561). Relays keep replaceable events after delivery, so
+    without this list an invite would re-prompt on every reconnect.
+
+
+================================================================================
+10. DATA AT REST
+================================================================================
+
+IndexedDB database "AirComicDB_v2", version 6 (db.ts:15-16).
+
+    store               keyPath        contents
+    -----------------   -----------   ------------------------------------------
+    profile             id            UserProfile incl. BOTH private keys as
+                                      plaintext JWK and PEM
+    friends             id            participantId, screen name, both public
+                                      keys, contactInfo, notes
+    messages            id            ChatMessage -- PLAINTEXT text, plus the
+                                      original encrypted envelope for re-serving
+    keys                id            StoredConversationKey -- raw epoch keys as
+                                      base64url. Max 50 per conversation.
+    rekeys              packetId      raw RekeyPackets (saved, never read back)
+    conversations       convId        roomSecret in cleartext, activeEpoch,
+                                      activeKeyId, isCreator
+    quickMessageAcks    id            dismissed quick message ids, 7-day TTL
+    preapprovals        id            convId::participantId, 7-day TTL
+    favorites           id            roomMode::convId, INCLUDING roomSecret /
+                                      publicJoinToken, plus a roster snapshot
+    invites             inviteId      outgoing invites incl. roomSecret
+
+localStorage:
+    aircomic_channel_title_{convId}          room title
+    aircomic_handled_invites_{participantId} last 200 handled invite ids
+
+sessionStorage:
+    open tab list (RoomTab[], including roomSecret and publicJoinToken)
+
+Nothing is encrypted at rest. The stated rationale (types/index.ts, comment
+above StoredConversationKey) is that the message log is already plaintext, so
+storing epoch keys costs no secrecy the history has not already given up.
+The same reasoning does not obviously extend to the private identity keys or to
+roomSecret, which are the credentials for future and remote content.
+
+Service worker (pwa/sw.js): caches only the app shell, fonts and icons.
+Relay, signalling, ICE, and directory traffic is explicitly excluded from any
+caching (sw.js:140-142). Push handlers exist but nothing subscribes -- there is
+no push endpoint and no VAPID key today.
+
+
+================================================================================
+11. THREAT MODEL AS CURRENTLY IMPLEMENTED
+================================================================================
+
+What an outside network observer (relay operator, ISP) can see
+    - That a client connects to specific well-known Nostr relays.
+    - Trystero announce traffic on rootTopic = SHA-1("Trystero@appId@convId"),
+      including peer counts and timing, for any convId they know or guess [T-02].
+    - Encrypted SDP; not the SDP contents. But announces carry selfId in clear.
+    - IP addresses of both peers via ICE, once a direct connection forms.
+    - The full public-room directory including every publicJoinToken, hence the
+      full plaintext of every public room they choose to join.
+    - Presence events: a stable Nostr pubkey per user, its online/offline
+      timeline, screen name, avatar and BOTH public keys, for any user whose
+      participantId they know [N-01].
+    - Sealed inbox events: size, timing, sender's Nostr pubkey, recipient's
+      inbox tag. Not the contents.
+
+What a holder of the room secret but not a member can do (private room)
+    - Join the mesh, be seen in the roster, read all control traffic, read every
+      state summary, read any message sent under root-v2, and request entry
+      indefinitely. Cannot read epoch-key traffic.
+
+What a current member can do
+    - Read everything in the room from the current epoch onward, plus any older
+      epoch whose key they still hold, plus backfilled history from before they
+      joined.
+    - Admit anyone unilaterally. Remove anyone unilaterally. Rename the room.
+    - Forge a private-room message attributed to any other participantId [O-02].
+
+What a removed member retains
+    - The roomSecret, hence mesh access, control-traffic visibility and the
+      ability to keep requesting re-entry, forever [O-05].
+
+What compromise of the profile store yields
+    - Both private keys, every room secret, every stored epoch key, and the full
+      plaintext message history, with no additional credential.
+
+Explicit non-goals in the current design
+    - No forward secrecy within an epoch, and no post-compromise security: an
+      attacker with a member's private RSA key can decrypt every future rekey
+      packet they observe.
+    - No deniability: public-room messages are non-repudiably signed.
+    - No metadata privacy against relays.
+    - No Sybil resistance: participantIds are free to mint.
+
+
+================================================================================
+12. OBSERVATIONS AND OPEN QUESTIONS FOR THE REDESIGN
+================================================================================
+
+Stated neutrally. Each is a place where the current behaviour is a choice
+rather than a necessity, and where a redesign would probably want to rule one
+way or the other. Mark each KEEP / CHANGE / DEFER and add direction.
+
+[O-01] Room topic is not password-derived.
+    The Trystero rendezvous topic is SHA-1 over appId + convId only [T-02], and
+    convId travels in the URL query string. Anyone with a convId can enumerate
+    a room's activity on public relays without the secret. Deriving the roomId
+    handed to Trystero from the secret (e.g. base64url(HKDF(secret, convId,
+    "topic"))) would close this, at the cost of breaking every existing invite
+    URL and requiring convId to stop being the routing key.
+
+[O-02] Private-room messages are unsigned.
+    Public rooms sign every message [P-14]; private rooms do not. Inside a
+    private room, sender attribution is "whoever holds the epoch key", so any
+    member can forge a message from any other. Signing private messages with
+    the existing ECDSA key would be a small change to sendMessage /
+    handleIncomingChat; it costs ~64 bytes plus a verify per message and gives
+    up in-room deniability.
+
+[O-03] Messages can be sent under the root key.
+    sendMessage falls back to root-v2 when no epoch key exists
+    (roomSession.ts:1654), which is the normal state for a creator talking
+    before the first admission. Those messages are readable by anyone who ever
+    obtains the room secret. Options: rekey immediately on creation so the root
+    key is never a content key, or refuse to send until an epoch key exists.
+
+[O-04] The epoch chain is recorded but never validated.
+    RekeyPacket carries parentKeyId and epoch, and the only rule enforced is
+    "never adopt a lower epoch" (roomSession.ts:1179). Nothing checks that the
+    parent is the key actually in use, that the signer was a member of the
+    parent epoch, or that members[] is a legal transition from the previous
+    members[]. A single member can therefore rewrite the roster arbitrarily,
+    and a stale-but-valid rekey packet can be replayed by anyone who holds the
+    root key. A validated chain (parent must match, signer must be in the
+    parent's member set, epoch must be parent.epoch + 1 unless it is a reshare)
+    would make membership auditable.
+
+[O-05] Removal does not rotate the room secret.
+    A removed member keeps mesh access and control-traffic visibility forever
+    [F-04]. Real exclusion would need the roomSecret itself to be rotated and
+    redistributed under the new epoch key -- which in turn means the signalling
+    password and the invite URL change, and offline members need a way to catch
+    up. Worth deciding explicitly whether "removal" means "cannot read new
+    messages" (today) or "cannot observe the room" (stronger).
+
+[O-06] SealedEnvelope is unsigned; quick messages inherit that.
+    The seal proves only that the writer knew the recipient's public key, which
+    is public [K-09]. Invites and invite responses carry their own ECDSA
+    signature and are cross-checked against the envelope's claimed sender, so
+    they are safe. QuickMessagePayload has no signature field at all [P-15], on
+    either delivery path, so quick-message sender identity is spoofable by
+    anyone who knows the recipient's participantId and public key. Adding a
+    signature to QuickMessagePayload, and signing the SealedEnvelope header
+    itself, are two independent fixes.
+
+[O-07] StateRequestPacket is unsigned.
+    The handler gates on approvedMembers.has(requesterId) but requesterId is an
+    unauthenticated field [P-09]. Any peer that passed the Trystero password
+    handshake can claim to be a member and pull the envelope cache. The
+    practical impact is limited -- the reply is ciphertext they cannot open
+    without the epoch key -- but it does confirm which message ids a peer holds.
+
+[O-08] Directory publisher key is ephemeral, so tombstones and updates do not
+    replace.
+    publicDirectory.ts generates a fresh secp256k1 key per page load [K-05
+    note]. NIP-33 replaceability is keyed on (pubkey, kind, d-tag), so a
+    descriptor refresh or a tombstone published from a later session is a
+    NEW event rather than a replacement of the earlier one. Merge logic in
+    fetchPublicRooms compensates on the read side, but stale descriptors
+    survive on relays until their expiration tag fires. Using the derived
+    stable key [K-05] would fix replaceability at the cost of linking a room
+    creator's directory activity to their presence identity.
+
+[O-09] relayConfig.redundancy is 12 but at most 10 URLs are supplied [T-01].
+    Harmless but almost certainly not what was intended; worth reconciling.
+
+[O-10] Dedup ledgers are FIFO with no time dimension [F-07].
+    Once 4000 packet ids have passed, the oldest are forgotten and a replayed
+    envelope is accepted again. Envelope timestamps are AAD-bound but never
+    range-checked, so there is no freshness rule anywhere in the chat path. A
+    timestamp window (reject anything older than N minutes or more than M
+    seconds in the future) would bound this cheaply.
+
+[O-11] Presence tags are derivable from a public identifier [N-01].
+    Anyone who has seen a user in any room, or in the public directory, can
+    compute their presence tag and subscribe to their online/offline timeline
+    without being their friend. A capability-style tag -- derived from a secret
+    shared only with accepted contacts -- would make presence opt-in per
+    contact, at the cost of a per-contact tag and a larger subscription filter.
+
+[O-12] Directory publish success is counted at socket open, not at relay OK
+    (publicDirectory.ts:278-283). The returned count overstates delivery.
+
+[O-13] selfId uses Math.random() [K-04].
+    Third-party behaviour, not AirComic's. It matters only if peer-id
+    unpredictability is ever load-bearing; today it is not, because the
+    peerId-to-participantId binding comes from the signed hello. Worth noting
+    if the redesign starts trusting peerIds.
+
+[O-14] Private keys and room secrets are stored unencrypted [section 10].
+    No passphrase, no non-extractable keys, no wrapping. Making the identity
+    keys non-extractable would break the PEM export shown in the profile
+    dialog and the JWK round-trip through IndexedDB; wrapping the store behind
+    a user passphrase would break silent startup. Both are product decisions
+    as much as protocol ones.
+
+[O-15] RSA-OAEP 2048 for key transport.
+    Rekey cost is one RSA encrypt per member per epoch, and the RekeyPacket
+    grows by 256 bytes per member -- a 30-member room ships ~8 KB per rekey,
+    and every admission rekeys. ECDH P-256 + HKDF would cut that to ~32-48
+    bytes per member and remove the 2048-bit generation cost at first run
+    (currently the slowest step of onboarding). This is the single largest
+    scalability lever in the current design.
+
+[O-16] No group-key ratchet.
+    Epoch keys are independent random keys distributed by a single member.
+    There is no ratchet, so a compromised member key decrypts every future
+    epoch that member is included in. If post-compromise security matters, the
+    shape to consider is a proper continuous group key agreement (MLS-style
+    tree, or at minimum a sender-key ratchet per epoch).
+
+[O-17] Trystero's signalling key uses a single unsalted SHA-256 [T-03].
+    Safe today only because AirComic feeds it 256 bits of derived entropy. If
+    the redesign ever allows a human-chosen room password to reach that
+    parameter, it must be stretched first.
+
+[O-18] ChannelTitlePacket is unsigned [P-17] and writes straight to
+    localStorage. Any key-holder can rename the room; there is no last-writer
+    arbitration beyond message arrival order.
+
+[O-19] Unbounded canonicalStringify [K-10].
+    No depth, size or key-count limit on a structure parsed from the network
+    before it is re-serialised for verification. Roster packets carry up to 64
+    nested hellos and are the deepest case.
+
+[O-20] Two protocol names in one product.
+    Every wire constant, domain tag and KDF info string says "airthread". If
+    the redesign is a breaking change anyway, it is the moment to decide
+    whether to renumber to aircomic/3 or keep compatibility.
+
+[O-21] @noble/secp256k1 is imported directly by src/services/presence.ts and
+    src/services/publicDirectory.ts but is not listed in package.json
+    dependencies -- it resolves only because trystero pulls it in. A
+    trystero upgrade that drops or moves it would break the presence and
+    directory paths. It should be a direct dependency regardless of what else
+    changes.
+
+[O-22] Dead protocol surface.
+    PublicRoomMetadataPacket [P-07] is fully built and verified but never sent
+    or received. StateSummaryPacket's membershipHeadPacketId and
+    controlPacketIds are always '' and []. StateChunkPacket.controlPackets is
+    always []. The 'rekeys' IndexedDB store is written but never read.
+    PublicRoomDescriptorPacket.historyPolicy and .relayUrls are never consulted.
+    RekeyPacket.action is advisory only. Each is either a feature to finish or
+    a field to drop.
+
+
+================================================================================
+13. IMPLEMENTATION MAP -- WHERE A CHANGE LANDS
+================================================================================
+
+Use this to scope a review comment to an edit.
+
+  Change primitives, KDFs, packet shapes, signing
+      src/services/crypto.ts               -- every builder AND its verifier
+      src/types/index.ts                   -- the wire type
+
+  Change how a room derives its keys or addresses itself
+      src/services/crypto.ts:333-415       -- generators and the two private KDFs
+      src/services/crypto.ts:824-905       -- the three public-room KDFs
+      src/services/roomSession.ts:200-334  -- init(), key seeding
+      src/services/roomSession.ts:475-533   -- connectTrystero(), password choice
+
+  Change membership rules, rekey, approval, removal
+      src/services/roomSession.ts:1050-1222 -- join request / decision / rekey handlers
+      src/services/roomSession.ts:1320-1502 -- send join, reshare, approve, decline, remove
+      src/services/roomSession.ts:1504-1588 -- rekeyConversation()
+
+  Change message send/receive or add signing to private messages
+      src/services/roomSession.ts:897-1048  -- handleIncomingChat, handleIncomingControl
+      src/services/roomSession.ts:1590-1718 -- sendMessage()
+
+  Change gossip, flooding, dedup or history sync
+      src/services/roomSession.ts:57-77     -- all tunables
+      src/services/roomSession.ts:734-830   -- markProcessed, caches, forwarding
+      src/services/roomSession.ts:1224-1318 -- summary / request / chunk
+
+  Change the transport or the actions on it
+      src/services/trystero.ts              -- action registration, relay monitoring
+      src/services/relays.ts                -- relay lists
+      (ICE/TURN would be a new config key passed to joinRoom in trystero.ts:52-79)
+
+  Change presence, invitations or the sealed inbox
+      src/services/presence.ts              -- publish, subscribe, verify, TTLs
+      src/services/crypto.ts:1161-1340      -- tags, presence, invite, seal
+      src/context/ChatContext.tsx:960-1210 -- invite queue and response handling
+
+  Change the public directory
+      src/services/publicDirectory.ts
+      src/context/ChatContext.tsx:653-698   -- createPublicRoomTab
+
+  Change storage
+      src/services/db.ts                    -- schema, DB_VERSION, TTLs, retention
+      (any store change needs DB_VERSION bumped and an onupgradeneeded branch)
+
+  Change URL / join parsing
+      src/context/ChatContext.tsx:362-374   -- syncBrowserUrl
+      src/context/ChatContext.tsx:580-637   -- joinRoomByUrlOrSecret
+      src/context/ChatContext.tsx:744-775   -- first-load URL handling
+      src/services/roomSession.ts:181-187   -- inviteUrl
+
+
+================================================================================
+14. COMPATIBILITY NOTES FOR ANY BREAKING CHANGE
+================================================================================
+
+Things that break existing users if changed:
+
+  Invite URLs            ?id= + #secret= / ?public=1&join= form. Changing the
+                         addressing scheme invalidates every shared link.
+  convId as Trystero     Changing it changes the rendezvous topic, so old and
+  roomId                 new clients never meet, silently -- they will both
+                         report "connected" with zero peers.
+  Trystero appId         'airthread-protocol-v2'. Same silent-partition effect.
+  Any KDF info/salt      Changes the room key. Old messages in IndexedDB become
+  string                 undecryptable unless the old key is kept.
+  participantId          Derived from the signing key. Changing the hash input
+  derivation             changes every identity, invalidating friends lists,
+                         pre-approvals, favourites and presence tags.
+  Canonical JSON rules   Any change to key ordering, undefined handling or the
+                         domain tags invalidates every signature, including
+                         those stored in IndexedDB.
+  IndexedDB schema       DB_VERSION is 6; an upgrade path is required for
+                         'profile', 'friends', 'messages', 'favorites',
+                         'conversations', which hold data users would notice
+                         losing.
+
+A staged migration is possible: introduce airthread/3 packet types alongside
+v2, have clients advertise support in the hello, and only switch a room's
+encryption once every participant in the roster has advertised v3. Nothing in
+the current code does version negotiation -- the protocol field is checked for
+equality with 'airthread/2' and nothing else -- so that capability would have
+to be added first.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

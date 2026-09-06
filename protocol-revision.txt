@@ -1,0 +1,1015 @@
+================================================================================
+AIRCOMIC -- PROPOSED NETWORK AND ENCRYPTION PROTOCOL REVISION
+================================================================================
+
+Status:              Design proposal for implementation
+Proposed protocol:   airthread/3
+Supersedes:          airthread/2 transport behavior for newly created v3 rooms
+Product name:        AirComic
+Date:                September 2026
+
+Document purpose
+    This document revises the current AirComic protocol so that Nostr is the
+    normal, authoritative transport for every room. Public and private room
+    traffic is published to and received from multiple Nostr relays. WebRTC is
+    retained as an optional low-latency optimization for the currently active
+    private room only.
+
+    The design is intended to preserve the useful parts of the current system:
+    self-certifying AirComic identities, private-room epoch encryption, public
+    directory discovery, invitations, offline catch-up, and a serverless static
+    web application. It also rules on the observations in section 12 of the
+    current protocol reference.
+
+    This is a target protocol and implementation change specification, not an
+    assertion that the current source already behaves this way.
+
+
+================================================================================
+1. DESIGN DECISIONS AND GOALS
+================================================================================
+
+[R-01] Nostr is authoritative
+    Every control packet, chat message, membership transition, room metadata
+    change, invitation, presence record, and public-directory record is
+    delivered through Nostr. A room remains functional when WebRTC cannot be
+    established or has been deliberately suspended.
+
+[R-02] WebRTC is an optimization only
+    The client MAY establish a Trystero/WebRTC mesh for the foreground private
+    room. It sends the same immutable AirComic envelope over WebRTC that it
+    publishes to Nostr. WebRTC never creates a distinct message, sequence,
+    acknowledgment, or state branch. Deduplication makes dual delivery safe.
+
+[R-03] One foreground private mesh
+    At most one private room per browser context may have an active WebRTC mesh.
+    Selecting another private room closes or suspends the previous room's mesh.
+    Public rooms never create a full WebRTC mesh. Background rooms continue to
+    receive Nostr events through the shared relay pool.
+
+[R-04] Room size
+    Private rooms have a protocol membership limit of 20 participants. The
+    WebRTC implementation also enforces a configurable global peer-connection
+    cap, initially 20. Public rooms have no protocol membership list or WebRTC
+    peer limit, although relays, clients, moderation, storage, and rendering
+    impose practical capacity limits. The UI MUST NOT describe them as
+    literally unlimited; `large public room` is the accurate model.
+
+[R-05] Encryption and authentication
+    Private content remains end-to-end encrypted under epoch keys. All chat and
+    control payloads in both room modes are individually ECDSA-signed. Public
+    content is not confidential. Nostr's Schnorr signature authenticates the
+    relay event; the inner AirComic signature authenticates the application
+    identity and survives transport changes.
+
+[R-06] Relay storage is replicated opportunistic storage
+    A successful send requires acknowledgments from a configurable relay quorum,
+    but public relays provide no permanent retention or availability guarantee.
+    IndexedDB remains the user's durable local history. The application retries
+    pending sends and queries several relays for catch-up.
+
+[R-07] Privacy statement
+    End-to-end encryption protects private-room content, not metadata. Relays can
+    observe IP addresses, event timing, sizes, room-routing pseudonyms, and
+    within-room publisher pseudonyms. WebRTC peers can learn one another's ICE
+    addresses. The UI and documentation MUST distinguish content confidentiality
+    from metadata privacy.
+
+
+================================================================================
+2. VERSIONING AND COMPATIBILITY
+================================================================================
+
+[V-01] Wire identifiers
+    Base protocol                 `airthread/3`
+    Nostr transport extension     `airthread/3-nostr-transport`
+    Public-room extension         `airthread/3-public-rooms`
+    Presence extension            `airthread/3-presence`
+    Optional Trystero appId        `airthread-protocol-v3`
+
+    The historical `airthread` name is retained to avoid changing every domain
+    separator and identifier solely for branding. AirComic remains the product
+    name.
+
+[V-02] No silent v2/v3 mixing
+    A v3 client MUST NOT send v3 packets into a v2 room. Existing v2 rooms remain
+    usable through a legacy compatibility implementation. Newly created rooms
+    use v3. A room record persists protocolVersion explicitly.
+
+[V-03] Invitations
+    A v3 invite identifies its protocolVersion. URL forms remain recognizable:
+
+      Private: https://<host>/<path>?id=<convId>#secret=<roomSecret>
+      Public:  https://<host>/<path>?id=<convId>&public=1&join=<publicJoinToken>
+
+    The private fragment prevents the static HTTP host from receiving the
+    secret, but browser history and copied addresses still contain it. After a
+    private-room capability rotation, old URLs cease to locate current traffic.
+
+[V-04] Migration
+    Do not convert an active v2 room in place. Offer `Create v3 replacement`
+    and issue signed invitations to the new room. Preserve v2 history locally
+    as a read-only archive if desired. Identity derivation remains unchanged,
+    so existing contacts survive the migration.
+
+
+================================================================================
+3. SHARED NOSTR RELAY POOL
+================================================================================
+
+[T-01] Connection model
+    One application-level RelayPool owns the WebSocket connections used by all
+    rooms, presence, directory, and inbox operations. A client normally connects
+    to 3-5 relays selected from a configurable list. Opening another room adds
+    subscription filters; it does not open another full set of sockets.
+
+    The relay list MUST be user-configurable. Public room descriptors MAY add
+    recommended relays, but a descriptor cannot silently remove the user's
+    relays or force connection to an insecure endpoint.
+
+[T-02] Event kind
+    Initial compatibility kind: 30078 (NIP-33 parameterized replaceable event).
+
+    Each immutable room packet uses a unique `d` tag containing its packetId, so
+    it behaves as an individually addressable stored record. Presence,
+    descriptors, tombstones, and mutable outbox bundles use stable `d` tags and
+    retain normal replaceable-event behavior.
+
+    The event kind MUST be a configuration constant, not duplicated literals.
+    A later standardized AirComic/Nostr event kind can replace 30078 only through
+    version negotiation. Clients MUST tolerate individual relays refusing the
+    configured kind and continue with the remaining relay set.
+
+[T-03] Nostr event tags for room packets
+
+      ["d", "<packetId>"]
+      ["t", "aircomic-room-packet"]
+      ["r", "<routingTag>"]
+      ["m", "private" | "public"]
+      ["v", "3"]
+      ["expiration", "<unix-seconds>"]       optional by retention class
+
+    Relays are queried by kind and `r`. packetId is random and globally unique.
+    No participantId, screen name, convId, epoch number, message type, or private
+    membership information is placed in a clear Nostr tag.
+
+[T-04] Private routing tag
+
+      routingKey = HKDF-SHA-256(
+          IKM  = roomSecret,
+          salt = SHA-256("airthread-v3-routing:" + convId.lower()),
+          info = "airthread-private-routing-v3",
+          len  = 256 bits)
+
+      routingTag = Base64URL(SHA-256("airthread-v3-room:" + routingKey))
+
+    Knowledge of convId alone cannot discover a private room's traffic. The
+    roomSecret is a capability granting knowledge of the current routing tag
+    and root control key, but not current epoch content unless the holder is an
+    approved member.
+
+[T-05] Public routing tag
+
+      routingTag = publicRoomId
+
+    It is intentionally discoverable from the public descriptor.
+
+[T-06] Per-room Nostr publishing identity
+    Each participant derives a distinct secp256k1 publishing key for every room:
+
+      seed = HMAC-SHA-256(
+          key  = raw private ECDSA scalar material,
+          data = "airthread-nostr-room-v3:" + routingTag)
+
+    If seed is outside the valid secp256k1 scalar range, hash it again with the
+    same domain separator and a counter until valid. The resulting public key is
+    stable within that room but is not reused for presence, inboxes, directory
+    publishing, or other rooms.
+
+    This reduces trivial cross-room linkage. It does not hide IP addresses or
+    prevent a relay from correlating traffic heuristically. Inner ECDSA
+    signatures, not this derived Nostr identity, remain the canonical AirComic
+    identity proof.
+
+[T-07] Publish acceptance
+    Opening a WebSocket is not delivery success. For every EVENT submission the
+    relay must return an `OK` accepting the exact Nostr event ID. The default
+    send policy is:
+
+      target relays       5 when available
+      success quorum      2 positive OK responses
+      initial timeout     5 seconds
+      retry               exponential backoff with jitter
+      local state         pending -> relayed -> failed/retrying
+
+    If only one usable relay is configured, one acknowledgment is provisionally
+    sufficient and the UI SHOULD indicate reduced redundancy. A relay rejection
+    is recorded separately from a network failure. Retrying uses the exact same
+    signed Nostr event and packetId.
+
+[T-08] Subscriptions
+    The RelayPool maintains subscriptions for:
+
+      - every open room's current routingTag;
+      - the current user's inbox tags;
+      - explicitly watched contact-presence capabilities;
+      - public-directory descriptors and room-presence records while the
+        directory view is open.
+
+    Filters SHOULD combine multiple routing tags where relay limits permit and
+    split them into bounded batches otherwise. Reconnect recreates subscriptions
+    with a `since` value based on the last locally committed event minus a small
+    overlap window.
+
+[T-09] Retention classes
+    Suggested expiration values:
+
+      chat/control history       30 days by default, room-configurable
+      public room presence       2 minutes
+      user presence              15 minutes
+      quick message              1 hour
+      pending invitation         7 days
+      public descriptor          30 minutes, refreshed every 10 minutes
+
+    Expiration is a request to relays, not a deletion guarantee. Sensitive
+    private content remains ciphertext even after local deletion.
+
+
+================================================================================
+4. AIRCOMIC APPLICATION ENVELOPE
+================================================================================
+
+[P-01] Immutable transport packet
+
+    {
+      "protocol": "airthread/3",
+      "extension": "airthread/3-nostr-transport",
+      "type": "room_envelope",
+      "convId": "<uuid>",
+      "packetId": "<uuid>",
+      "roomMode": "private",
+      "packetClass": "chat",
+      "keyId": "epoch-2-7b3f9a",
+      "senderId": "<participantId>",
+      "senderSigningPublicKey": "<ecdsa_spki_base64>",
+      "timestamp": 1725280040000,
+      "iv": "<base64url_12_bytes_or_empty_for_public>",
+      "data": "<base64url_ciphertext_or_canonical_public_payload>",
+      "signature": "<base64url_ecdsa_signature>"
+    }
+
+    packetClass is one of `chat`, `control`, `metadata`, or `system`.
+
+    Private room:
+      data = Base64URL(AES-256-GCM(key, canonical payload, AAD))
+      iv   = 12 cryptographically random bytes
+
+    Public room:
+      data = Base64URL(UTF8(canonical payload))
+      iv   = ""
+
+    Public content is not encrypted under a publicly derivable AES key. Removing
+    that meaningless encryption makes the security property explicit and avoids
+    presenting obfuscation as confidentiality.
+
+[P-02] Envelope AAD
+
+      AAD = "airthread/3:" + convId + ":" + packetId + ":" + roomMode +
+            ":" + packetClass + ":" + keyId + ":" + senderId + ":" + timestamp
+
+    The envelope signature covers the canonical envelope without `signature`,
+    including the ciphertext. Domain:
+
+      AIRTHREAD_ROOM_ENVELOPE_V3:
+
+    Receivers first enforce structural limits, derive senderId from
+    senderSigningPublicKey, verify the ECDSA signature, check routing/room
+    consistency, deduplicate packetId, and only then decrypt and parse data.
+
+[P-03] Identical dual transport
+    The serialized RoomEnvelope is the unit delivered through both transports:
+
+      Nostr event content = exact serialized RoomEnvelope
+      WebRTC action data   = exact serialized RoomEnvelope
+
+    The Nostr wrapper is not part of the AirComic packet ID. Receiving the same
+    packet from two relays and WebRTC produces one application delivery.
+
+[P-04] Size limits
+    Before canonicalization or signature verification, reject input exceeding:
+
+      Nostr event content             64 KiB default
+      AirComic envelope               60 KiB default
+      decoded chat text                8 KiB default
+      canonical object depth              16
+      object keys per object             128
+      array elements                    256 unless packet-specific lower bound
+      private membership                 20
+
+    The effective event limit is the minimum accepted by the configured relay
+    quorum. Images, audio, large comic assets, and large exports are not embedded
+    in room events. They use separately encrypted blob storage with a signed
+    content hash and retrieval reference. WebRTC MAY accelerate blob transfer
+    when available but cannot be the only retrieval path for a message claimed
+    to be durably sent.
+
+
+================================================================================
+5. MESSAGE DELIVERY, ORDERING, AND DEDUPLICATION
+================================================================================
+
+[D-01] Send sequence
+    1. Build and sign the inner payload where its type requires a signature.
+    2. Build, encrypt when private, and sign one RoomEnvelope.
+    3. Commit the envelope to IndexedDB with state `pending`.
+    4. Publish the corresponding Nostr event to the relay pool.
+    5. If this is the foreground private room and WebRTC is ready, transmit the
+       same serialized envelope immediately without waiting for relay OK.
+    6. Mark the record `relayed` when the acknowledgment quorum is reached.
+    7. Retry in the background until quorum, expiration, or explicit cancellation.
+
+    WebRTC arrival may make a message visible quickly, but only relay quorum
+    changes the sender's durable delivery state to `relayed`.
+
+[D-02] Deduplication
+    The canonical dedup key is `(convId, packetId)`. Persist processed IDs with
+    firstSeenAt, packet timestamp, senderId, and content hash. Do not use a pure
+    FIFO ledger.
+
+      live dedup retention          at least message retention + 7 days
+      tombstone/control retention   for the lifetime of the room record
+
+    If the same key arrives with a different content hash, retain the first
+    valid packet, flag a protocol collision, and never display the conflicting
+    packet as a second message.
+
+[D-03] Ordering
+    Nostr and WebRTC do not define a shared total order. Display order is:
+
+      1. application timestamp ascending;
+      2. senderId lexicographically;
+      3. packetId lexicographically.
+
+    Locally sent messages appear optimistically. Late events may be inserted at
+    their deterministic position. No timestamp order is treated as proof of
+    causality. A future reply/thread field references the target msgId directly.
+
+[D-04] Timestamp acceptance
+    Live delivery rejects or quarantines packets more than 5 minutes in the
+    future or older than the live subscription window. Explicit history queries
+    may accept older packets within the room's retention policy. Signature,
+    deduplication, and membership-at-send-time checks still apply.
+
+[D-05] Delivery meaning
+    `sent` or `relayed` means the configured relay quorum stored/accepted the
+    event; it does not mean another participant read it. Read receipts, if added,
+    are separate signed packets and SHOULD be opt-in because they reveal activity.
+
+
+================================================================================
+6. OPTIONAL WEBRTC ACCELERATOR
+================================================================================
+
+[W-01] Eligibility
+    WebRTC is attempted only when all are true:
+
+      - roomMode is private;
+      - the room is the currently selected foreground room;
+      - local membership is approved;
+      - the room has 20 or fewer members;
+      - the global peer cap would not be exceeded;
+      - WebRTC acceleration is enabled by the user/client policy.
+
+[W-02] Secret-derived rendezvous
+    Do not pass raw convId to Trystero. Derive:
+
+      webrtcRoomId = Base64URL(HKDF-SHA-256(
+          IKM  = current roomSecret,
+          salt = SHA-256("airthread-v3-webrtc:" + convId.lower()),
+          info = "airthread-private-webrtc-room-v3",
+          len  = 256 bits))
+
+    Derive the Trystero password independently with info
+    `airthread-private-webrtc-password-v3`. A convId alone therefore reveals no
+    rendezvous topic. Human-chosen passwords are never passed directly.
+
+[W-03] Lifecycle
+    Activating private room B calls `leave()` on room A's Trystero session before
+    starting B. Backgrounding the page MAY suspend WebRTC while keeping Nostr
+    subscriptions. Returning to the room performs a fresh mesh join and does not
+    require history gossip because Nostr is authoritative.
+
+[W-04] Failure behavior
+    ICE failure, relay-signaling failure, missing TURN, password mismatch, or a
+    peer cap never prevents room use. The client records WebRTC as `unavailable`
+    or `degraded` and continues over Nostr. The UI distinguishes:
+
+      Nostr connected / reconnecting / offline
+      Direct acceleration active / partial / unavailable
+
+    `Connected` MUST NOT mean `another WebRTC peer was found`.
+
+[W-05] No application flooding
+    Send a RoomEnvelope directly to each connected peer once. Do not re-flood it
+    through every peer; Nostr already supplies the convergence path and the old
+    O(N^2) application-level flood is removed. A partial mesh is acceptable.
+
+[W-06] Peer authentication
+    The signed hello remains, adds protocol capabilities, and is checked against
+    the WebRTC peer metadata. peerId is never trusted as an identity or security
+    token. Math.random()-generated third-party peer IDs therefore remain
+    non-load-bearing.
+
+[W-07] Large assets
+    Direct transfer is permitted as an optimization after the message containing
+    the signed asset hash/reference has been published. Recipients that cannot
+    use WebRTC need a relay-independent blob retrieval option. AirComic should
+    not add a mandatory TURN service merely for chat delivery.
+
+
+================================================================================
+7. PRIVATE ROOMS
+================================================================================
+
+[PR-01] Creation
+    Generate convId and a 256-bit roomSecret for v3 rooms. Derive root control,
+    routing, and optional WebRTC keys with independent HKDF info strings.
+
+    Immediately create epoch 1 with the creator as its only member. The root key
+    is never a chat content key. If epoch initialization fails, sending is
+    disabled rather than falling back to root-v3.
+
+[PR-02] Private message authentication
+    Every private PlaintextMessagePayload includes senderSigningPublicKey and an
+    ECDSA signature:
+
+      AIRTHREAD_PRIVATE_MESSAGE_V3:canonicalStringify(unsignedPayload)
+
+    The outer RoomEnvelope is also signed. This intentionally chooses attributable
+    authorship over in-room deniability: one member cannot forge another member's
+    messages merely by holding the group epoch key.
+
+[PR-03] Join request over Nostr
+    A holder of the roomSecret subscribes to the current routingTag and publishes
+    a signed JoinRequestPacket inside a root-key RoomEnvelope. Approved members
+    can decrypt and approve it. The requester cannot decrypt epoch traffic.
+
+    Join requests are rate-limited by `(routingTag, participantId)` and expire.
+    Repeated declined requests may be muted locally. The protocol continues to
+    permit any current member to approve unless a future governance extension
+    specifies otherwise.
+
+[PR-04] Membership epoch chain
+    Each RekeyPacket contains epoch, keyId, parentPacketId, parentKeyId, action,
+    targetParticipantId when applicable, exact sorted members, individually
+    wrapped epoch keys, signer identity, timestamp, and signature.
+
+    A transition is valid only when:
+
+      - parentPacketId and parentKeyId equal a locally validated epoch head;
+      - epoch equals parent epoch + 1, except an explicitly typed reshare;
+      - signer was a member of the parent epoch;
+      - signer signature and identity binding verify;
+      - `add` changes membership by exactly the target addition;
+      - `remove` changes membership by exactly the target removal;
+      - member count is 1-20 with no duplicates;
+      - every member has exactly one wrapped key slot.
+
+    Reshare packets do not create a new epoch or modify membership and are valid
+    only for someone already listed in that epoch.
+
+[PR-05] Concurrent transitions
+    Competing valid children of one parent are ordered by packetId
+    lexicographically; the greatest packetId is the canonical child. Clients
+    retain observed forks for audit but adopt only the canonical branch. A
+    subsequent transition must name the canonical head. The UI SHOULD prevent
+    concurrent local approval actions while a transition is pending, reducing
+    but not replacing deterministic fork resolution.
+
+[PR-06] Admission
+    Approval creates a new epoch containing the requester. The new epoch key is
+    RSA-OAEP-wrapped to every listed member. The rekey control packet is published
+    on the existing routing tag so the requester can retrieve and open its slot.
+    JoinDecisionPacket remains signed and clears prompts consistently.
+
+[PR-07] Strong removal and capability rotation
+    Removal means the target cannot decrypt new content and cannot locate the new
+    room route from the old roomSecret.
+
+    The remover generates:
+
+      - a fresh epoch key;
+      - a fresh 256-bit roomSecret;
+      - new root, routing, and optional WebRTC derivations.
+
+    A signed capability-rotation packet published on the old route contains the
+    new epoch key and new roomSecret wrapped separately to each remaining member's
+    RSA public key. The removed member can observe the old-route event but has no
+    wrapped slot. Remaining online or offline members retrieve it, unwrap their
+    values, validate the chain, and subscribe to the new routing tag.
+
+    The old route remains monitored for a configurable migration period (default
+    30 days) solely to retrieve the rotation packet. No new chat is accepted
+    there after rotation. Old invitation URLs and outstanding invites are revoked;
+    new invitations use the new roomSecret. Best-effort deletion events may be
+    sent, but confidentiality never relies on relay deletion.
+
+    This does not erase history or stop a removed member from replaying old
+    ciphertext. It does prevent continued observation of the new routing stream
+    unless a remaining member leaks the new capability.
+
+[PR-08] Epoch confidentiality limitation
+    Independent random epoch keys provide removal cutoff but not continuous
+    post-compromise security. RSA-OAEP key transport is retained for the initial
+    v3 implementation to limit migration scope. MLS or a sender-key ratchet is a
+    future protocol project, not something to approximate informally.
+
+[PR-09] History policy
+    A private room stores ciphertext on relays. A newly admitted participant may
+    decrypt only epochs for which it receives a key. Default policy is
+    `from_admission`; the approval transition does not give earlier epoch keys.
+    An explicit `share_history` operation may wrap selected older epoch keys to
+    the new member and is auditable as a signed control packet.
+
+
+================================================================================
+8. PUBLIC ROOMS, DIRECTORY, AND APPROXIMATE OCCUPANCY
+================================================================================
+
+[PU-01] Public messages
+    Public message payloads and RoomEnvelopes are signed but not encrypted.
+    Any relay, subscriber, archive, or participant may read and retain them.
+    The client clearly warns the creator and participant that public means
+    world-readable, not merely open admission.
+
+[PU-02] Directory descriptor
+    Retain the v2 descriptor concepts under the v3 extension: publicRoomId,
+    convId, publicJoinToken, name, description, creator identity, createdAt,
+    updatedAt, expiresAt, language, tags, history policy, content policy, relay
+    recommendations, and signature.
+
+    The directory Nostr key is deterministically derived per public room, rather
+    than generated per page load. It is stable enough for NIP-33 replacement and
+    isolated from the creator's presence and other rooms. Descriptor, metadata
+    update, and tombstone authorization also require the creator's inner ECDSA
+    signature.
+
+[PU-03] Directory acknowledgments
+    Descriptor publication succeeds only on positive relay OK responses, using
+    the same quorum rules as room packets. Socket-open counts are diagnostics,
+    not publish counts.
+
+[PU-04] Approximate room presence
+    Each client that has a public room open publishes a short-lived, signed,
+    parameterized presence event:
+
+      {
+        "type": "public_room_presence",
+        "protocol": "airthread/3",
+        "extension": "airthread/3-public-rooms",
+        "publicRoomId": "<id>",
+        "presenceId": "<room-scoped pseudonymous id>",
+        "observedAt": 1725280040000,
+        "expiresAt": 1725280160000,
+        "signature": "<application signature>"
+      }
+
+    It is refreshed every 45 seconds and expires after 120 seconds. The Nostr
+    `d` tag is `presence:<publicRoomId>`; NIP-33 replacement is also scoped by
+    the client's room-specific Nostr pubkey. Screen name, contact information,
+    persistent participantId, and avatar are omitted.
+
+    Directory clients count distinct valid, unexpired room-scoped publishers
+    across relays after deduplication. Counts are approximate because relays may
+    lag or disagree and Sybil identities are free. Display recommended ranges:
+
+      0, 1-4, 5-9, 10-24, 25-99, 100-499, 500+
+
+    Label the result `approximately online`. It is not an admission or capacity
+    guarantee.
+
+[PU-05] Room lifecycle
+    Public rooms require no join request, epoch, rekey, or member roster. Leaving
+    stops presence refresh. A creator tombstone removes the directory listing but
+    cannot make already-published public content private or force subscribers to
+    disconnect.
+
+[PU-06] Moderation
+    Every client supports local mute/block and payload/rate limits. Creator or
+    moderator advisory packets can recommend hiding a message or identity, but
+    arbitrary public relays cannot guarantee enforcement. Strong moderation is a
+    distinct relay-managed-group mode (for example, a future NIP-29 integration),
+    not claimed by this protocol.
+
+
+================================================================================
+9. HISTORY AND SYNCHRONIZATION
+================================================================================
+
+[H-01] Relay-first catch-up
+    On subscription, query every available relay from the last committed room
+    timestamp minus an overlap window. Merge by `(convId, packetId)`, verify each
+    packet independently, and commit in deterministic order. Continue pagination
+    until the retention boundary, room-configured maximum, or user cancellation.
+
+[H-02] Targeted recovery
+    Persist recent packet IDs and detect gaps referenced by control chains or
+    replies. Query relays by `d=packetId` when supported. A signed recovery request
+    may be published when a known packet is absent from all relays; peers can
+    republish the original immutable Nostr event or envelope.
+
+[H-03] Remove old peer state protocol
+    StateSummaryPacket, StateRequestPacket, StateChunkPacket, envelopeCache
+    serving, roster gossip, and application re-flooding are removed from the v3
+    correctness path. They are not needed for normal history because all valid
+    senders publish through Nostr. This also removes the unsigned state-request
+    weakness.
+
+[H-04] Relay disagreement
+    One relay's absence, ordering, or EOSE response is not authoritative. A
+    packet validly received from any configured relay is considered available.
+    A conflicting event with the same AirComic packetId is handled as a collision
+    under [D-02].
+
+[H-05] Local retention
+    Users may retain more history than relays. Local deletion removes plaintext,
+    ciphertext, indices, and cached asset keys from that browser, but cannot
+    recall copies held by relays or other participants. Public-room deletion is
+    necessarily local unless a cooperative relay honors deletion requests.
+
+
+================================================================================
+10. PRESENCE, INVITATIONS, AND QUICK MESSAGES
+================================================================================
+
+[N-01] Contact presence capabilities
+    Replace publicly derivable presenceTag(participantId) with a random
+    contact-presence capability shared in a signed, sealed contact-acceptance
+    exchange. Each accepted contact may receive a distinct capability. Presence
+    is published and subscribed by capability tag, making monitoring opt-in per
+    contact rather than derivable from a public participantId.
+
+    Revoking a contact rotates capabilities for the remaining authorized
+    contacts. This improves routing privacy but does not hide the publisher's IP
+    from relays.
+
+[N-02] Signed sealed envelope
+    SealedEnvelope v3 adds senderSigningPublicKey and signature. The signature
+    covers recipientParticipantId, senderParticipantId, encryptedKey, iv, data,
+    timestamp, protocol, extension, and type under:
+
+      AIRTHREAD_SEALED_ENVELOPE_V3:
+
+    The receiver derives senderParticipantId from the signing key and verifies
+    the envelope before attempting RSA decryption.
+
+[N-03] Quick message
+    QuickMessagePayload v3 includes senderSigningPublicKey and an ECDSA signature
+    under `AIRTHREAD_QUICK_MESSAGE_V3:`. It is sent once through the sealed Nostr
+    inbox. If a direct WebRTC link happens to exist, the identical signed sealed
+    payload may be accelerated, with ID-based deduplication.
+
+[N-04] Invitations and responses
+    Existing signed invitation payloads remain conceptually valid but declare v3.
+    Bundled replaceable outbox events continue to permit clearing outstanding
+    invitations. Acceptance verifies both the signed sealed-envelope identity and
+    the signed inner invitation identity. A private invite revoked by capability
+    rotation is rejected even if its Nostr event remains stored.
+
+[N-05] Inbox privacy limitation
+    Inbox tags and event timing remain observable to relays. Contact capabilities
+    prevent simple derivation from participantId but do not create traffic-analysis
+    resistance. Padding and cover traffic are deferred.
+
+
+================================================================================
+11. METADATA AND CONTROL AUTHORIZATION
+================================================================================
+
+[M-01] Channel metadata is signed
+    Channel title, room name, description, and policy packets include setter
+    signing key and signature. Private-room authorization policy is explicitly
+    stored in the room genesis packet:
+
+      `members`     any current member may change metadata
+      `creator`     only the creator identity may change metadata
+
+    Default is `members` for compatibility. Public authoritative metadata is
+    creator-signed. Conflicting valid updates use `(timestamp, packetId)` ordering.
+
+[M-02] Control authorization
+    Control packet handlers validate both the packet signature and the sender's
+    authority in the canonical membership epoch applicable at packet.timestamp.
+    Possession of a symmetric key alone never authorizes a claimed sender.
+
+[M-03] Canonicalization limits
+    canonicalStringify remains byte-compatible for retained P-256 identities and
+    packet signatures, but callers first run a bounded structural validator. No
+    untrusted object exceeding [P-04] reaches recursive canonicalization.
+
+[M-04] Unknown fields
+    Signed packets may include extension fields. A receiver verifies the whole
+    parsed object, then ignores unknown optional fields. Unknown critical behavior
+    must be declared in `requiredExtensions[]`; unsupported required extensions
+    cause rejection rather than partial interpretation.
+
+
+================================================================================
+12. RELAY FAILURE, ABUSE, AND OPERATIONAL CONTROLS
+================================================================================
+
+[A-01] Relay health
+    Track WebSocket state, subscription EOSE, EVENT OK/rejection, round-trip time,
+    last received event, and retry backlog separately. `Connected` means the
+    socket is open; `Writable` means a recent probe/application event was accepted;
+    `Readable` means a subscription has produced EOSE or events.
+
+[A-02] Rate limits
+    Apply token buckets by room-scoped Nostr pubkey, inner senderId, routingTag,
+    and packet class. Control packets receive a small reserved budget. History
+    import has maximum event count, total bytes, and processing duration.
+
+[A-03] Malicious relay
+    A relay can omit, delay, replay, reorder, or refuse events, but cannot forge
+    valid AirComic signatures or private ciphertext. Querying and publishing to
+    several independent relays reduces single-relay censorship. A relay can retain
+    any event indefinitely regardless of expiration tags.
+
+[A-04] Malicious participant
+    Signatures prevent impersonation but not spam by a valid or newly minted
+    identity. Public rooms have no Sybil resistance. Private rooms enforce the
+    canonical membership epoch before displaying chat. Local blocks are applied
+    before expensive rendering or asset retrieval.
+
+[A-05] Offline sends
+    Pending events remain in an IndexedDB outbox and retry when relay connectivity
+    returns. A user can cancel a not-yet-acknowledged local send, but a relay may
+    already have stored a copy. The UI must not promise recall.
+
+[A-06] Relay portability
+    Rooms do not depend on one relay URL. Participants can learn signed relay-list
+    suggestions through room metadata, merge them with user choices, and republish
+    immutable events to newly added relays. No single relay is the room owner.
+
+
+================================================================================
+13. DATA AT REST
+================================================================================
+
+[S-01] Required IndexedDB changes
+    Increment DB_VERSION and add or revise stores for:
+
+      nostrOutbox
+        packetId, signedEvent, targetRelays, acknowledgedRelays, rejectedRelays,
+        attempts, nextAttemptAt, expiration, state
+
+      processedPackets
+        convId::packetId, contentHash, senderId, packetTimestamp, firstSeenAt,
+        retentionClass
+
+      relayCursors
+        relayUrl::routingTag, lastCommittedTimestamp, lastEventId
+
+      membershipHeads
+        convId, canonical head, validated transitions and observed forks
+
+      conversations
+        protocolVersion, roomMode, current roomSecret/capability generation,
+        routingTag, activeEpoch, activeKeyId, historyPolicy, metadataPolicy
+
+    Existing profile, friends, messages, keys, favorites, invitations, and
+    preapprovals receive explicit migration rather than deletion.
+
+[S-02] Secret storage
+    Plaintext private keys, room secrets, epoch keys, and message history in
+    IndexedDB remain a high-impact local compromise risk. This revision defines
+    two product modes:
+
+      Convenience mode
+        Current silent startup behavior. Secrets remain protected only by the
+        browser profile and operating-system account. The security UI states this.
+
+      Locked vault mode
+        User selects a passphrase. Derive a wrapping key with a memory-hard KDF
+        available through a reviewed library (recommended Argon2id), encrypt
+        extractable private material and room secrets with AES-GCM, and keep the
+        unlocked key only in memory. Parameters and salt are stored with the vault.
+
+    Locked vault mode is recommended but cannot be mandatory without changing
+    current silent-startup and key-export behavior. Non-extractable WebCrypto
+    identity keys may be offered for new profiles but require a separate recovery
+    and multi-device design.
+
+[S-03] Plaintext history
+    Decrypted messages stored locally are protected only by the selected storage
+    mode. `Delete local history` removes message records and search indices but
+    does not imply network deletion.
+
+
+================================================================================
+14. RESOLUTION OF CURRENT OPEN QUESTIONS
+================================================================================
+
+This section maps directly to observations [O-01] through [O-22] in the current
+protocol reference.
+
+[O-01] CHANGE
+    Private Nostr routing tags and optional Trystero room IDs are derived from
+    the current roomSecret. convId alone no longer reveals room activity.
+
+[O-02] CHANGE
+    Private messages are ECDSA-signed. Authenticated attribution is chosen over
+    in-room deniability.
+
+[O-03] CHANGE
+    Create epoch 1 immediately. The root key is control-only and never a fallback
+    content key.
+
+[O-04] CHANGE
+    Validate parent head, signer membership, epoch increment, exact legal member
+    transition, wrapped-key slots, and deterministic fork resolution.
+
+[O-05] CHANGE
+    Removal rotates roomSecret, routing tag, root derivation, WebRTC rendezvous,
+    and epoch key. Offline remaining members recover the signed rotation from the
+    old Nostr route using their individually wrapped slot.
+
+[O-06] CHANGE
+    Sign both SealedEnvelope and QuickMessagePayload and cross-check identities.
+
+[O-07] REMOVE
+    The peer StateRequestPacket is removed from the normal v3 protocol. Relay
+    history queries and signed targeted recovery replace it.
+
+[O-08] CHANGE
+    Derive a stable per-room directory Nostr key. It replaces descriptors and
+    tombstones across sessions without linking unrelated rooms.
+
+[O-09] REMOVE
+    Trystero no longer owns the general relay pool. Optional foreground WebRTC
+    uses an explicit bounded signaling relay list whose redundancy equals the
+    supplied URL count.
+
+[O-10] CHANGE
+    Persistent, time-aware dedup records replace FIFO-only ledgers. Apply live
+    timestamp windows and separate historical acceptance rules.
+
+[O-11] CHANGE
+    Contact presence uses shared random capability tags rather than hashes of a
+    public participantId.
+
+[O-12] CHANGE
+    Count only positive Nostr OK acknowledgments as successful publication.
+
+[O-13] KEEP, NON-SECURITY
+    Trystero peerId remains an untrusted connection label bound to identity by a
+    signed hello. Its randomness is never load-bearing.
+
+[O-14] CHANGE AT PRODUCT LAYER
+    Add recommended locked-vault mode while retaining an explicitly disclosed
+    convenience mode for compatibility. Protocol security cannot protect an
+    already-compromised unlocked browser profile.
+
+[O-15] DEFER
+    Keep RSA-OAEP 2048 for v3 key slots because private membership is capped at
+    20 and changing transport plus identity key agreement simultaneously would
+    enlarge migration risk. Evaluate ECDH/HPKE or MLS as a separate revision.
+
+[O-16] DEFER, DOCUMENT
+    No continuous group ratchet is claimed. Random epoch keys plus strong removal
+    rotation provide cutoff, not full post-compromise security. MLS remains the
+    correct future direction if that property becomes required.
+
+[O-17] CHANGE
+    Feed Trystero only independently HKDF-derived full-entropy values. Never pass
+    a human password directly.
+
+[O-18] CHANGE
+    Sign metadata packets and enforce the room's declared metadata authority.
+
+[O-19] CHANGE
+    Enforce byte, nesting, key-count, array, and packet-specific limits before
+    canonicalization.
+
+[O-20] KEEP NAME, BUMP VERSION
+    Retain `airthread` wire naming but introduce airthread/3 because transport,
+    signatures, routing, membership, and storage behavior are breaking changes.
+
+[O-21] CHANGE
+    Declare @noble/secp256k1 as a direct, pinned package dependency and include it
+    in dependency/security update review.
+
+[O-22] CHANGE/REMOVE
+    Remove v2 peer-history packets, roster flooding, unused rekey-store behavior,
+    and advisory-only fields. Implement and consult public descriptor
+    historyPolicy and relay recommendations. Public metadata becomes an active,
+    signed packet path. Rekey action becomes a validated transition type.
+
+
+================================================================================
+15. IMPLEMENTATION WORK PLAN
+================================================================================
+
+[I-01] Types and cryptography
+    - Add v3 packet/envelope types and bounded validators.
+    - Add private-message, sealed-envelope, quick-message, and metadata signatures.
+    - Add room routing, per-room Nostr identity, and WebRTC rendezvous derivations.
+    - Add strict epoch-chain and capability-rotation verification.
+
+[I-02] Relay service
+    - Build one shared RelayPool with reconnect, multiplexed subscriptions,
+      positive-OK tracking, quorum, cursor overlap, relay diagnostics, and outbox.
+    - Keep event-kind and relay policies configurable.
+    - Make @noble/secp256k1 a direct dependency.
+
+[I-03] Room session
+    - Make Nostr send/receive authoritative for private and public rooms.
+    - Persist before publish, deduplicate before decrypt/display, and validate
+      membership authorization.
+    - Remove v3 gossip, state chunks, and envelope-cache serving.
+    - Enforce 20-member private membership limit.
+
+[I-04] WebRTC
+    - Refactor Trystero into ForegroundPrivateAccelerator.
+    - Use secret-derived room ID/password, one foreground session, global cap,
+      identical envelopes, no flood, and non-blocking failure behavior.
+
+[I-05] Public directory
+    - Use per-room stable publisher keys and actual OK acknowledgments.
+    - Implement short-lived room-presence records and approximate count ranges.
+    - Honor historyPolicy and signed relay suggestions.
+
+[I-06] Presence and inbox
+    - Introduce per-contact presence capabilities.
+    - Sign seals and quick messages.
+    - Retain signed invitations/responses with v3 version checks and revocation.
+
+[I-07] Persistence and migration
+    - Upgrade IndexedDB without dropping visible user data.
+    - Add outbox, dedup, relay cursors, membership heads, and capability generation.
+    - Keep v2 room records on the legacy path; default new rooms to v3.
+
+[I-08] User interface
+    - Separate relay connectivity from direct acceleration state.
+    - Display pending/relayed/failed message state accurately.
+    - Explain public readability and private metadata exposure.
+    - Offer locked-vault mode and show current storage protection.
+    - Show approximate public occupancy and private-room 20-member limit.
+
+
+================================================================================
+16. REQUIRED TESTS AND ACCEPTANCE CRITERIA
+================================================================================
+
+[Q-01] Transport independence
+    With WebRTC completely disabled, two private members exchange live and
+    offline messages, approve a join, rekey, remove a member, rotate capability,
+    and recover history using Nostr alone.
+
+[Q-02] Dual delivery
+    The same packet arriving first by WebRTC and later from five Nostr relays is
+    displayed and persisted exactly once. Reverse arrival order behaves the same.
+
+[Q-03] Foreground switching
+    Switching repeatedly among several private rooms never leaves more than one
+    Trystero room active and never interrupts Nostr delivery to background rooms.
+
+[Q-04] Relay failures
+    Verify operation with individual relays offline, read-only, write-rejecting,
+    slow, replaying, and returning events out of order. Quorum and UI state remain
+    accurate.
+
+[Q-05] Membership security
+    Reject forged private senders, invalid epoch parents, illegal member changes,
+    over-20 membership, stale branches, absent key slots, and unauthorized
+    metadata changes.
+
+[Q-06] Strong removal
+    A removed member with the old roomSecret, root key, epoch key, routing tag,
+    invite URL, and complete old relay history cannot derive the new route or
+    decrypt new content. An offline remaining member can recover the rotation.
+
+[Q-07] Input bounds
+    Oversized, deeply nested, duplicate-ID/conflicting-content, malformed Base64,
+    far-future, stale-live, and signature-invalid packets are rejected without
+    blocking the UI or amplifying traffic.
+
+[Q-08] Directory and occupancy
+    Descriptor refresh replaces across reloads, tombstones suppress listings,
+    only relay OK counts as publication, duplicate presence events across relays
+    count once, and expired presence ages out.
+
+[Q-09] Compatibility
+    Existing v2 rooms remain available through the legacy path. New v3 rooms do
+    not silently partition or exchange partially understood packets with v2
+    clients.
+
+[Q-10] Storage migration
+    Upgrade from IndexedDB version 6 preserves profile, friends, conversations,
+    favorites, invites, keys, and messages. Failed migration is recoverable and
+    never clears stores automatically.
+
+
+================================================================================
+END OF PROTOCOL REVISION
+================================================================================

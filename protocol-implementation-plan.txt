@@ -1,0 +1,1360 @@
+================================================================================
+AIRCOMIC -- airthread/3 IMPLEMENTATION PLAN
+================================================================================
+
+Target:      airthread/3, Nostr-authoritative transport
+Basis:       protocol-revision.txt (the approved proposal)
+Reference:   protocols.txt (as-built description of the airthread/2 system)
+Written:     2026-09-05
+Executed by: a later session, starting cold
+
+
+================================================================================
+0. HOW TO USE THIS DOCUMENT
+================================================================================
+
+This plan is written to be executed by a session that has NOT read the other two
+documents cover to cover. Everything needed to write the code is restated here.
+The other documents are still the authority on intent:
+
+    protocol-revision.txt   what we agreed to build, tagged [R-xx] [T-xx]
+                            [P-xx] [D-xx] [W-xx] [PR-xx] [PU-xx] [H-xx]
+                            [N-xx] [M-xx] [A-xx] [S-xx] [Q-xx]
+    protocols.txt           what exists today, tagged [K-xx] [P-xx] [T-xx]
+                            [F-xx] [G-xx] [H-xx] [N-xx] [O-xx], plus a
+                            file:line implementation map in its section 13
+
+    When this plan cites a tag like [PR-07] it means protocol-revision.txt.
+    Citations to the old system are written "v2 [O-05]" or with a file:line.
+
+Session bootstrap, in order:
+    1. Read this file completely.
+    2. Read section 2 (LOCKED DECISIONS) and section 3 (OPEN QUESTIONS). If any
+       item in section 3 is still unanswered, ask the user before starting the
+       phase that depends on it -- section 3 says which phase each blocks.
+    3. Read protocol-revision.txt sections 3-13 for the reasoning behind any
+       spec in section 5 you find surprising.
+    4. Work the phases in section 6 in order. Do not start a phase before its
+       stated preconditions hold.
+
+Project facts the implementer needs immediately:
+    - Repo root /data/air-comic, branch main, git user eglass1.
+    - React 19 + MUI 7 + TypeScript 5.9, Vite 7, `strict: true`.
+    - Build: `npm run build` (runs `tsc` then vite). This is the only automated
+      correctness gate that exists today.
+    - Output is a single self-contained docs/index.html plus PWA companions.
+    - `npm run dev` for a dev server; `npm run preview` to exercise the PWA.
+    - Node v24 is available, so WebCrypto and Vitest both work in-process.
+    - There is currently NO test framework. Section 8 proposes adding one.
+
+
+================================================================================
+1. SCOPE AND THE CUTOVER DECISION
+================================================================================
+
+[C-01] CLEAN CUTOVER -- THIS OVERRIDES THE PROPOSAL
+    The user has ruled that backward compatibility is NOT a consideration.
+    Nothing migrates. This supersedes these parts of protocol-revision.txt:
+
+        [V-02] "Existing v2 rooms remain usable through a legacy compatibility
+               implementation"                                     -> DROPPED
+        [V-04] Migration / "Create v3 replacement" flow             -> DROPPED
+        [S-01] "Existing profile, friends, messages, keys, favorites,
+               invitations, and preapprovals receive explicit migration rather
+               than deletion"                                      -> DROPPED
+        [I-07] "Keep v2 room records on the legacy path"            -> DROPPED
+        [Q-09] Compatibility test                                   -> DROPPED
+        [Q-10] Storage migration test              -> REPLACED, see [Q-10']
+
+    Consequences, all intended:
+      - No `protocolVersion` branch anywhere in the code. There is one protocol.
+      - No legacy RoomSession, no v2 packet types, no v2 verifiers.
+      - v2 wire constants, domain tags and KDF strings are deleted, not kept
+        alongside v3 ones.
+      - A fresh IndexedDB database is used. See [C-02].
+      - Existing users lose local history, friends, favourites and their
+        identity keypair on first run of the new build. Accepted.
+
+[C-02] STORAGE: NEW DATABASE, NO UPGRADE PATH
+    Use a new database name `AirComicDB_v3` at version 1, with a fresh
+    `onupgradeneeded` that creates every store from scratch. Do NOT write
+    migration branches against `AirComicDB_v2`.
+
+    Optionally delete the old database on first successful open of the new one
+    (`indexedDB.deleteDatabase('AirComicDB_v2')`) so stale data does not sit in
+    the browser forever. Do this AFTER the new DB opens successfully, never
+    before, and never as a precondition.
+
+    Because the profile store starts empty, a new identity keypair is generated
+    on first run, so participantId changes and friends lists start empty. This
+    is the accepted meaning of "clean cutover". Nothing in the code should try
+    to detect or repair the old state.
+
+[Q-10'] Replacement acceptance test for [Q-10]
+    First run against a browser profile that already holds `AirComicDB_v2`
+    completes normally: the new DB is created, a new identity is generated, the
+    app is usable, and no error surfaces from the presence of the old database.
+
+[C-03] What is NOT in scope for this work
+    - Comic rendering, avatar/backdrop parsing, emotion engine, layout: untouched.
+    - MLS or any group ratchet. [PR-08]/[O-16] defer this explicitly.
+    - Replacing RSA-OAEP with ECDH/HPKE. [O-15] defers this explicitly.
+    - Blob/asset storage for images and audio. [P-04] and [W-07] describe the
+      shape; no such feature exists today and none is being added. Implement the
+      size limits that forbid embedding large assets, and nothing more.
+    - Padding / cover traffic. [N-05] defers this.
+    - NIP-29 relay-managed moderation. [PU-06] defers this.
+    - Push notifications. The service-worker scaffolding stays as it is.
+
+
+================================================================================
+2. LOCKED DECISIONS
+================================================================================
+
+These resolve ambiguities and internal gaps in protocol-revision.txt. They are
+settled; do not re-litigate them during implementation. Each says why.
+
+[L-01] Wire naming stays `airthread/3`
+    Per [V-01] and [O-20]. All domain tags, KDF info strings and extension names
+    use `airthread`. The product is still AirComic. No renaming pass.
+
+[L-02] routingKey is fed into routingTag as its Base64URL text
+    [T-04] writes `routingTag = Base64URL(SHA-256("airthread-v3-room:" +
+    routingKey))` without saying how the 256-bit routingKey enters a string
+    concatenation. Ruling: routingKey is Base64URL-encoded first, then
+    concatenated as text, then the whole string is UTF-8 encoded and hashed.
+    Pin this in a single helper so it cannot drift.
+
+[L-03] Per-room Nostr key derivation uses jwk.d as raw HMAC key material
+    [T-06] says `HMAC-SHA-256(key = raw private ECDSA scalar material, data =
+    "airthread-nostr-room-v3:" + routingTag)`. Ruling: the scalar is the P-256
+    private key JWK's `d` member, Base64URL-decoded to its 32 raw bytes, imported
+    as an HMAC-SHA-256 key. Rejection loop on out-of-range scalars re-hashes as
+    `HMAC(key, prevSeed || counterByte)` with counter starting at 0, max 32
+    attempts, then throw. This mirrors the existing v2 helper's structure
+    (crypto.ts:1341 deriveNostrSecretKey) so the shape is familiar.
+
+[L-04] A GenesisPacket is added; the proposal requires one but never defines it
+    [M-01] refers to "the room genesis packet" and [PR-04] requires every epoch
+    transition to name a validated parent, so the chain needs a root. Define
+    `RoomGenesisPacket` -- see spec [X-07]. Epoch 1's parent is the genesis
+    packet id.
+
+[L-05] Genesis and the epoch chain need stable discoverability
+    [T-03] gives immutable packets `d = packetId`, which makes them
+    unlistable except by scanning the routing tag. A joiner needs the genesis
+    packet and the current epoch head without replaying the entire room.
+    Ruling:
+      - Genesis is published with the stable tag `d = "genesis:" + routingTag`
+        so it is retrievable in one query, and republished verbatim (same
+        packetId, re-signed Nostr event) onto every new route after a
+        capability rotation.
+      - Control packets (`packetClass: 'control'`) carry NO `expiration` tag,
+        so relays are asked to keep them for the life of the room. The
+        authoritative durable copy is still the local `membershipHeads` store.
+      - The epoch chain is rebuilt by querying the routing tag filtered to
+        control packets and walking from genesis. Rekeys are rare, so this is
+        cheap. Do NOT add a mutable "current head" pointer event: it would be
+        forgeable and racy, and the chain rules already give a deterministic
+        answer.
+
+[L-06] Retention class for control packets overrides [T-09]
+    [T-09] lists "chat/control history 30 days". Ruling: chat gets 30 days;
+    control gets no expiration tag, per [L-05]. Membership must remain
+    reconstructible longer than chat.
+
+[L-07] Presence capability is ONE per user, rotated on revoke -- not one per contact
+    [N-01] says "Each accepted contact MAY receive a distinct capability" and
+    then "Revoking a contact rotates capabilities for the remaining authorized
+    contacts". Per-contact capabilities would require publishing one presence
+    event per contact every republish interval, which scales badly and gains
+    little. Ruling: a single presence capability per user, with a generation
+    counter, distributed sealed to each authorized contact, rotated and
+    redistributed to the remaining contacts on revocation. One presence event
+    per republish, exactly as today. See spec [X-11].
+
+[L-08] Inbox tags remain derived from participantId
+    [N-01] changes PRESENCE tags to capabilities. It does not change inbox tags,
+    and [N-05] explicitly accepts that "inbox tags and event timing remain
+    observable". Ruling: `inboxTag = Base64URL(SHA-256("airthread-inbox-v3:" +
+    participantId))`, same construction as v2 with a v3 domain separator. This
+    preserves the ability to send a sealed invitation to anyone whose contact
+    card you hold, which is how the friend relationship is bootstrapped in the
+    first place. Flagged for confirmation as [U-02].
+
+[L-09] Public room presence carries no inner application signature
+    [PU-04] shows a `"signature": "<application signature>"` field on a record
+    whose stated purpose is pseudonymity. An ECDSA identity signature there
+    would defeat the pseudonymity; a signature by the room-scoped Nostr key
+    would duplicate the Nostr event signature. Ruling: drop the inner
+    signature. `presenceId` IS the room-scoped Nostr public key (hex), the
+    Nostr event's Schnorr signature is the authentication, and occupancy is
+    counted as distinct valid unexpired publisher pubkeys. Note that in a public
+    room the same room-scoped key also publishes that user's messages, whose
+    envelopes carry the real participantId -- so this is pseudonymity ACROSS
+    rooms, not within one. Document that in the UI copy.
+
+[L-10] `isSecretMissing` / MissingSecretDialog is retained
+    Joining by `?id=` with no `#secret=` is still possible (a truncated or
+    stripped link). In v3 the consequence is stronger: without the secret the
+    client cannot even compute the routing tag, so it sees nothing at all rather
+    than sitting unapproved on a mesh. Keep the dialog, update the copy.
+
+[L-11] Public rooms are unencrypted end to end
+    Per [P-01]/[PU-01]. `derivePublicTransportKey` and the whole `public-v2` key
+    record are deleted. Public envelopes carry `iv: ""` and
+    `data = Base64URL(UTF8(canonical payload))`. The publicJoinToken survives
+    only as the input to publicRoomId and as the "you have the link" token; it
+    is no longer key material.
+
+[L-12] Message send is persist-then-publish, and optimistic in the UI
+    Per [D-01]. The local message record appears immediately with state
+    `pending`, flips to `relayed` on quorum, `failed` after the retry budget is
+    exhausted. The UI must show this; see phase 8. `sent` never means "read".
+
+[L-13] Deduplication is `(convId, packetId)` with a content hash
+    Per [D-02]. contentHash = Base64URL(SHA-256(exact serialized RoomEnvelope
+    bytes as published)). A second arrival with the same key and a different
+    hash is a collision: keep the first, count it, never render the second.
+
+[L-14] One RelayPool singleton owns every WebSocket
+    Per [T-01]. PresenceService and PublicDirectoryService stop opening their
+    own sockets and become clients of the pool. This removes the current
+    situation where three subsystems independently open sockets to the same
+    five relays.
+
+[L-15] Trystero keeps its own relay sockets
+    Trystero opens its own connections and cannot be pointed at the RelayPool
+    without forking it. That is acceptable because WebRTC is now optional, at
+    most one private room at a time [R-03], and it is off by default when
+    unavailable. Do not attempt to unify the two.
+
+[L-17] The 20-member figure is a SOFT WebRTC threshold, not a protocol cap
+    RESOLVES [U-05], and OVERRIDES [R-04] of protocol-revision.txt, which said
+    "Private rooms have a protocol membership limit of 20 participants."
+    The user has ruled: there is no protocol membership cap. 20 is only the
+    point past which WebRTC acceleration stops being attempted and the room
+    runs on Nostr alone, which it can always do.
+
+    Consequences:
+      - Epoch-chain validation does NOT reject a members array for being
+        larger than 20. See the amended clause (f) in [X-07].
+      - There IS still a hard structural bound, imposed by the envelope size
+        limit rather than by policy. A RekeyPacket carries one RSA-OAEP-2048
+        slot per member: 256 bytes -> 344 base64url chars, plus a 43-char
+        participantId key and JSON punctuation, ~440 bytes per member once the
+        members array is counted too. Against MAX_ENVELOPE_BYTES of 60 KiB that
+        allows roughly 137 members, so the validator caps members at
+        MAX_PRIVATE_MEMBERS_HARD = 128 with the envelope limit as the reason.
+        Exceeding it is a structural rejection, not a membership policy.
+      - The accelerator threshold is WEBRTC_MEMBER_THRESHOLD = 20 [W-01].
+      - No "room is full" UI state. Approve is never disabled for headcount.
+      - Acceptance test [Q-05]'s "over-20 membership" case is replaced by
+        "over-128 membership is structurally rejected", and a new case: a room
+        of 21+ members keeps working with accelerationStatus 'unavailable'.
+
+[L-16] Delete rather than deprecate
+    Every v2-only construct listed in section 7 is deleted in the phase that
+    replaces it. Do not leave dead code behind a flag.
+
+
+================================================================================
+3. OPEN QUESTIONS FOR THE USER
+================================================================================
+
+ALL FIVE ARE ANSWERED (2026-09-06). The answers are recorded inline below.
+[U-05] deviates from the recommendation and is promoted to a locked decision as
+[L-17]; the other four match the recommended defaults.
+
+[U-01] Add a test framework?  (blocks phase 1, but only for the test files)
+    The epoch-chain validator, bounded structural validator, dedup, quorum and
+    all KDFs are pure functions, and getting them wrong is silent and severe.
+    Recommendation: add Vitest as a devDependency with a `npm test` script and
+    unit tests for src/services/v3/crypto*, validators and the chain rules.
+    Node 24 provides WebCrypto, so no browser environment is needed.
+
+ANSWER: add it
+
+[U-02] Confirm inbox tags stay participantId-derived  (blocks phase 6)
+    See [L-08]. The alternative -- capability-gated inboxes -- would mean you
+    can only be invited by someone you have already exchanged capabilities with,
+    which changes how friends are bootstrapped.
+
+ANSWER: participantId-derived
+
+[U-03] Default relay list and user configurability  (blocks phase 2)
+    [T-01] requires the relay list to be user-configurable. Today it is a
+    hard-coded list of 5 preferred + 6 trystero defaults (protocols.txt [T-05]).
+    Questions: keep the same 5 as the shipped default? Where does the user edit
+    the list -- a new section in the Security dialog, or a new Relays dialog?
+
+ANSWER: keep the current 5 preferred relays as the default set, add editing to the existing SecurityDialog, persist in the new `settings` store.
+
+[U-04] Locked vault mode -- now or later?  (blocks phase 7 sizing)
+    [S-02] defines Convenience mode (today's behaviour) and Locked vault mode
+    (Argon2id-wrapped secrets). Locked vault needs a passphrase prompt on every
+    cold start, a new dependency for Argon2id, and a recovery story.
+    Recommendation: implement Convenience mode only in this pass, but lay the
+    store shape out so vault mode is additive (a `vault` store and a
+    `storageMode` field that is always 'convenience' for now), and put the
+    honest disclosure text in the Security dialog.
+
+ANSWER: convenience only, with the disclosure text.
+
+[U-05] Private room member cap UI  (blocks phase 8)
+    [R-04] sets a hard protocol cap of 20 private members. What should the UI do
+    at the cap -- grey out approve with a reason, or hide the prompt?
+
+ANSWER: SOFT limit of 20; WebRTC is only used for the active private room, for convenience; if exceeded, falls back to Nostr
+
+
+================================================================================
+4. TARGET FILE LAYOUT
+================================================================================
+
+New tree under src/services. The v3 code lives in its own directory so that the
+deletion pass in section 7 is unambiguous.
+
+    src/services/
+      nostr/
+        relayPool.ts          NIP-01 client: sockets, REQ/EVENT/OK/EOSE/CLOSED,
+                              subscription multiplexing, reconnect+backoff,
+                              publish quorum, per-relay health
+        nostrEvent.ts         event construction, id hashing, Schnorr signing,
+                              tag helpers, kind constant
+        outbox.ts             durable pending-publish queue over IndexedDB,
+                              retry with backoff+jitter, state transitions
+        subscriptions.ts      filter builders and batching by routing tag
+      v3/
+        constants.ts          every domain tag, KDF info string, kind, limit,
+                              timeout and retention value -- single source
+        keys.ts               all HKDF/HMAC derivations, per-room Nostr identity
+        envelope.ts           RoomEnvelope build/sign/verify/encrypt/decrypt
+        packets.ts            inner packet builders + verifiers (v3)
+        validate.ts           bounded structural validator, size/depth limits
+        epochChain.ts         membership transition validation, fork resolution
+        dedup.ts              (convId, packetId) ledger with content hashes
+        roomSession.ts        the v3 room state machine
+        accelerator.ts        ForegroundPrivateAccelerator (Trystero wrapper)
+        presence.ts           contact-capability presence over the RelayPool
+        directory.ts          public room directory + room occupancy
+        types.ts              every v3 wire type
+      crypto.ts               RETAINED, reduced: primitives only (see section 7)
+      db.ts                   rewritten for AirComicDB_v3
+      relays.ts               rewritten: default list + user config accessor
+      pwa.ts                  untouched
+
+Deleted outright (section 7 has the full list):
+    src/services/trystero.ts          -> replaced by v3/accelerator.ts
+    src/services/roomSession.ts       -> replaced by v3/roomSession.ts
+    src/services/presence.ts          -> replaced by v3/presence.ts
+    src/services/publicDirectory.ts   -> replaced by v3/directory.ts
+
+Rewritten in place:
+    src/types/index.ts                -> v3 types only, re-exporting v3/types
+    src/context/ChatContext.tsx       -> wired to the v3 session API
+    src/services/db.ts, relays.ts
+
+Touched for UI only (phase 8):
+    src/components/Navbar.tsx, Sidebar.tsx, ChatArea.tsx, MessageItem.tsx,
+    SecurityDialog.tsx, JoinRequestsDialog.tsx, MissingSecretDialog.tsx,
+    PublicRoomsDialog.tsx, CreatePublicRoomDialog.tsx, FriendsDialog.tsx,
+    ContactCardDialog.tsx, App.tsx
+
+
+================================================================================
+5. SPECIFICATIONS
+================================================================================
+
+Everything in this section is normative for the implementation. Where a value
+comes straight from protocol-revision.txt the tag is cited; where this plan is
+filling a gap it is marked NEW.
+
+--------------------------------------------------------------------------------
+[X-01] Constants -- src/services/v3/constants.ts
+--------------------------------------------------------------------------------
+    PROTOCOL              = 'airthread/3'
+    EXT_TRANSPORT         = 'airthread/3-nostr-transport'
+    EXT_PUBLIC_ROOMS      = 'airthread/3-public-rooms'
+    EXT_PRESENCE          = 'airthread/3-presence'
+    TRYSTERO_APP_ID       = 'airthread-protocol-v3'
+    NOSTR_KIND            = 30078                       [T-02] configurable
+
+    Nostr tag names:      d, t, r, m, v, expiration     [T-03]
+    T_ROOM_PACKET         = 'aircomic-room-packet'
+    T_PUBLIC_ROOM         = 'aircomic-public-room'
+    T_PUBLIC_PRESENCE     = 'aircomic-public-presence'
+    T_USER_PRESENCE       = 'aircomic-user-presence'
+    T_INBOX               = 'aircomic-inbox'
+
+    Publish policy                                       [T-07]
+      PUBLISH_TARGET_RELAYS   = 5
+      PUBLISH_QUORUM          = 2   (1 when only one relay is configured)
+      PUBLISH_TIMEOUT_MS      = 5000
+      PUBLISH_MAX_ATTEMPTS    = 8
+      PUBLISH_BACKOFF_BASE_MS = 2000, doubling, jitter +/-25%, cap 300000
+
+    Retention (expiration tag, seconds)                  [T-09] as amended [L-06]
+      CHAT_RETENTION_SEC        = 30 * 24 * 3600  (room-configurable)
+      CONTROL_RETENTION         = none -- omit the expiration tag   [L-05][L-06]
+      PUBLIC_ROOM_PRESENCE_SEC  = 120
+      USER_PRESENCE_SEC         = 900
+      QUICK_MESSAGE_SEC         = 3600
+      INVITE_SEC                = 7 * 24 * 3600
+      PUBLIC_DESCRIPTOR_SEC     = 1800, refreshed every 600 s
+
+    Cadences
+      PUBLIC_PRESENCE_REFRESH_MS = 45000               [PU-04]
+      USER_PRESENCE_REFRESH_MS   = 120000
+      USER_PRESENCE_FRESH_MS     = 330000
+      DIRECTORY_REFRESH_MS       = 600000
+
+    Bounds                                               [P-04]
+      MAX_NOSTR_EVENT_BYTES   = 65536
+      MAX_ENVELOPE_BYTES      = 61440
+      MAX_CHAT_TEXT_BYTES     = 8192
+      MAX_JSON_DEPTH          = 16
+      MAX_OBJECT_KEYS         = 128
+      MAX_ARRAY_ELEMENTS      = 256
+      MAX_PRIVATE_MEMBERS_HARD   = 128   structural only, see [L-17]
+      WEBRTC_MEMBER_THRESHOLD    = 20    acceleration eligibility [W-01][L-17]
+      MAX_WEBRTC_PEERS           = 20    global peer cap          [W-01]
+
+    Timestamp acceptance                                 [D-04]
+      LIVE_FUTURE_SKEW_MS  = 300000
+      LIVE_PAST_WINDOW_MS  = 3600000   (older -> history path, not live)
+
+    Rotation                                             [PR-07]
+      OLD_ROUTE_MONITOR_MS = 30 * 24 * 3600 * 1000
+
+    Signature domain tags (all v3)
+      AIRTHREAD_ROOM_ENVELOPE_V3:        [P-02]
+      AIRTHREAD_PRIVATE_MESSAGE_V3:      [PR-02]
+      AIRTHREAD_PUBLIC_MESSAGE_V3:
+      AIRTHREAD_GENESIS_V3:              NEW, [L-04]
+      AIRTHREAD_REKEY_V3:
+      AIRTHREAD_CAPABILITY_ROTATION_V3:  NEW, [PR-07]
+      AIRTHREAD_JOIN_REQUEST_V3:
+      AIRTHREAD_JOIN_DECISION_V3:
+      AIRTHREAD_METADATA_V3:             [M-01]
+      AIRTHREAD_HELLO_V3:                [W-06]
+      AIRTHREAD_SEALED_ENVELOPE_V3:      [N-02]
+      AIRTHREAD_QUICK_MESSAGE_V3:        [N-03]
+      AIRTHREAD_ROOM_INVITE_V3:
+      AIRTHREAD_INVITE_RESPONSE_V3:
+      AIRTHREAD_PRESENCE_V3:
+      AIRTHREAD_CONTACT_CAPABILITY_V3:   NEW, [L-07]
+      AIRTHREAD_PUBLIC_ROOM_DESCRIPTOR_V3:
+      AIRTHREAD_PUBLIC_ROOM_TOMBSTONE_V3:
+      AIRTHREAD_PUBLIC_ROOM_METADATA_V3:
+      AIRTHREAD_RECOVERY_REQUEST_V3:     [H-02]
+
+--------------------------------------------------------------------------------
+[X-02] Key derivations -- src/services/v3/keys.ts
+--------------------------------------------------------------------------------
+Identity keypairs are UNCHANGED from v2: RSA-OAEP 2048 (SHA-256) for key
+transport, ECDSA P-256 (SHA-256) for signatures, participantId =
+Base64URL(SHA-256(SPKI of the signing key)). Reuse the existing generator and
+the normalizePublicKey / canonicalStringify helpers from crypto.ts verbatim.
+
+Room secret: 32 random bytes (256 bits) Base64URL, per [PR-01]. Note this is a
+change from v2's 128 bits.
+
+All room derivations are HKDF-SHA-256 with
+    IKM  = UTF-8(roomSecret.trim())
+    salt = SHA-256(UTF-8(<saltPrefix> + convId.trim().toLowerCase()))
+    L    = 256 bits
+
+    purpose        saltPrefix                    info
+    -----------    --------------------------    -------------------------------
+    root control   "airthread-v3-root:"          "airthread-private-root-key-v3"
+    routing        "airthread-v3-routing:"       "airthread-private-routing-v3"   [T-04]
+    webrtc room    "airthread-v3-webrtc:"        "airthread-private-webrtc-room-v3"   [W-02]
+    webrtc pass    "airthread-v3-webrtc:"        "airthread-private-webrtc-password-v3"   [W-02]
+
+    root control -> AES-GCM CryptoKey (control packets only, never chat) [PR-01]
+    routing      -> raw bits, then per [L-02]:
+                    routingKey = Base64URL(bits)
+                    routingTag = Base64URL(SHA-256(UTF-8(
+                        "airthread-v3-room:" + routingKey)))
+    webrtc room  -> Base64URL, passed to Trystero as roomId
+    webrtc pass  -> Base64URL, passed to Trystero as password
+
+Public rooms:
+    publicRoomId = Base64URL(SHA-256("airthread-public-room-v3:" +
+                                     convId.toLowerCase() + ":" + publicJoinToken))
+    routingTag   = publicRoomId                                          [T-05]
+    No transport key. No signalling password beyond what Trystero needs, and
+    public rooms never start Trystero at all.                            [R-03]
+
+Per-room Nostr publishing identity                        [T-06], ruled by [L-03]
+    dBytes = Base64URL-decode(signingPrivateKeyJwk.d)      // 32 bytes, P-256 scalar
+    hk     = importKey('raw', dBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign'])
+    seed0  = HMAC(hk, UTF-8("airthread-nostr-room-v3:" + routingTag))
+    for i in 0..31:
+        if 0 < BE(seed_i) < secp256k1_n: return seed_i
+        seed_{i+1} = HMAC(hk, seed_i || byte(i))
+    throw
+
+    Cache derived room keys in memory keyed by routingTag; the HMAC is cheap but
+    this runs on every publish.
+
+Inbox / presence tags
+    inboxTag        = Base64URL(SHA-256("airthread-inbox-v3:" + participantId))   [L-08]
+    responseTag     = inboxTag + "~r"
+    quickMsgTag     = inboxTag + "~qm"
+    presenceCapTag  = Base64URL(SHA-256("airthread-presence-cap-v3:" + capability))  [L-07]
+
+    The user's own inbox Nostr identity: derive as [T-06] with
+    routingTag replaced by the literal "inbox:" + participantId, so the inbox
+    publisher key is stable but distinct from every room key.
+
+Directory publishing identity                                            [PU-02]
+    Derive as [T-06] with routingTag = publicRoomId. Stable per public room,
+    which is what makes NIP-33 replacement work across reloads, and isolated
+    from presence and other rooms. This fixes v2 [O-08].
+
+--------------------------------------------------------------------------------
+[X-03] RoomEnvelope -- src/services/v3/envelope.ts
+--------------------------------------------------------------------------------
+Exactly the shape in [P-01]:
+
+    interface RoomEnvelope {
+      protocol: 'airthread/3'
+      extension: 'airthread/3-nostr-transport'
+      type: 'room_envelope'
+      convId: string
+      packetId: string          // uuid, globally unique, also the Nostr d tag
+      roomMode: 'private' | 'public'
+      packetClass: 'chat' | 'control' | 'metadata' | 'system'
+      keyId: string             // 'epoch-N-xxxxxxxx' | 'root-v3' | 'public-v3'
+      senderId: string          // participantId
+      senderSigningPublicKey: string
+      timestamp: number
+      iv: string                // base64url 12 bytes, or '' for public
+      data: string              // base64url ciphertext, or base64url(UTF8(json))
+      signature: string
+    }
+
+    AAD = "airthread/3:" + convId + ":" + packetId + ":" + roomMode + ":" +
+          packetClass + ":" + keyId + ":" + senderId + ":" + timestamp   [P-02]
+
+    Signature over AIRTHREAD_ROOM_ENVELOPE_V3: + canonicalStringify(envelope
+    minus signature) -- so it covers the ciphertext.                     [P-02]
+
+    Receive order is mandatory and must not be reordered              [P-02]:
+      1. byte-size check against MAX_ENVELOPE_BYTES
+      2. JSON.parse
+      3. bounded structural validation [X-04]
+      4. derive senderId from senderSigningPublicKey; reject on mismatch
+      5. verify the envelope ECDSA signature
+      6. check convId + roomMode match the room, and that the packet arrived on
+         that room's routing tag
+      7. timestamp acceptance [D-04]
+      8. dedup on (convId, packetId) [X-06]
+      9. authorization: is senderId a member of the canonical epoch applicable
+         at packet.timestamp?  [M-02]
+     10. only now decrypt and parse `data`
+
+    Steps 1-5 must complete before any decryption is attempted. Never decrypt to
+    decide whether to verify.
+
+--------------------------------------------------------------------------------
+[X-04] Bounded structural validator -- src/services/v3/validate.ts
+--------------------------------------------------------------------------------
+    validateStructure(value, opts): asserts bounds from [X-01] before anything
+    recursive touches the value.                                   [M-03][O-19]
+
+    Checks: max depth 16, max 128 keys per object, max 256 array elements,
+    no prototype-polluting keys (`__proto__`, `constructor`, `prototype`),
+    strings within a per-field byte cap, numbers finite and integral where the
+    schema says so.
+
+    Per-packet-type schemas declare required fields, optional fields, and
+    tighter array bounds (e.g. RekeyPacket.members max 128, per [L-17]).
+
+    `requiredExtensions?: string[]` on any signed packet: if present and any
+    entry is unknown to this build, REJECT the packet rather than partially
+    interpret it.                                                       [M-04]
+    Unknown optional fields are preserved through verification (they are inside
+    the signature) and then ignored.
+
+--------------------------------------------------------------------------------
+[X-05] Inner packet types -- src/services/v3/types.ts and packets.ts
+--------------------------------------------------------------------------------
+Every inner packet carries `senderSigningPublicKey` (or a role-named equivalent)
+and a `signature`, and every verifier re-derives the claimed participantId from
+that key. This is the uniform rule in v3; v2 had it on some packets only.
+
+    PlaintextMessagePayload      chat, both modes.  NOW SIGNED IN PRIVATE ROOMS
+                                 too, under AIRTHREAD_PRIVATE_MESSAGE_V3:  [PR-02]
+                                 Public uses AIRTHREAD_PUBLIC_MESSAGE_V3:.
+                                 Fields as v2 plus senderSigningPublicKey,
+                                 minus the v2 `keyId` duplication.
+    RoomGenesisPacket            NEW, [L-04]; see [X-07]
+    RekeyPacket                  gains parentPacketId; see [X-07]
+    CapabilityRotationPacket     NEW, [PR-07]; see [X-08]
+    JoinRequestPacket            as v2 with v3 tags
+    JoinDecisionPacket           as v2 with v3 tags
+    RoomMetadataPacket           NEW unified metadata packet, replaces the
+                                 unsigned ChannelTitlePacket and the never-used
+                                 PublicRoomMetadataPacket.  [M-01][O-18][O-22]
+                                 { convId, title?, description?, setterId,
+                                   setterSigningPublicKey, timestamp, signature }
+    IdentityHelloPacket          WebRTC only now. Adds `capabilities: string[]`.
+                                 [W-06]
+    RecoveryRequestPacket        NEW, [H-02]: { convId, wantedPacketIds[],
+                                 requesterId, requesterSigningPublicKey,
+                                 timestamp, signature }
+    SealedEnvelope               NOW SIGNED, [N-02]; see [X-10]
+    QuickMessagePayload          NOW SIGNED, [N-03]
+    RoomInvitePayload            as v2, v3 tags, plus capabilityGeneration
+    RoomInviteResponsePayload    as v2, v3 tags
+    PresencePacket               as v2, v3 tags; published to a capability tag
+    ContactCapabilityPacket      NEW, [L-07]; see [X-11]
+    PublicRoomDescriptorPacket   as v2, v3 tags
+    PublicRoomTombstonePacket    as v2, v3 tags
+    PublicRoomPresenceRecord     NEW, [PU-04]; see [X-12]
+
+    DELETED with no replacement: StateSummaryPacket, StateRequestPacket,
+    StateChunkPacket, RosterGossipPacket, ChannelTitlePacket.      [H-03][O-07]
+
+--------------------------------------------------------------------------------
+[X-06] Deduplication -- src/services/v3/dedup.ts
+--------------------------------------------------------------------------------
+    Key            `${convId}::${packetId}`                              [D-02]
+    Record         { key, convId, packetId, contentHash, senderId,
+                     packetTimestamp, firstSeenAt, retentionClass }
+    contentHash    Base64URL(SHA-256(the exact serialized envelope bytes))  [L-13]
+
+    Backed by the `processedPackets` IndexedDB store, not an in-memory FIFO.
+    Keep an in-memory LRU in front of it for the hot path.
+
+    Retention: chat records live at least CHAT_RETENTION + 7 days; control and
+    tombstone records live for the life of the room record.  This replaces v2's
+    pure-FIFO ledger and closes v2 [O-10].
+
+    Collision handling: same key, different contentHash -> keep the first valid
+    packet, increment a per-room `collisions` counter, log once, never render
+    the second.
+
+--------------------------------------------------------------------------------
+[X-07] Genesis and the epoch chain -- src/services/v3/epochChain.ts
+--------------------------------------------------------------------------------
+RoomGenesisPacket (NEW, [L-04])
+    { type:'room_genesis', protocol, convId, creatorId,
+      creatorSigningPublicKey, createdAt, metadataPolicy:'members'|'creator',
+      historyPolicy:'from_admission'|'share_history', maxMembers:20,
+      signature }
+    Signed AIRTHREAD_GENESIS_V3:. Published as a control envelope under the root
+    key with the stable Nostr d tag "genesis:"+routingTag [L-05]. Republished
+    verbatim onto each new route after a capability rotation.
+
+RekeyPacket v3
+    { type:'key', protocol, convId, packetId, keyId, epoch,
+      parentPacketId, parentKeyId,
+      action:'genesis_epoch'|'add'|'remove'|'rekey'|'reshare',
+      targetParticipantId?, targetScreenName?,
+      signerId, signerSigningPublicKey, signerScreenName, timestamp,
+      members: string[],                    // sorted, deduped, 1..20
+      keys: Record<participantId, base64url RSA-OAEP(raw 32-byte epoch key)>,
+      signature }
+    Signed AIRTHREAD_REKEY_V3:.
+
+Transition validity -- ALL must hold                                    [PR-04]
+    a. signature verifies and signerId === SHA-256(signerSigningPublicKey)
+    b. parentPacketId + parentKeyId name a locally validated epoch head,
+       or, for action 'genesis_epoch', name the genesis packet
+    c. epoch === parent.epoch + 1, except action 'reshare' where
+       epoch === parent.epoch and keyId === parent.keyId
+    d. signer was a member of the PARENT epoch
+       (for 'genesis_epoch': signer === genesis.creatorId)
+    e. action 'add'    : members === parent.members + {target}, exactly
+       action 'remove' : members === parent.members - {target}, exactly
+       action 'rekey'  : members === parent.members, exactly
+       action 'reshare': members === parent.members, no epoch change
+    f. 1 <= members.length <= MAX_PRIVATE_MEMBERS_HARD (128), no duplicates.
+       This is a structural bound from the envelope size limit, NOT a
+       membership policy -- see [L-17].
+    g. keys has exactly one slot per member, no extra slots
+    h. reshare is only valid for a participant already listed in that epoch
+
+Fork resolution                                                         [PR-05]
+    Two valid children of the same parent -> the child with the
+    lexicographically greatest packetId is canonical. Retain observed forks in
+    `membershipHeads` for audit; adopt only the canonical branch. A later
+    transition must name the canonical head. The UI should disable local approve
+    while a transition is in flight, as a reduction not a replacement.
+
+Storage: `membershipHeads` store, one record per convId, holding the validated
+chain (epoch -> {packetId, keyId, members, signerId, timestamp}), the canonical
+head, and observed forks.
+
+This closes v2 [O-04].
+
+--------------------------------------------------------------------------------
+[X-08] Capability rotation on removal -- [PR-07]
+--------------------------------------------------------------------------------
+CapabilityRotationPacket (NEW)
+    { type:'capability_rotation', protocol, convId, packetId,
+      generation: number,                  // increments per rotation
+      newEpoch, newKeyId, parentPacketId, parentKeyId,
+      removedParticipantId,
+      members: string[],                   // the remaining members, sorted
+      wrapped: Record<participantId, base64url RSA-OAEP(JSON{
+                  roomSecret: string, epochKey: string })>,
+      signerId, signerSigningPublicKey, timestamp, signature }
+    Signed AIRTHREAD_CAPABILITY_ROTATION_V3:.
+
+Flow:
+    1. Remover generates a fresh 256-bit roomSecret AND a fresh epoch key.
+    2. Derives the new root/routing/webrtc values from the new secret.
+    3. Builds the rotation packet, wrapping {newRoomSecret, newEpochKey} to each
+       remaining member's RSA public key.
+    4. Publishes it as a control envelope UNDER THE OLD ROOT KEY on the OLD
+       routing tag, so offline members find it where they are already looking.
+       The removed member can see the event but has no wrapped slot.
+    5. Publishes genesis verbatim onto the NEW routing tag [L-05], then
+       switches all publishing and subscriptions to the new tag.
+    6. Keeps a read-only subscription to the OLD tag for
+       OLD_ROUTE_MONITOR_MS (30 days), accepting ONLY rotation packets there.
+       No chat is accepted on a rotated-away route.
+    7. Revokes outstanding invitations for the old secret; new invitations carry
+       the new secret and the new generation.
+
+Receiver side: validate the chain step as a 'remove' transition, unwrap the
+slot, adopt the new secret, recompute derivations, resubscribe, bump the stored
+capability generation, and rewrite the room record + invite URL.
+
+An invite whose capabilityGeneration is older than the room's current generation
+is rejected even if its Nostr event is still stored.                     [N-04]
+
+This closes v2 [O-05].
+
+--------------------------------------------------------------------------------
+[X-09] RelayPool contract -- src/services/nostr/relayPool.ts
+--------------------------------------------------------------------------------
+One singleton. NIP-01 client verbs: EVENT, REQ, CLOSE inbound; EVENT, OK, EOSE,
+CLOSED, NOTICE outbound handling.
+
+    class RelayPool {
+      configure(urls: string[]): void            // hot-swappable [T-01]
+      getHealth(): RelayHealth[]                 // [A-01]
+      subscribe(spec: SubscriptionSpec): Subscription
+      publish(event: NostrEvent, opts?): Promise<PublishResult>
+      close(): void
+    }
+
+    interface RelayHealth {
+      url: string
+      connected: boolean      // socket open
+      writable: boolean       // a recent EVENT got OK
+      readable: boolean       // a subscription produced EOSE or events
+      rttMs: number | null
+      lastEventAt: number | null
+      backlog: number
+      lastError: string | null
+    }
+
+    interface PublishResult {
+      eventId: string
+      accepted: string[]      // relay urls that returned OK true
+      rejected: {url, reason}[]
+      failed: string[]        // timeout / socket error
+      quorumMet: boolean
+    }
+
+Rules:
+    - Only a positive OK naming the exact event id counts as acceptance.
+      Socket-open is NOT delivery.                            [T-07][PU-03][O-12]
+    - A relay rejection (OK false) is recorded distinctly from a network failure.
+    - Retry re-sends the byte-identical signed event with the same packetId.
+    - Subscriptions are multiplexed: many routing tags per REQ where the relay
+      allows it, split into bounded batches otherwise.                  [T-08]
+    - Reconnect recreates subscriptions with `since` = last committed timestamp
+      for that (relay, routingTag) minus an overlap window, from the
+      `relayCursors` store.                                             [T-08]
+    - Tolerate a relay refusing the configured kind: drop that relay from the
+      working set for that subscription, keep the rest.                 [T-02]
+    - Token buckets per room-scoped pubkey, senderId, routingTag and packet
+      class on the INBOUND side, to bound abuse.                        [A-02]
+
+Outbox (src/services/nostr/outbox.ts):
+    Every publish is written to the `nostrOutbox` store BEFORE the socket write
+    [D-01 step 3]. State machine: pending -> relayed | failed.
+    Retry loop with exponential backoff + jitter, capped attempts, survives
+    reload, cancellable while still pending.                            [A-05]
+
+--------------------------------------------------------------------------------
+[X-10] Signed sealed envelope -- [N-02]
+--------------------------------------------------------------------------------
+    interface SealedEnvelope {
+      type:'sealed', protocol, extension: EXT_PRESENCE,
+      recipientParticipantId, senderParticipantId,
+      senderSigningPublicKey,          // NEW
+      encryptedKey, iv, data, timestamp,
+      signature                        // NEW
+    }
+    Signed AIRTHREAD_SEALED_ENVELOPE_V3: over the canonical envelope minus
+    signature. Receiver derives senderParticipantId from senderSigningPublicKey,
+    verifies the signature, and only then attempts RSA-OAEP decryption.
+
+    Inner AES-GCM AAD keeps the v2 shape with the v3 protocol string:
+      "airthread/3-presence:" + recipient + ":" + sender + ":" + timestamp
+
+    This closes v2 [O-06] for the envelope; the quick-message half is closed by
+    signing QuickMessagePayload under AIRTHREAD_QUICK_MESSAGE_V3:.  [N-03]
+
+--------------------------------------------------------------------------------
+[X-11] Contact presence capabilities -- [N-01], ruled by [L-07]
+--------------------------------------------------------------------------------
+    Each user holds ONE presence capability with a generation counter:
+        { capability: base64url(32 random bytes), generation: number }
+    stored in the new `presenceCapability` record.
+
+    Publishing: one PresencePacket per refresh to
+        d = presenceCapTag(capability), t = T_USER_PRESENCE,
+        expiration = now + USER_PRESENCE_SEC
+    signed by the inbox-scoped Nostr key and by ECDSA as today.
+
+    Distribution: ContactCapabilityPacket (NEW)
+        { type:'contact_capability', protocol, extension: EXT_PRESENCE,
+          issuerId, issuerSigningPublicKey, capability, generation,
+          timestamp, signature }
+        signed AIRTHREAD_CONTACT_CAPABILITY_V3:, sent inside a SealedEnvelope
+        [X-10] to each authorized contact's inbox tag.
+
+    Sent when: a contact is added or an invitation is accepted (both directions
+    exchange capabilities), and on every rotation.
+
+    Rotation: removing/blocking a contact generates a new capability, bumps the
+    generation, and re-seals it to every REMAINING authorized contact. The
+    revoked contact is simply not sent the new one and their subscription to the
+    old tag goes quiet when the old presence event expires.
+
+    Subscribing: watch the capability tags of contacts who have given us one.
+    Contacts who have not are shown as "presence not shared" rather than offline.
+
+    This closes v2 [O-11].
+
+--------------------------------------------------------------------------------
+[X-12] Public room occupancy -- [PU-04], ruled by [L-09]
+--------------------------------------------------------------------------------
+    interface PublicRoomPresenceRecord {
+      type: 'public_room_presence'
+      protocol: 'airthread/3'
+      extension: 'airthread/3-public-rooms'
+      publicRoomId: string
+      presenceId: string        // hex room-scoped Nostr pubkey  [L-09]
+      observedAt: number
+      expiresAt: number
+    }
+    No inner signature [L-09]. Published with
+      d = "presence:" + publicRoomId, t = T_PUBLIC_PRESENCE,
+      expiration = now + 120, refreshed every 45 s,
+    signed as a Nostr event by the room-scoped key, which is what makes NIP-33
+    replacement per-publisher work.
+
+    Counting: distinct presenceId values across all relays, unexpired, deduped.
+    Display buckets [PU-04]: 0, 1-4, 5-9, 10-24, 25-99, 100-499, 500+.
+    Label it "approximately online". Never present it as capacity or admission.
+
+--------------------------------------------------------------------------------
+[X-13] v3 RoomSession contract -- src/services/v3/roomSession.ts
+--------------------------------------------------------------------------------
+Keep the observable shape close to today's so ChatContext and the components
+change as little as possible. Removed/added members are called out.
+
+    Unchanged public state: tabId, convId, roomMode, roomSecret,
+      publicJoinToken, publicRoomId, isInitialCreator, channelTitle,
+      participantsMap, messages, activeKeyId, activeEpoch, isApproved,
+      isRekeying, pendingJoinRequests, isSecretMissing
+
+    Changed:
+      connectionStatus        now means NOSTR status only        [W-04]
+      relayStatuses           now RelayHealth[] from the pool     [A-01]
+      rootFingerprint         now derived from the routing key, and renamed
+                              roomFingerprint
+
+    Added:
+      accelerationStatus: 'active' | 'partial' | 'unavailable' | 'disabled'
+      connectedPeersCount     retained, but now clearly accelerator-only
+      capabilityGeneration: number
+      memberCount  (no maxMembers -- there is no cap, see [L-17])
+      pendingSendCount, failedSendCount           [L-12]
+      approximateOccupancy: OccupancyBucket | null    (public rooms) [X-12]
+      collisions: number                              [X-06]
+
+    Removed: everything tied to gossip and peer history --
+      broadcastHello (still exists internally for WebRTC only, not public),
+      sendJoinRequest(targetPeerId) targeting, retryJoinRequest budget model,
+      refreshRelayStatuses and reconnectSignaling (superseded by pool-level
+      health and reconnect).
+      NOTE these two are surfaced by ChatContext as `refreshRelays` and
+      `reconnectRelays` and are consumed by SecurityDialog.tsx:55-74. Keep the
+      two ChatContext names, repoint them at RelayPool.getHealth() and a
+      pool-level reconnect, and update SecurityDialog to render RelayHealth
+      (connected/writable/readable) instead of the old four-state enum.
+
+    Methods: init, destroy, sendMessage, sendJoinRequest, approveJoinRequest,
+      declineJoinRequest, removeParticipant (now performs [X-08] rotation),
+      rekeyConversation, shareHistoryWith(participantId, epochs) [PR-09],
+      updateRoomMetadata, clearHistory, provideRoomSecret, setAutoApprove,
+      clearAutoApprove, setForeground(bool)  [R-03]
+
+    Removed: claimConversation. It is not a RoomSession method -- it is a
+      ChatContext alias for rekeyConversation (ChatContext.tsx:1569) consumed by
+      ChatArea.tsx:415 and Navbar.tsx:87 as a "claim this room" affordance. In
+      v3 the genesis packet establishes the creator and an unapproved client
+      cannot rekey at all, so remove the alias and both call sites in phase 8.
+
+--------------------------------------------------------------------------------
+[X-14] ForegroundPrivateAccelerator -- src/services/v3/accelerator.ts
+--------------------------------------------------------------------------------
+    Per [W-01]..[W-07]. A module-level singleton owning AT MOST ONE Trystero
+    room across the whole app.
+
+    activate(session) is a no-op unless ALL hold:
+      roomMode === 'private', session is foreground, isApproved,
+      memberCount <= WEBRTC_MEMBER_THRESHOLD (20), global peer cap not
+      exceeded, user setting enabled.
+    Above the threshold the room simply runs on Nostr with
+    accelerationStatus 'unavailable'. It is never blocked. [L-17]
+
+    Trystero config:
+      appId    TRYSTERO_APP_ID
+      roomId   the webrtc-room derivation from [X-02]     -- NOT convId   [W-02]
+      password the webrtc-password derivation from [X-02]                 [W-02]
+
+    Actions: exactly two -- 'hello' (signed IdentityHelloPacket, [W-06]) and
+    'env' (the byte-identical serialized RoomEnvelope, [P-03]).
+
+    Sending: one direct send per connected peer. NO re-flooding.          [W-05]
+    Receiving: hand the envelope to the same receive pipeline as Nostr; dedup
+    makes double delivery free.                                          [P-03]
+
+    Switching rooms calls leave() on the previous room before joining.    [W-03]
+    Any failure sets accelerationStatus and is never fatal.               [W-04]
+
+
+================================================================================
+6. PHASED WORK PLAN
+================================================================================
+
+Ten phases. Each states its precondition, what it produces, and a concrete
+done-when. `npm run build` must pass at the end of every phase -- the app may be
+non-functional mid-sequence, but it must compile. The only phase where the app is
+expected to be genuinely broken end-to-end is phase 5, which is why phases 5 and
+6 should be done back to back.
+
+Commit at the end of each phase with a message naming the phase.
+
+--------------------------------------------------------------------------------
+PHASE 0 -- Groundwork
+--------------------------------------------------------------------------------
+Precondition: none.
+Do:
+    - `npm i --save @noble/secp256k1@3.2.0` so it is a direct pinned dependency
+      rather than a transitive one.                             [O-21][I-02]
+    - If [U-01] is yes: `npm i -D vitest`, add `"test": "vitest run"` to
+      scripts, add vitest.config.ts with environment 'node'.
+    - Create the empty directory structure from section 4.
+    - Write src/services/v3/constants.ts in full from [X-01]. Nothing else
+      should ever hard-code these values.
+Done when: `npm run build` passes; `npm test` runs (even with zero tests);
+    `grep -rn "@noble/secp256k1" package.json` shows it as a direct dependency.
+
+--------------------------------------------------------------------------------
+PHASE 1 -- Crypto and validation core  (pure functions, fully testable)
+--------------------------------------------------------------------------------
+Precondition: phase 0.
+Do:
+    - src/services/v3/keys.ts: every derivation in [X-02].
+    - src/services/v3/validate.ts: the bounded validator from [X-04].
+    - src/services/v3/envelope.ts: build/sign/verify/encrypt/decrypt per [X-03],
+      including the mandatory receive ordering.
+    - src/services/v3/packets.ts + types.ts: every builder/verifier from [X-05].
+    - src/services/v3/epochChain.ts: the transition rules and fork resolution
+      from [X-07].
+    - src/services/v3/dedup.ts: the ledger from [X-06] (in-memory half now, the
+      IndexedDB half lands in phase 7 -- keep the store access behind an
+      injected interface so it can be tested without a browser).
+    - Reduce src/services/crypto.ts to primitives only: base64/base64url,
+      canonicalStringify, normalizePublicKey, getParticipantId,
+      getPublicKeyFingerprint, generateUserKeyPair, the key import helpers,
+      signData, verifySignature, encryptSymmetric/decryptSymmetric,
+      encryptAsymmetric/decryptAsymmetric, importRawAesKey,
+      generateNewConversationKey. Delete every v2 packet builder, verifier and
+      KDF from it (they move to v3/ in their v3 form).
+    - If [U-01] yes: unit tests for KDF vectors, envelope round-trip, AAD
+      tamper-rejection, every clause of the [X-07] transition rules, fork
+      resolution, the validator bounds, and dedup collision handling.
+Done when: build passes; tests pass; no file outside src/services/v3 and
+    src/services/crypto.ts contains a cryptographic constant.
+
+--------------------------------------------------------------------------------
+PHASE 2 -- RelayPool, outbox, subscriptions
+--------------------------------------------------------------------------------
+Precondition: phase 1; [U-03] answered.
+Do:
+    - src/services/nostr/nostrEvent.ts: event build, id = SHA-256 over the
+      canonical NIP-01 serialization array, Schnorr sign with a supplied secret
+      key, tag helpers.
+    - src/services/nostr/relayPool.ts: the full contract in [X-09]. Take care
+      with OK correlation (map event id -> pending publish), EOSE per
+      subscription, CLOSED handling, and reconnect with per-relay backoff.
+    - src/services/nostr/subscriptions.ts: filter builders, multi-tag batching.
+    - src/services/nostr/outbox.ts: the durable queue. It needs db.ts, so either
+      do phase 7's `nostrOutbox` store early or put the store access behind an
+      interface and wire it in phase 7. Prefer creating that ONE store now.
+    - Rewrite src/services/relays.ts: exported DEFAULT_RELAY_URLS plus
+      get/set accessors backed by the settings store, per [U-03].
+Done when: build passes; a scratch harness (a temporary dev-only route or a
+    node script in the scratchpad) can publish an event to the default relays
+    and read it back, and PublishResult reports accepted/rejected/failed
+    correctly against at least one deliberately bad relay URL.
+
+--------------------------------------------------------------------------------
+PHASE 3 -- v3 RoomSession, private rooms
+--------------------------------------------------------------------------------
+Precondition: phases 1-2.
+Do:
+    - src/services/v3/roomSession.ts implementing [X-13] for roomMode private.
+    - Room creation per [PR-01]: 256-bit secret, genesis packet, epoch 1 with
+      the creator as sole member, published before the room is usable. If epoch
+      init fails, disable sending -- never fall back to the root key.
+    - Send path per [D-01]/[L-12]: sign inner payload, build+encrypt+sign
+      envelope, persist as pending, publish, mark relayed on quorum.
+    - Receive path per [X-03] steps 1-10, then dispatch by packetClass.
+    - Join over Nostr per [PR-03]; approval per [PR-06]; decision per [P-04].
+    - Removal per [X-08] including old-route monitoring.
+    - History catch-up per [H-01]: subscribe with `since` from relayCursors,
+      paginate to the retention boundary, merge by (convId, packetId).
+    - Ordering per [D-03]: timestamp, then senderId, then packetId.
+    - Metadata per [M-01] with the genesis metadataPolicy enforced.
+Done when: build passes; two browser profiles can create a private room, invite
+    by URL, join, approve, exchange messages, rekey, remove a member with
+    rotation, and the removed profile stops seeing new traffic. WebRTC is not
+    involved at all in this phase.
+
+--------------------------------------------------------------------------------
+PHASE 4 -- Public rooms and directory
+--------------------------------------------------------------------------------
+Precondition: phase 3.
+Do:
+    - Public branch of v3/roomSession.ts: unencrypted signed envelopes [L-11],
+      routingTag = publicRoomId, no epochs, no roster, no join request.
+    - src/services/v3/directory.ts: descriptor publish/refresh/tombstone using
+      the per-room stable Nostr key from [X-02], acknowledged by real OK only
+      [PU-03]. Honour historyPolicy and merge signed relay suggestions with the
+      user's list [A-06][O-22].
+    - Room occupancy per [X-12], including the bucket display helper.
+Done when: build passes; a public room created on one profile appears in the
+    directory on another, messages flow, occupancy shows a plausible bucket, a
+    tombstone removes the listing, and a reload of the creator still REPLACES
+    its own descriptor rather than duplicating it.
+
+--------------------------------------------------------------------------------
+PHASE 5 -- WebRTC accelerator
+--------------------------------------------------------------------------------
+Precondition: phases 3-4.
+Do:
+    - src/services/v3/accelerator.ts per [X-14].
+    - Delete src/services/trystero.ts.
+    - Wire setForeground() from ChatContext tab switching.
+Done when: build passes; with two profiles in the same private room the
+    accelerator reports `active`, messages still arrive exactly once, and
+    disabling WebRTC entirely (or blocking STUN) leaves the room fully working
+    over Nostr with accelerationStatus `unavailable`.
+
+--------------------------------------------------------------------------------
+PHASE 6 -- Presence, invitations, quick messages
+--------------------------------------------------------------------------------
+Precondition: phase 2; [U-02] answered.
+Do:
+    - src/services/v3/presence.ts as a RelayPool client [L-14]: capability
+      publish/subscribe per [X-11], sealed inbox per [X-10].
+    - Contact capability issue + rotation, wired to add/remove friend.
+    - Signed quick messages [N-03], sealed inbox path primary, accelerator path
+      opportunistic and deduped by id.
+    - Invitations per [N-04] with capabilityGeneration checks.
+    - Delete src/services/presence.ts and src/services/publicDirectory.ts.
+Done when: build passes; two profiles that have exchanged capabilities see each
+    other's presence; a third that has not sees "presence not shared"; revoking
+    a contact rotates and the revoked side goes quiet within the expiry window;
+    an invite sent while the recipient is offline is delivered on their return;
+    a quick message with a tampered signature is rejected.
+
+--------------------------------------------------------------------------------
+PHASE 7 -- Persistence
+--------------------------------------------------------------------------------
+Precondition: phases 3-6 (the store shapes are known by then).
+Do:
+    - Rewrite src/services/db.ts for `AirComicDB_v3` version 1 per [C-02].
+      Stores:
+        profile, friends (now with contactCapability + generation),
+        messages (now with sendState and contentHash),
+        keys (epoch keys), conversations (per [S-01]: protocolVersion is always
+        '3', roomMode, roomSecret, capabilityGeneration, routingTag,
+        activeEpoch, activeKeyId, historyPolicy, metadataPolicy),
+        membershipHeads, processedPackets, nostrOutbox, relayCursors,
+        favorites, invites, preapprovals, quickMessageAcks,
+        settings (relay list, WebRTC enabled, storageMode), presenceCapability
+    - Delete the old v2 database after the new one opens, per [C-02].
+    - Retention sweeps: processedPackets by retentionClass, outbox by
+      expiration, quickMessageAcks and preapprovals by TTL as today.
+Done when: build passes; a browser profile holding AirComicDB_v2 starts cleanly
+    into the new build ([Q-10']); reload preserves rooms, keys, membership heads
+    and pending outbox entries; a pending send survives a reload and completes.
+
+--------------------------------------------------------------------------------
+PHASE 8 -- ChatContext and UI
+--------------------------------------------------------------------------------
+Precondition: phases 3-7; [U-04], [U-05] answered.
+Do:
+    - Rewrite src/context/ChatContext.tsx against the [X-13] API. The exported
+      context shape should change as little as possible; the notable additions
+      are accelerationStatus, pendingSendCount/failedSendCount,
+      approximateOccupancy, capabilityGeneration, memberCount/maxMembers.
+      Remove claimConversation.
+    - Rewrite src/types/index.ts to re-export v3 types; delete v2 types.
+    - UI work, per [I-08]:
+        Navbar/Sidebar    separate "Nostr: connected/reconnecting/offline" from
+                          "Direct: active/partial/unavailable". "Connected" must
+                          never mean "a WebRTC peer was found".      [W-04]
+        MessageItem       pending / relayed / failed indicator.      [L-12][D-05]
+        ChatArea          failed-send retry affordance.
+        SecurityDialog    relay list editor [U-03]; storage-mode disclosure
+                          [U-04]; room fingerprint; capability generation;
+                          honest content-vs-metadata wording.        [R-07]
+        JoinRequestsDialog  no headcount cap; Approve is never disabled
+                            for room size. Show member count plainly. [L-17]
+        PublicRoomsDialog   approximate occupancy buckets; "public means
+                            world-readable" warning.            [PU-01][PU-04]
+        CreatePublicRoomDialog  the same warning at creation time.
+        FriendsDialog / ContactCardDialog  presence-capability state:
+                            shared / not shared / revoked.
+        MissingSecretDialog  updated copy per [L-10].
+    - Delete src/services/roomSession.ts (v2).
+Done when: build passes; every screen renders; no component imports anything
+    from the deleted v2 modules; the two-profile private-room and public-room
+    flows work end to end through the real UI.
+
+--------------------------------------------------------------------------------
+PHASE 9 -- Deletion sweep and documentation
+--------------------------------------------------------------------------------
+Precondition: phase 8.
+Do:
+    - Work section 7's checklist to zero.
+    - `grep -rn "airthread/2\|root-v2\|public-v2\|epoch-.*-v2\|AIRTHREAD_.*_V2"
+      src/` must return nothing.
+    - Update README.md: the Security & P2P section currently describes the v2
+      model (WebRTC-first, dual keypair, gossip mesh). Rewrite it to describe
+      Nostr-authoritative transport, optional acceleration, the 20-member
+      private cap, public rooms being world-readable, and the honest
+      content-vs-metadata privacy statement [R-07].
+    - Regenerate protocols.txt to describe airthread/3 as built, keeping the
+      same tagged structure so it stays reviewable.
+    - Note in THIRD-PARTY-NOTICES.txt that @noble/secp256k1 is now direct.
+Done when: the greps are clean, README no longer describes v2 behaviour, and
+    `npm run build` produces a working docs/index.html.
+
+
+================================================================================
+7. DELETION CHECKLIST
+================================================================================
+
+Nothing here is kept behind a flag [L-16]. Tick each off in phase 9.
+
+Files deleted entirely:
+    [ ] src/services/trystero.ts                    (phase 5)
+    [ ] src/services/roomSession.ts                 (phase 8)
+    [ ] src/services/presence.ts                    (phase 6)
+    [ ] src/services/publicDirectory.ts             (phase 6)
+
+Concepts deleted:
+    [ ] StateSummaryPacket / StateRequestPacket / StateChunkPacket   [H-03][O-07]
+    [ ] RosterGossipPacket and all roster gossip                     [H-03]
+    [ ] envelopeCache history re-serving                             [H-03]
+    [ ] application-level re-flooding (forwardEnvelope)              [W-05][O-22]
+    [ ] ChannelTitlePacket (unsigned)          -> RoomMetadataPacket [O-18]
+    [ ] derivePublicTransportKey and the 'public-v2' key record      [L-11]
+    [ ] root key as a chat content key                               [O-03]
+    [ ] deriveRootKeyV2 / deriveTrysteroPassword / derivePublicRoomId(v2) /
+        derivePublicSignalingPassword                                [X-02]
+    [ ] derivePresenceTag / deriveInboxTag (v2 forms)                [X-02]
+    [ ] deriveNostrSecretKey (single global Nostr identity)          [T-06]
+    [ ] the 'rekeys' IndexedDB store (written, never read)           [O-22]
+    [ ] claimConversation                                            [X-13]
+    [ ] joinRequestAttempts budget model                             [PR-03]
+    [ ] every AIRTHREAD_*_V2 domain tag                              [X-01]
+    [ ] the whole AirComicDB_v2 schema and its upgrade branches      [C-02]
+
+Verification greps for phase 9:
+    grep -rn "airthread/2" src/
+    grep -rn "AIRTHREAD_[A-Z_]*_V2" src/
+    grep -rn "root-v2\|public-v2" src/
+    grep -rn "StateSummary\|StateRequest\|StateChunk\|RosterGossip" src/
+    grep -rn "AirComicDB_v2" src/          # only the delete call in db.ts
+    All must be empty except where noted.
+
+
+================================================================================
+8. TESTING AND ACCEPTANCE
+================================================================================
+
+Automated (Vitest, node environment, if [U-01] is yes). These are the cases
+where a silent bug is most costly and a unit test is cheapest:
+
+    keys.spec.ts        KDF outputs are stable and distinct across purposes;
+                        routingTag changes when the secret changes; per-room
+                        Nostr keys differ across rooms and are stable within one
+    envelope.spec.ts    round-trip; AAD tamper on every header field is rejected;
+                        signature covers the ciphertext; public envelopes carry
+                        iv:'' and decode without a key
+    validate.spec.ts    depth/keys/array/size limits; prototype-pollution keys;
+                        requiredExtensions rejection                    [M-04]
+    epochChain.spec.ts  every clause a-h of [X-07]; fork resolution picks the
+                        greatest packetId; reshare does not advance the epoch;
+                        a 129th member is rejected; a 21st member is NOT
+    dedup.spec.ts       same key + same hash is idempotent; same key + different
+                        hash is a flagged collision that never renders twice
+    rotation.spec.ts    [X-08] wrap/unwrap; removed member has no slot; an
+                        invite with a stale capabilityGeneration is rejected
+
+Manual acceptance, mapped to protocol-revision.txt section 16. Run these with
+two or three browser profiles. Sections [Q-09] and [Q-10] are dropped/replaced
+per [C-01].
+
+    [Q-01] Transport independence -- WebRTC fully disabled: live and offline
+           messaging, join approval, rekey, removal, rotation, history recovery,
+           all over Nostr alone.                                   phase 3+6
+    [Q-02] Dual delivery -- same packet by WebRTC then by relays, and the
+           reverse order: displayed and persisted exactly once.    phase 5
+    [Q-03] Foreground switching -- rapid switching among private rooms leaves
+           at most one Trystero room active and never stalls background Nostr
+           delivery.                                               phase 5
+    [Q-04] Relay failures -- offline, read-only, write-rejecting, slow,
+           replaying and out-of-order relays: quorum and UI state stay honest.
+           Simulate with a bad URL, a relay that rejects kind 30078, and by
+           pointing one entry at a local ws server that misbehaves.  phase 2+8
+    [Q-05] Membership security -- forged private sender, invalid epoch parent,
+           illegal member delta, over-128 membership, stale branch, missing
+           key slot, unauthorized metadata change: all rejected. A room of 21+
+           members works normally with acceleration 'unavailable'. [L-17]
+                                                                    phase 3+5
+    [Q-06] Strong removal -- a removed member holding the old secret, root key,
+           epoch key, routing tag, invite URL and full old relay history cannot
+           derive the new route or read new content; an offline remaining member
+           recovers the rotation on return.                        phase 3
+    [Q-07] Input bounds -- oversized, deeply nested, duplicate-id-conflicting,
+           malformed base64, far-future and signature-invalid packets are
+           rejected without blocking the UI or amplifying traffic.  phase 1+3
+    [Q-08] Directory and occupancy -- descriptor replaces across reloads,
+           tombstone suppresses, only OK counts as publication, duplicate
+           presence across relays counts once, expired presence ages out.
+                                                                    phase 4
+    [Q-10'] Fresh start over an existing AirComicDB_v2 profile.     phase 7
+
+
+================================================================================
+9. RISKS AND GOTCHAS
+================================================================================
+
+[G-01] Unique `d` tag per packet is unusual for NIP-33
+    [T-03] gives every immutable room packet its own `d`, which means one stored
+    parameterized-replaceable event per chat message. Some relays cap the number
+    of such events per pubkey or treat kind 30078 specially. Test early against
+    the real default relay set -- this is the single assumption most likely to
+    fail in the field. If a relay refuses, [T-02] already requires continuing
+    with the rest of the set; make sure that path actually works before phase 3
+    depends on it. If it fails broadly, the fallback is a regular (non-
+    replaceable) kind for immutable packets, keeping replaceable kinds only for
+    presence/descriptors/outbox -- treat that as a phase-2 finding, not a
+    phase-8 surprise.
+
+[G-02] Public relays will rate-limit a chat application
+    Every message is now a relay write. The default relays are community-run and
+    tuned for social posting. Expect throttling on bursts. The outbox retry and
+    the [A-02] token buckets are what keep this civil; do not remove them for
+    convenience during development, and do not test with tight loops against
+    public relays.
+
+[G-03] Epoch-chain rebuild depends on relays keeping control packets
+    [L-05]/[L-06] omit the expiration tag on control packets, but a relay may
+    still prune. The local `membershipHeads` store is the durable copy, and a
+    member who has never seen the chain and finds no control packets on any
+    relay simply cannot join -- they must be re-invited. Make that failure
+    explicit in the UI rather than a silent empty room.
+
+[G-04] The removal rotation has a delivery window
+    An offline member who never retrieves the rotation packet within
+    OLD_ROUTE_MONITOR_MS is stranded and must be re-invited. Surface this: after
+    a rotation, show which members have and have not adopted the new generation.
+
+[G-05] Losing the identity keypair is now more consequential
+    Presence capabilities, room secrets and epoch keys all hang off the profile.
+    Combined with [C-02] deleting the old database, be very sure the new-profile
+    path is correct before shipping, and keep the existing profile export/import
+    working.
+
+[G-06] Two send paths, one dedup ledger
+    [P-03] requires the byte-identical envelope on both transports. Any
+    re-serialization difference (key order, number formatting) between the Nostr
+    path and the WebRTC path produces a different contentHash and a spurious
+    collision. Serialize ONCE and pass the string to both.
+
+[G-07] Clock skew
+    [D-04] rejects packets more than 5 minutes in the future. A user with a badly
+    set clock becomes invisible. Log rejections with the delta so this is
+    diagnosable, and consider a one-line UI warning if many packets are rejected
+    for skew.
+
+[G-08] The single-file build
+    Everything ends up inlined in docs/index.html. Watch the bundle size as the
+    new services land; `assetsInlineLimit` is effectively unbounded, so nothing
+    will warn.
+
+[G-09] Do not regress the comic layer
+    Nothing in src/comic/ should change. If a type change in src/types/index.ts
+    ripples into it, adapt at the boundary rather than editing the comic code.
+
+
+================================================================================
+10. QUICK REFERENCE
+================================================================================
+
+Room addressing
+    private   routingTag = B64U(SHA-256("airthread-v3-room:" + B64U(HKDF(
+                             secret, "airthread-v3-routing:"+convId,
+                             "airthread-private-routing-v3"))))
+    public    routingTag = publicRoomId
+                         = B64U(SHA-256("airthread-public-room-v3:" +
+                                        convId + ":" + publicJoinToken))
+
+Nostr tags on a room packet
+    ["d", packetId]  ["t","aircomic-room-packet"]  ["r", routingTag]
+    ["m", roomMode]  ["v","3"]  ["expiration", secs]   (chat only)
+
+Envelope AAD
+    "airthread/3:" + convId + ":" + packetId + ":" + roomMode + ":" +
+    packetClass + ":" + keyId + ":" + senderId + ":" + timestamp
+
+Publish policy         5 target relays, quorum 2, 5 s timeout, 8 attempts
+Private member cap     20
+Dedup key              (convId, packetId) + contentHash
+Ordering               timestamp, senderId, packetId
+Live timestamp window  +5 min future, -1 h past
+
+Key files to open first in a new session
+    protocol-implementation-plan.txt   this file
+    protocol-revision.txt              sections 3-13 for rationale
+    protocols.txt                      section 13 for the v2 file:line map
+    src/services/crypto.ts             primitives being retained
+    src/services/roomSession.ts        the v2 state machine being replaced
+    src/context/ChatContext.tsx        the consumer that must keep working
+
+
+================================================================================
+END OF IMPLEMENTATION PLAN
+================================================================================
