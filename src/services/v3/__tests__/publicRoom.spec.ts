@@ -441,6 +441,138 @@ describe('directory -- [Q-08]', () => {
     const rooms = await directoryService.fetchRooms();
     expect(rooms.some((r) => r.name === 'Impostor')).toBe(false);
   }, 20000);
+
+  it('respawns an expired public room under the same ID when creator rejoins from saved state', async () => {
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const publicRoomId = await derivePublicRoomId(convId, joinToken);
+    const aliceDb = freshDb();
+
+    // 1. Creator creates and enters the public room
+    const firstSession = new RoomSession({
+      tabId: 'a1',
+      convId,
+      roomMode: 'public',
+      publicJoinToken: joinToken,
+      channelTitle: 'Recreation Lounge',
+      isInitialCreator: true,
+      database: aliceDb,
+    });
+    await firstSession.init(alice);
+    await settle();
+
+    // The room is active and listed
+    expect((await directoryService.fetchRooms()).some((r) => r.publicRoomId === publicRoomId)).toBe(
+      true
+    );
+
+    // 2. All users close out and the room eventually goes away (expires / purged from relays)
+    firstSession.destroy();
+    resetRelays();
+    await settle();
+
+    // Directory list shows the room is now gone
+    expect((await directoryService.fetchRooms()).some((r) => r.publicRoomId === publicRoomId)).toBe(
+      false
+    );
+
+    // 3. User restarts and rejoins from saved state (same convId, joinToken, title, database)
+    const secondSession = new RoomSession({
+      tabId: 'a2',
+      convId,
+      roomMode: 'public',
+      publicJoinToken: joinToken,
+      channelTitle: 'Recreation Lounge',
+      isInitialCreator: true,
+      database: aliceDb,
+    });
+    await secondSession.init(alice);
+    await settle(150);
+
+    // 4. Room is respawned under the exact same ID and listed in active rooms
+    const liveRooms = await directoryService.fetchRooms();
+    const listed = liveRooms.find((r) => r.publicRoomId === publicRoomId);
+    expect(listed).toBeDefined();
+    expect(listed!.convId).toBe(convId);
+    expect(listed!.publicJoinToken).toBe(joinToken);
+    expect(listed!.publicRoomId).toBe(publicRoomId);
+    expect(listed!.name).toBe('Recreation Lounge');
+
+    // 5. Another user enters via the active directory listing and communicates under the same ID
+    const bobRoom = new RoomSession({
+      tabId: 'b1',
+      convId: listed!.convId,
+      roomMode: 'public',
+      publicJoinToken: listed!.publicJoinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+
+    await bobRoom.sendMessage('welcome back!');
+    await settle(150);
+    expect(secondSession.messages.some((m) => m.text === 'welcome back!')).toBe(true);
+
+    secondSession.destroy();
+    bobRoom.destroy();
+  }, 30000);
+
+  it('respawns an unpurged but expired descriptor when creator rejoins', async () => {
+    const alice = await makeProfile('Alice');
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const publicRoomId = await derivePublicRoomId(convId, joinToken);
+    const aliceDb = freshDb();
+
+    // Publish an already-expired descriptor to the relays
+    const signingPrivateKey = await importSigningPrivateKeyFromJwk(alice.signingPrivateKeyJwk);
+    const expiredDescriptor = await buildPublicRoomDescriptor({
+      publicRoomId,
+      convId,
+      publicJoinToken: joinToken,
+      name: 'Old Lounge',
+      description: 'expired descriptor',
+      creatorId: alice.participantId,
+      creatorScreenName: alice.screenName,
+      creatorSigningPublicKey: alice.signingPublicKeyBase64,
+      signingPrivateKey,
+      lifetimeSec: -120, // Expired 2 minutes ago
+    });
+    await directoryService.publishDescriptor({
+      descriptor: expiredDescriptor,
+      signingPrivateKeyJwk: alice.signingPrivateKeyJwk,
+    });
+    await settle();
+
+    // Relay has the event, but fetchRooms ignores it because it is expired
+    expect((await directoryService.fetchRooms()).some((r) => r.publicRoomId === publicRoomId)).toBe(
+      false
+    );
+
+    // Creator restarts and rejoins
+    const session = new RoomSession({
+      tabId: 'exp1',
+      convId,
+      roomMode: 'public',
+      publicJoinToken: joinToken,
+      channelTitle: 'Old Lounge',
+      isInitialCreator: true,
+      database: aliceDb,
+    });
+    await session.init(alice);
+    await settle(150);
+
+    // Now directoryService.fetchRooms() returns the respawned, unexpired descriptor
+    const rooms = await directoryService.fetchRooms();
+    const respawned = rooms.find((r) => r.publicRoomId === publicRoomId);
+    expect(respawned).toBeDefined();
+    expect(respawned!.expiresAt).toBeGreaterThan(Date.now());
+    expect(respawned!.publicRoomId).toBe(publicRoomId);
+
+    session.destroy();
+  }, 30000);
 });
 
 describe('public room naming -- [PU-02][M-01]', () => {

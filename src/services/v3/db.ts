@@ -18,6 +18,7 @@ import type {
   ContactInfo,
   HistoryPolicy,
   MetadataPolicy,
+  PublicRoomDescriptorPacket,
   RoomMode,
 } from './types';
 
@@ -91,6 +92,7 @@ export interface ConversationRecord {
   /** The identity a public room's directory listing names, if we have read
    *  one. The only identity allowed to rename it [PU-02]. */
   publicRoomCreatorId?: string;
+  publicDescriptor?: PublicRoomDescriptorPacket;
   historyPolicy: HistoryPolicy;
   metadataPolicy: MetadataPolicy;
   genesisPacketId?: string;

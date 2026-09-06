@@ -344,9 +344,16 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         session.roomMode === 'private' && session.roomSecret
           ? session.roomSecret
           : current.roomSecret;
-      if (channelTitle === current.channelTitle && roomSecret === current.roomSecret) return;
+      const isInitialCreator = session.isInitialCreator || current.isInitialCreator;
+      if (
+        channelTitle === current.channelTitle &&
+        roomSecret === current.roomSecret &&
+        isInitialCreator === current.isInitialCreator
+      ) {
+        return;
+      }
 
-      const updated = { ...current, channelTitle, roomSecret };
+      const updated = { ...current, channelTitle, roomSecret, isInitialCreator };
       const next = tabsRef.current.map((t) => (t.tabId === session.tabId ? updated : t));
       tabsRef.current = next;
       setTabs(next);

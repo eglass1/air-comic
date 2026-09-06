@@ -205,6 +205,7 @@ export class DirectoryService {
 
   async fetchRoom(publicRoomId: string): Promise<PublicRoomDescriptorPacket | null> {
     const { descriptor } = await this.fetchRoomStatus(publicRoomId);
+    if (!descriptor || descriptor.expiresAt <= Date.now() - 60000) return null;
     return descriptor;
   }
 
