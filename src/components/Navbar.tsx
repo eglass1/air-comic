@@ -346,14 +346,21 @@ export const Navbar: React.FC<NavbarProps> = ({
             </IconButton>
           </Tooltip>
 
-          {/* 5. Profile */}
+          {/* 5. Friends */}
+          <Tooltip title={`Friends (${friends.length})`}>
+            <IconButton color="inherit" onClick={onOpenFriends}>
+              <PeopleIcon />
+            </IconButton>
+          </Tooltip>
+
+          {/* 6. Profile */}
           <Tooltip title="Profile">
             <IconButton color="inherit" onClick={onOpenProfile}>
               <AccountCircleIcon />
             </IconButton>
           </Tooltip>
 
-          {/* 6. Dark/Light Mode */}
+          {/* 7. Dark/Light Mode */}
           <Tooltip title="Dark/Light Mode">
             <IconButton color="inherit" onClick={onToggleTheme}>
               {themeMode === 'dark' ? <LightModeIcon /> : <DarkModeIcon />}
@@ -396,7 +403,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Favorite Rooms ({favoriteRooms.length})</ListItemText>
             </MenuItem>
 
-            {/* 6. Friends (x) */}
+            {/* 5. Friends (x) */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenFriends(); }}>
               <ListItemIcon>
                 <PeopleIcon fontSize="small" color="primary" />
@@ -404,7 +411,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>Friends ({friends.length})</ListItemText>
             </MenuItem>
 
-            {/* 5. Profile */}
+            {/* 6. Profile */}
             <MenuItem onClick={() => { handleCloseMenu(); onOpenProfile(); }}>
               <ListItemIcon>
                 <AccountCircleIcon fontSize="small" color="primary" />
