@@ -199,11 +199,14 @@ export interface QuickMessageAckRecord {
 export class DatabaseService {
   private dbPromise: Promise<IDBDatabase> | null = null;
 
+  /** The name is injectable so tests can run several isolated profiles. */
+  constructor(private readonly name: string = DB_NAME) {}
+
   private getDB(): Promise<IDBDatabase> {
     if (this.dbPromise) return this.dbPromise;
 
     this.dbPromise = new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      const request = indexedDB.open(this.name, DB_VERSION);
 
       request.onupgradeneeded = () => {
         const db = request.result;

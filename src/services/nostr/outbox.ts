@@ -12,7 +12,7 @@ import {
   PUBLISH_BACKOFF_JITTER,
   PUBLISH_MAX_ATTEMPTS,
 } from '../v3/constants';
-import { db, type OutboxRecord, type OutboxState } from '../v3/db';
+import { db as defaultDb, type DatabaseService, type OutboxRecord, type OutboxState } from '../v3/db';
 import type { NostrEvent } from './nostrEvent';
 import type { RelayPool } from './relayPool';
 
@@ -33,7 +33,7 @@ export class Outbox {
   private draining = false;
   private listeners = new Set<(change: OutboxChange) => void>();
 
-  constructor(private pool: RelayPool) {}
+  constructor(private pool: RelayPool, private db: DatabaseService = defaultDb) {}
 
   onChange(listener: (change: OutboxChange) => void): () => void {
     this.listeners.add(listener);
@@ -62,8 +62,13 @@ export class Outbox {
   }
 
   /**
-   * Persists then publishes. Resolves as soon as the first attempt settles;
-   * a failure leaves the record queued for the background drain.
+   * Persists, then publishes in the background.
+   *
+   * Returns as soon as the record is durable, per [D-01]: the send sequence
+   * commits locally, publishes, and marks the record 'relayed' when the
+   * acknowledgment quorum arrives. Callers must not block on quorum -- a slow
+   * or unreachable relay would otherwise stall room creation and sending.
+   * Subscribe with onChange to observe the state transition.
    */
   async publish(params: {
     packetId: string;
@@ -84,9 +89,12 @@ export class Outbox {
       state: 'pending',
       createdAt: Date.now(),
     };
-    await db.saveOutbox(record);
+    await this.db.saveOutbox(record);
     this.emit({ packetId: record.packetId, convId: record.convId, state: 'pending' });
-    return this.attempt(record);
+    void this.attempt(record).catch(() => {
+      /* the background drain retries */
+    });
+    return 'pending';
   }
 
   private async attempt(record: OutboxRecord): Promise<OutboxState> {
@@ -97,7 +105,7 @@ export class Outbox {
 
     if (result.quorumMet) {
       record.state = 'relayed';
-      await db.saveOutbox(record);
+      await this.db.saveOutbox(record);
       this.emit({ packetId: record.packetId, convId: record.convId, state: 'relayed' });
       return 'relayed';
     }
@@ -108,14 +116,14 @@ export class Outbox {
       record.lastError = expired
         ? 'expired before reaching a relay quorum'
         : result.rejected[0]?.reason || 'no relay quorum';
-      await db.saveOutbox(record);
+      await this.db.saveOutbox(record);
       this.emit({ packetId: record.packetId, convId: record.convId, state: 'failed' });
       return 'failed';
     }
 
     record.nextAttemptAt = Date.now() + backoffDelay(record.attempts);
     record.lastError = result.rejected[0]?.reason || 'no relay quorum';
-    await db.saveOutbox(record);
+    await this.db.saveOutbox(record);
     return 'pending';
   }
 
@@ -124,7 +132,7 @@ export class Outbox {
     if (this.draining) return;
     this.draining = true;
     try {
-      const due = (await db.getPendingOutbox()).filter((r) => r.nextAttemptAt <= Date.now());
+      const due = (await this.db.getPendingOutbox()).filter((r) => r.nextAttemptAt <= Date.now());
       for (const record of due) await this.attempt(record);
     } catch {
       /* a drain failure is retried on the next tick */
@@ -135,28 +143,28 @@ export class Outbox {
 
   /** Cancels a send that has not yet reached a relay. A relay may already hold it [A-05]. */
   async cancel(packetId: string): Promise<void> {
-    await db.deleteOutbox(packetId);
+    await this.db.deleteOutbox(packetId);
   }
 
   async pendingCount(convId?: string): Promise<number> {
-    const rows = await db.getPendingOutbox();
+    const rows = await this.db.getPendingOutbox();
     return convId ? rows.filter((r) => r.convId === convId).length : rows.length;
   }
 
   async failedCount(convId?: string): Promise<number> {
-    const rows = (await db.getOutbox()).filter((r) => r.state === 'failed');
+    const rows = (await this.db.getOutbox()).filter((r) => r.state === 'failed');
     return convId ? rows.filter((r) => r.convId === convId).length : rows.length;
   }
 
   /** Puts a failed record back into the queue for a manual retry from the UI. */
   async requeue(packetId: string): Promise<void> {
-    const rows = await db.getOutbox();
+    const rows = await this.db.getOutbox();
     const record = rows.find((r) => r.packetId === packetId);
     if (!record) return;
     record.state = 'pending';
     record.attempts = 0;
     record.nextAttemptAt = Date.now();
-    await db.saveOutbox(record);
+    await this.db.saveOutbox(record);
     void this.drain();
   }
 }

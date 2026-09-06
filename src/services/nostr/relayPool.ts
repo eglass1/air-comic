@@ -366,9 +366,15 @@ export class RelayPool {
       opts?.relays ? opts.relays.map((u) => this.relays.get(u)) : Array.from(this.relays.values())
     ).filter((c): c is RelayConn => !!c);
 
-    const targets = candidates.slice(0, PUBLISH_TARGET_RELAYS);
-    // With a single usable relay one acknowledgment is provisionally enough,
-    // and the UI is expected to show reduced redundancy [T-07].
+    // Only relays that are actually connected can acknowledge, so an offline
+    // relay must not inflate the quorum denominator. With a single usable relay
+    // one acknowledgment is provisionally enough and the UI is expected to show
+    // reduced redundancy [T-07].
+    const reachable = candidates.filter((c) => c.health.connected);
+    const targets = (reachable.length > 0 ? reachable : candidates).slice(
+      0,
+      PUBLISH_TARGET_RELAYS
+    );
     const quorum = opts?.quorum ?? Math.min(PUBLISH_QUORUM, Math.max(1, targets.length));
     const timeoutMs = opts?.timeoutMs ?? PUBLISH_TIMEOUT_MS;
 
