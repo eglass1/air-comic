@@ -29,6 +29,7 @@ import {
   CHAT_RETENTION_SEC,
   D_GENESIS_PREFIX,
   D_METADATA_PREFIX,
+  D_ROOM_PRESENCE_PREFIX,
   JOIN_REQUEST_MAX_ATTEMPTS,
   JOIN_REQUEST_RETRY_MS,
   LIVE_PAST_WINDOW_MS,
@@ -36,6 +37,11 @@ import {
   OLD_ROUTE_MONITOR_MS,
   PUBLIC_KEY_ID,
   PUBLIC_PRESENCE_REFRESH_MS,
+  ROOM_PRESENCE_FRESH_MS,
+  ROOM_PRESENCE_QUERY_LIMIT,
+  ROOM_PRESENCE_REFRESH_MS,
+  ROOM_PRESENCE_SEC,
+  ROOM_PRESENCE_SWEEP_MS,
   ROOT_KEY_ID,
   T_ROOM_PACKET,
   WEBRTC_MEMBER_THRESHOLD,
@@ -80,6 +86,7 @@ import {
   buildMessagePayload,
   buildRekey,
   buildRoomMetadata,
+  buildRoomPresence,
   openRekeySlot,
   openRotationSlot,
   verifyCapabilityRotation,
@@ -89,6 +96,7 @@ import {
   verifyMessagePayload,
   verifyRekey,
   verifyRoomMetadata,
+  verifyRoomPresence,
 } from './packets';
 import { byteLength } from './validate';
 import {
@@ -109,13 +117,18 @@ import type {
   Participant,
   PacketClass,
   PendingJoinRequest,
+  PresenceStatus,
   PublicRoomDescriptorPacket,
   RekeyPacket,
   RoomGenesisPacket,
   RoomMetadataPacket,
   RoomMode,
+  RoomPresencePacket,
   SendState,
 } from './types';
+
+/** Claimants whose unjudged title we will hold on to at once [M-01]. */
+const MAX_HELD_METADATA = 8;
 
 const outbox = new Outbox(relayPool);
 outbox.start();
@@ -207,8 +220,11 @@ export class RoomSession {
   private genesis: RoomGenesisPacket | null = null;
   /** Timestamp of the newest room_metadata we have applied [M-01]. */
   private titleUpdatedAt = 0;
-  /** A title that arrived before there was a chain to judge its author by. */
-  private pendingMetadata: RoomMetadataPacket | null = null;
+  /**
+   * Titles that arrived before there was any authority to judge their author
+   * by, one per claimant [M-01].
+   */
+  private pendingMetadata = new Map<string, RoomMetadataPacket>();
   private dedup: DedupLedger;
 
   private subscription: { close(): void; update(f: unknown[]): void } | null = null;
@@ -231,6 +247,8 @@ export class RoomSession {
   private publicDescriptor: PublicRoomDescriptorPacket | null = null;
   private beacon: PublicRoomPresenceBeacon | null = null;
   private occupancyTimer: ReturnType<typeof setInterval> | null = null;
+  private roomPresenceTimer: ReturnType<typeof setInterval> | null = null;
+  private presenceSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   private isDestroyed = false;
   private isInitialized = false;
@@ -375,6 +393,8 @@ export class RoomSession {
       // Public rooms have no join request, epoch, rekey or roster [PU-05].
       await this.persistConversation();
       await this.startOccupancy();
+      // ...which is exactly why the occupants have to say who they are [PU-06].
+      await this.startRoomPresence();
       // Only then go and ask the directory who owns the room -- the room is
       // usable while that query is in flight.
       await this.loadPublicRoomAuthority();
@@ -416,6 +436,159 @@ export class RoomSession {
   }
 
   /**
+   * Announces this identity to the room and collects everyone else's
+   * announcement [PU-06].
+   *
+   * A public room has no membership chain, so before this the roster filled up
+   * from chat alone: you saw yourself, and a person who had said nothing yet
+   * was invisible to you and you to them. The announcement is a replaceable
+   * record on one `d` tag per room, so a joiner learns the current occupants in
+   * a single query and each refresh replaces its own predecessor rather than
+   * piling up.
+   *
+   * It is identified where the occupancy beacon [PU-04] is not: counting heads
+   * anonymously and listing who is here are different jobs. Being in a public
+   * room is therefore visible to that room -- which is what a chat roster is.
+   */
+  private async startRoomPresence(): Promise<void> {
+    if (this.roomMode !== 'public') return;
+    this.stopRoomPresence();
+
+    await this.publishRoomPresence('online');
+    await this.fetchRoomPresence();
+
+    this.roomPresenceTimer = setInterval(
+      () => void this.publishRoomPresence('online'),
+      ROOM_PRESENCE_REFRESH_MS
+    );
+    this.presenceSweepTimer = setInterval(() => this.sweepRoomPresence(), ROOM_PRESENCE_SWEEP_MS);
+  }
+
+  /** 'offline' is a leave notice, and the last thing a departing tab says. */
+  private async publishRoomPresence(status: PresenceStatus): Promise<boolean> {
+    if (this.roomMode !== 'public' || !this.profile || !this.signingPrivateKey) return false;
+
+    const packet = await buildRoomPresence({
+      convId: this.convId,
+      publicRoomId: this.publicRoomId ?? undefined,
+      participantId: this.profile.participantId,
+      screenName: this.profile.screenName,
+      avatarName: this.profile.avatarName,
+      publicKey: this.profile.publicKeyBase64,
+      signingPublicKey: this.profile.signingPublicKeyBase64,
+      contactInfo: this.profile.contactInfo,
+      status,
+      signingPrivateKey: this.signingPrivateKey,
+    });
+
+    const result = await this.publishEnvelope({
+      payload: packet,
+      packetClass: 'system',
+      keyId: PUBLIC_KEY_ID,
+      contentKey: null,
+      // One tag per room: the relay replaces per author, so this holds exactly
+      // one live record per occupant and expires on its own if a tab vanishes.
+      dTag: D_ROOM_PRESENCE_PREFIX + this.routingTag,
+      expirationSec: ROOM_PRESENCE_SEC,
+    });
+    return result !== null;
+  }
+
+  /**
+   * The joiner's half. The live subscription only carries what is published
+   * from now on -- and on a rejoin it resumes from a cursor -- so the people
+   * already sitting in the room have to be asked for [PU-06].
+   */
+  private async fetchRoomPresence(): Promise<void> {
+    if (this.roomMode !== 'public') return;
+    const events = await relayPool.query(
+      dTagFilters([D_ROOM_PRESENCE_PREFIX + this.routingTag], ROOM_PRESENCE_QUERY_LIMIT)
+    );
+    for (const event of events) await this.handleHistoricalEvent(event);
+  }
+
+  private async handleRoomPresence(packet: RoomPresencePacket): Promise<void> {
+    if (this.roomMode !== 'public') return;
+    if (packet.convId !== this.convId) return;
+    if (!this.profile || packet.participantId === this.profile.participantId) return;
+    if (!(await verifyRoomPresence(packet))) return;
+
+    const existing = this.participantsMap.get(packet.participantId);
+    // Relays replay in no particular order, so an older record must never undo
+    // a newer one -- nor a message we have just had from them.
+    if (existing && existing.lastSeen > packet.timestamp) return;
+
+    if (packet.status === 'offline') {
+      // Nothing vouches for a public-room participant except being here, so
+      // someone who has left is simply not on the list.
+      if (this.participantsMap.delete(packet.participantId)) {
+        this.commitParticipants();
+        this.notify();
+      }
+      return;
+    }
+
+    // A record can outlive its subject: relays hold it until expiry, and a
+    // query answers with whatever they still have. Only a fresh one is an
+    // arrival; a stale one is swept out below anyway.
+    if (Date.now() - packet.timestamp > ROOM_PRESENCE_FRESH_MS) return;
+
+    const next: Participant = {
+      participantId: packet.participantId,
+      publicKey: normalizePublicKey(packet.publicKey) || existing?.publicKey || '',
+      signingPublicKey: normalizePublicKey(packet.signingPublicKey),
+      screenName: packet.screenName?.trim() || existing?.screenName || 'Anonymous',
+      avatarName: packet.avatarName?.trim() || existing?.avatarName || 'Armando',
+      contactInfo: packet.contactInfo ?? existing?.contactInfo,
+      lastSeen: packet.timestamp,
+      isSelf: false,
+      status: 'online',
+      isApproved: true,
+    };
+
+    // A refresh once a minute says nothing new; only re-render when
+    // the entry a person actually sees has changed.
+    const visiblyChanged =
+      !existing ||
+      existing.screenName !== next.screenName ||
+      existing.avatarName !== next.avatarName ||
+      existing.publicKey !== next.publicKey ||
+      existing.signingPublicKey !== next.signingPublicKey ||
+      existing.status !== next.status;
+
+    this.participantsMap.set(packet.participantId, next);
+    this.commitParticipants();
+    if (visiblyChanged) this.notify();
+  }
+
+  /**
+   * A tab that is closed abruptly never sends its leave notice, so silence has
+   * to mean something: it dims an occupant, and eventually drops them.
+   */
+  private sweepRoomPresence(): void {
+    if (this.roomMode !== 'public' || this.isDestroyed) return;
+    const now = Date.now();
+    let changed = false;
+
+    for (const [id, participant] of this.participantsMap) {
+      if (participant.isSelf) continue;
+      const silentFor = now - participant.lastSeen;
+      if (silentFor > ROOM_PRESENCE_FRESH_MS * 2) {
+        this.participantsMap.delete(id);
+        changed = true;
+      } else if (silentFor > ROOM_PRESENCE_FRESH_MS && participant.status !== 'offline') {
+        this.participantsMap.set(id, { ...participant, status: 'offline' });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.commitParticipants();
+      this.notify();
+    }
+  }
+
+  /**
    * Establishes who may rename this public room. The directory descriptor is
    * signed by a key only the creator holds, so the identity it names is the
    * one authority a room with no roster has [PU-02].
@@ -423,7 +596,10 @@ export class RoomSession {
   private async loadPublicRoomAuthority(): Promise<void> {
     if (this.roomMode !== 'public' || !this.profile) return;
 
-    if (this.isInitialCreator) this.publicRoomCreatorId = this.profile.participantId;
+    if (this.isInitialCreator) {
+      this.publicRoomCreatorId = this.profile.participantId;
+      await this.applyPendingMetadata();
+    }
     if (!this.publicRoomId) return;
 
     const status = await directoryService.fetchRoomStatus(this.publicRoomId);
@@ -440,6 +616,9 @@ export class RoomSession {
     this.publicDescriptor = descriptor;
     this.publicRoomCreatorId = descriptor.creatorId;
     await this.persistConversation();
+    // The room's name may well have arrived while we were still asking who was
+    // entitled to set it; now we can judge it [M-01].
+    await this.applyPendingMetadata();
     this.notify();
   }
 
@@ -512,6 +691,9 @@ export class RoomSession {
     if (!this.profile || this.isDestroyed) return;
 
     if (profile.participantId !== this.profile.participantId) {
+      // Retire the old identity's announcement before the new one arrives, or
+      // the room lists both of us until the record expires [PU-06].
+      await this.publishRoomPresence('offline');
       this.isInitialized = false;
       this.subscription?.close();
       this.subscription = null;
@@ -519,6 +701,7 @@ export class RoomSession {
       this.beacon = null;
       if (this.occupancyTimer) clearInterval(this.occupancyTimer);
       this.occupancyTimer = null;
+      this.stopRoomPresence();
       this.participantsMap.clear();
       this.commitParticipants();
       await this.init(profile);
@@ -527,6 +710,9 @@ export class RoomSession {
 
     this.profile = profile;
     this.addSelfParticipant();
+    // A rename or a new avatar reaches a public room's roster the same way the
+    // name itself did: by being announced [PU-06].
+    void this.publishRoomPresence('online');
     this.notify();
   }
 
@@ -671,6 +857,12 @@ export class RoomSession {
   /**
    * Builds, persists and publishes one envelope. The serialized string is
    * produced once and reused, so the WebRTC copy cannot hash differently [G-06].
+   *
+   * A 'system' packet is a beacon and takes the short road: no dedup row and no
+   * outbox. It repeats on a timer by design, so a permanent ledger entry each
+   * time would grow the database without bound, and a retry queue would re-send
+   * a stale "I am here" and count it on screen as a message that failed to
+   * send [PU-06].
    */
   private async publishEnvelope(params: {
     payload: unknown;
@@ -682,6 +874,7 @@ export class RoomSession {
     expirationSec?: number | undefined;
   }): Promise<{ packetId: string; serialized: string; state: SendState } | null> {
     if (!this.profile || !this.signingPrivateKey || !this.nostrSecretKey) return null;
+    const isBeacon = params.packetClass === 'system';
 
     const built = await buildEnvelope({
       convId: this.convId,
@@ -697,14 +890,16 @@ export class RoomSession {
     });
 
     // Claim our own packet so an echo from any transport is a duplicate.
-    await this.dedup.claim({
-      convId: this.convId,
-      packetId: built.envelope.packetId,
-      contentHash: built.contentHash,
-      senderId: this.profile.participantId,
-      packetTimestamp: built.envelope.timestamp,
-      retentionClass: params.packetClass === 'chat' ? 'chat' : 'control',
-    });
+    if (!isBeacon) {
+      await this.dedup.claim({
+        convId: this.convId,
+        packetId: built.envelope.packetId,
+        contentHash: built.contentHash,
+        senderId: this.profile.participantId,
+        packetTimestamp: built.envelope.timestamp,
+        retentionClass: params.packetClass === 'chat' ? 'chat' : 'control',
+      });
+    }
 
     const event = await buildNostrEvent({
       secretKey: this.nostrSecretKey,
@@ -724,6 +919,15 @@ export class RoomSession {
           }),
       content: built.serialized,
     });
+
+    if (isBeacon) {
+      const result = await relayPool.publish(event);
+      return {
+        packetId: built.envelope.packetId,
+        serialized: built.serialized,
+        state: result.quorumMet ? 'relayed' : 'failed',
+      };
+    }
 
     const state = await this.outbox.publish({
       packetId: built.envelope.packetId,
@@ -853,22 +1057,29 @@ export class RoomSession {
     const envelope = result.envelope;
     if (!envelope || !result.contentHash) return;
 
-    const retentionClass = envelope.packetClass === 'chat' ? 'chat' : 'control';
-    const verdict = await this.dedup.check({
-      convId: this.convId,
-      packetId: envelope.packetId,
-      contentHash: result.contentHash,
-      senderId: envelope.senderId,
-      packetTimestamp: envelope.timestamp,
-      retentionClass,
-    });
+    // Beacons are exempt from the ledger: they are judged on freshness rather
+    // than on novelty, their handlers are idempotent, and a busy room would
+    // otherwise write a permanent row a minute for every occupant [PU-06].
+    // packetClass is signed header, so this decision is taken without looking
+    // inside the envelope, as [X-03] requires.
+    if (envelope.packetClass !== 'system') {
+      const retentionClass = envelope.packetClass === 'chat' ? 'chat' : 'control';
+      const verdict = await this.dedup.check({
+        convId: this.convId,
+        packetId: envelope.packetId,
+        contentHash: result.contentHash,
+        senderId: envelope.senderId,
+        packetTimestamp: envelope.timestamp,
+        retentionClass,
+      });
 
-    if (verdict === 'collision') {
-      this.collisions = this.dedup.collisions;
-      this.notify();
-      return;
+      if (verdict === 'collision') {
+        this.collisions = this.dedup.collisions;
+        this.notify();
+        return;
+      }
+      if (verdict === 'duplicate') return;
     }
-    if (verdict === 'duplicate') return;
 
     // Chat is authorized against the membership epoch in force when it was
     // sent [M-02]; control packets carry their own authority rules.
@@ -911,6 +1122,9 @@ export class RoomSession {
       case 'room_metadata':
         await this.handleMetadata(payload as unknown as RoomMetadataPacket);
         break;
+      case 'room_presence':
+        await this.handleRoomPresence(payload as unknown as RoomPresencePacket);
+        break;
       default:
         break;
     }
@@ -952,7 +1166,7 @@ export class RoomSession {
       sendState: 'relayed',
     };
 
-    this.trackParticipantFromMessage(payload);
+    this.trackParticipantFromMessage(payload, isBackfill);
     this.insertMessage(message, isBackfill);
   }
 
@@ -1037,19 +1251,32 @@ export class RoomSession {
     if (changed) this.commitParticipants();
   }
 
-  private trackParticipantFromMessage(payload: MessagePayload) {
+  /**
+   * A message is evidence of two separate things: who the sender is, and that
+   * they were here when they sent it. Backfill carries the first only --
+   * replaying a month of history must not light up everyone who ever spoke as
+   * though they were sitting in the room now [PU-06].
+   */
+  private trackParticipantFromMessage(payload: MessagePayload, isBackfill: boolean) {
     if (payload.senderId === this.profile?.participantId) return;
     const existing = this.participantsMap.get(payload.senderId);
+    // History arrives in no particular order, so only the newest record we
+    // have from someone gets to say what they are called.
+    const isNewest = !existing || payload.timestamp >= existing.lastSeen;
+    const present = !isBackfill && Date.now() - payload.timestamp <= ROOM_PRESENCE_FRESH_MS;
+
     this.participantsMap.set(payload.senderId, {
       participantId: payload.senderId,
       publicKey: existing?.publicKey ?? '',
-      signingPublicKey: payload.senderSigningPublicKey,
-      screenName: payload.sender.screenName?.trim() || existing?.screenName || 'Anonymous',
-      avatarName: payload.sender.avatarName || existing?.avatarName || 'Armando',
-      contactInfo: payload.sender.contactInfo ?? existing?.contactInfo,
-      lastSeen: Date.now(),
+      signingPublicKey:
+        isNewest || !existing ? payload.senderSigningPublicKey : existing.signingPublicKey,
+      screenName:
+        (isNewest ? payload.sender.screenName?.trim() : '') || existing?.screenName || 'Anonymous',
+      avatarName: (isNewest ? payload.sender.avatarName : '') || existing?.avatarName || 'Armando',
+      contactInfo: (isNewest ? payload.sender.contactInfo : undefined) ?? existing?.contactInfo,
+      lastSeen: Math.max(existing?.lastSeen ?? 0, payload.timestamp),
       isSelf: false,
-      status: 'online',
+      status: present ? 'online' : existing?.status ?? 'offline',
       isApproved: this.roomMode === 'public' || isMember(this.chain, payload.senderId),
     });
     this.commitParticipants();
@@ -1361,6 +1588,11 @@ export class RoomSession {
       // A public room is world-writable on the wire, so the title has to be
       // pinned to the identity its listing names. With no listing to read we
       // leave the name alone rather than take anyone's word for it [PU-02].
+      //
+      // "Not yet read" is a different thing from "read, and it was not them":
+      // the title routinely overtakes the directory lookup on a fresh join, and
+      // dedup means a dropped packet never comes back, so hold it [M-01].
+      if (!this.publicRoomCreatorId) this.deferMetadata(packet);
       return;
     }
 
@@ -1384,17 +1616,28 @@ export class RoomSession {
    * creator alone [PR-01], which is enough to accept the creator's own record.
    */
   private deferMetadata(packet: RoomMetadataPacket): void {
-    if (!this.pendingMetadata || packet.timestamp > this.pendingMetadata.timestamp) {
-      this.pendingMetadata = packet;
-    }
+    const held = this.pendingMetadata.get(packet.setterId);
+    if (held && held.timestamp >= packet.timestamp) return;
+    // Everyone who claims the room gets one slot, and there are only a few
+    // slots: on the wire a public room is world-writable, and a holding queue
+    // must not become somewhere to put things.
+    if (!held && this.pendingMetadata.size >= MAX_HELD_METADATA) return;
+    this.pendingMetadata.set(packet.setterId, packet);
   }
 
-  /** Re-judges a held title once the chain can actually answer the question. */
+  /**
+   * Re-judges held titles once there is something to judge them by. All of
+   * them, not just the newest: the newest arrival is routinely the one from
+   * somebody with no claim to the room, and dedup means a title dropped here
+   * never comes round again [M-01].
+   */
   private async applyPendingMetadata(): Promise<void> {
-    const held = this.pendingMetadata;
-    if (!held) return;
-    this.pendingMetadata = null;
-    await this.handleMetadata(held);
+    if (this.pendingMetadata.size === 0) return;
+    const held = Array.from(this.pendingMetadata.values());
+    this.pendingMetadata.clear();
+    // Oldest first, so the newest legitimate rename is the one that sticks.
+    held.sort((a, b) => a.timestamp - b.timestamp);
+    for (const packet of held) await this.handleMetadata(packet);
   }
 
   private setterWasMember(packet: RoomMetadataPacket): boolean {
@@ -2087,10 +2330,21 @@ export class RoomSession {
     this.notify();
   }
 
+  private stopRoomPresence(): void {
+    if (this.roomPresenceTimer) clearInterval(this.roomPresenceTimer);
+    if (this.presenceSweepTimer) clearInterval(this.presenceSweepTimer);
+    this.roomPresenceTimer = null;
+    this.presenceSweepTimer = null;
+  }
+
   destroy(): void {
+    // Say goodbye before the flag goes up: leaving a public room should take
+    // us off everyone else's list now, not in five minutes [PU-06].
+    void this.publishRoomPresence('offline');
     this.isDestroyed = true;
     if (this.isForeground) accelerator.deactivate();
     this.stopJoinRetry();
+    this.stopRoomPresence();
     this.subscription?.close();
     this.oldRouteSubscription?.close();
     this.beacon?.stop();

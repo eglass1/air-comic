@@ -41,6 +41,8 @@ export const T_INBOX = 'aircomic-inbox';
 export const D_GENESIS_PREFIX = 'genesis:';
 export const D_METADATA_PREFIX = 'meta:';
 export const D_PUBLIC_PRESENCE_PREFIX = 'presence:';
+/** One tag per room: every occupant's announcement replaces only their own. */
+export const D_ROOM_PRESENCE_PREFIX = 'roster:';
 
 // ============================================================================
 // PUBLISH POLICY  [T-07]
@@ -61,6 +63,7 @@ export const PUBLISH_BACKOFF_JITTER = 0.25;
 /** Chat expiration. Control packets deliberately carry no expiration [L-05]. */
 export const CHAT_RETENTION_SEC = 30 * 24 * 3600;
 export const PUBLIC_ROOM_PRESENCE_SEC = 120;
+export const ROOM_PRESENCE_SEC = 180;
 export const USER_PRESENCE_SEC = 900;
 export const QUICK_MESSAGE_SEC = 3600;
 export const INVITE_SEC = 7 * 24 * 3600;
@@ -74,6 +77,11 @@ export const PUBLIC_PRESENCE_REFRESH_MS = 45000;
 export const USER_PRESENCE_REFRESH_MS = 120000;
 export const USER_PRESENCE_FRESH_MS = 330000;
 export const USER_PRESENCE_SWEEP_MS = 30000;
+export const ROOM_PRESENCE_REFRESH_MS = 60000;
+export const ROOM_PRESENCE_FRESH_MS = 200000;
+export const ROOM_PRESENCE_SWEEP_MS = 30000;
+/** Enough occupants for one query to answer "who is in this room" [PU-06]. */
+export const ROOM_PRESENCE_QUERY_LIMIT = 200;
 export const DIRECTORY_REFRESH_MS = 600000;
 export const PUBLIC_DESCRIPTOR_REFRESH_MS = 600000;
 
@@ -193,6 +201,7 @@ export const DOMAIN_CONTACT_CAPABILITY = 'AIRTHREAD_CONTACT_CAPABILITY_V3:';
 export const DOMAIN_PUBLIC_ROOM_DESCRIPTOR = 'AIRTHREAD_PUBLIC_ROOM_DESCRIPTOR_V3:';
 export const DOMAIN_PUBLIC_ROOM_TOMBSTONE = 'AIRTHREAD_PUBLIC_ROOM_TOMBSTONE_V3:';
 export const DOMAIN_PUBLIC_ROOM_METADATA = 'AIRTHREAD_PUBLIC_ROOM_METADATA_V3:';
+export const DOMAIN_ROOM_PRESENCE = 'AIRTHREAD_ROOM_PRESENCE_V3:';
 export const DOMAIN_RECOVERY_REQUEST = 'AIRTHREAD_RECOVERY_REQUEST_V3:';
 
 // ============================================================================

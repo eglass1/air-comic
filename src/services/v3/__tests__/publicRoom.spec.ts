@@ -186,6 +186,135 @@ describe('public room messaging', () => {
     room.destroy();
   }, 20000);
 
+  it('shows the people already in the room before anyone has spoken -- [PU-06]', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'sa', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    await settle();
+
+    // Bob arrives second and says nothing at all.
+    const bobRoom = new RoomSession({
+      tabId: 'sb', convId, roomMode: 'public', publicJoinToken: joinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+
+    // Bob learns of Alice from the record she left on the room's roster tag;
+    // Alice learns of Bob from his announcement arriving live.
+    expect(bobRoom.participants.map((p) => p.screenName).sort()).toEqual(['Alice', 'Bob']);
+    expect(aliceRoom.participants.map((p) => p.screenName).sort()).toEqual(['Alice', 'Bob']);
+
+    const seenAlice = bobRoom.participantsMap.get(alice.participantId)!;
+    expect(seenAlice.status).toBe('online');
+    expect(seenAlice.isSelf).toBe(false);
+    // Enough of an identity to open a contact card or add them as a friend.
+    expect(seenAlice.publicKey).toBe(alice.publicKeyBase64);
+    expect(seenAlice.avatarName).toBe('Armando');
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  }, 20000);
+
+  it('takes a departing occupant off everyone elses roster -- [PU-06]', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'la', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    const bobRoom = new RoomSession({
+      tabId: 'lb', convId, roomMode: 'public', publicJoinToken: joinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+    expect(aliceRoom.participantsMap.has(bob.participantId)).toBe(true);
+
+    bobRoom.destroy();
+    await settle(200);
+
+    // Nothing vouches for a public-room occupant except being here.
+    expect(aliceRoom.participantsMap.has(bob.participantId)).toBe(false);
+    expect(aliceRoom.participants.map((p) => p.screenName)).toEqual(['Alice']);
+
+    aliceRoom.destroy();
+  }, 20000);
+
+  it('does not mistake replayed history for company in the room -- [PU-06]', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'ha', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    await aliceRoom.sendMessage('leaving this here');
+    await settle(120);
+    aliceRoom.destroy();
+    await settle(120);
+
+    // Bob arrives to an empty room with a transcript in it.
+    const bobRoom = new RoomSession({
+      tabId: 'hb', convId, roomMode: 'public', publicJoinToken: joinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(200);
+
+    expect(bobRoom.messages.some((m) => m.text === 'leaving this here')).toBe(true);
+    // Alice is named by her message, but a month-old transcript is not a room
+    // full of people: only an announcement lights somebody up.
+    expect(bobRoom.participantsMap.get(alice.participantId)?.status).not.toBe('online');
+    expect(bobRoom.participants.filter((p) => p.status === 'online').map((p) => p.screenName))
+      .toEqual(['Bob']);
+
+    bobRoom.destroy();
+  }, 20000);
+
+  it('announces a rename to the room without waiting for a message -- [PU-06]', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'na', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    const bobRoom = new RoomSession({
+      tabId: 'nb', convId, roomMode: 'public', publicJoinToken: joinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle(150);
+
+    await aliceRoom.applyProfile({ ...alice, screenName: 'Alicia', avatarName: 'Susan' });
+    await settle(200);
+
+    const seen = bobRoom.participantsMap.get(alice.participantId)!;
+    expect(seen.screenName).toBe('Alicia');
+    expect(seen.avatarName).toBe('Susan');
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  }, 20000);
+
   it('rejects a public message with a broken signature -- [PU-01]', async () => {
     const convId = crypto.randomUUID();
     const joinToken = generateRoomSecret();

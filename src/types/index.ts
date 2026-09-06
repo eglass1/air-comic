@@ -32,6 +32,7 @@ export type {
   RoomInviteResponsePayload,
   RoomMetadataPacket,
   RoomMode,
+  RoomPresencePacket,
   SealedEnvelope,
   SendState,
 } from '../services/v3/types';

@@ -36,6 +36,7 @@ import {
   DOMAIN_RECOVERY_REQUEST,
   DOMAIN_REKEY,
   DOMAIN_ROOM_INVITE,
+  DOMAIN_ROOM_PRESENCE,
   EXT_PRESENCE,
   EXT_PUBLIC_ROOMS,
   MAX_PRIVATE_MEMBERS_HARD,
@@ -65,6 +66,7 @@ import type {
   RoomInviteResponsePayload,
   RoomMetadataPacket,
   RoomMode,
+  RoomPresencePacket,
 } from './types';
 
 // ----------------------------------------------------------------------------
@@ -452,6 +454,43 @@ export async function buildRoomMetadata(p: {
 
 export async function verifyRoomMetadata(packet: RoomMetadataPacket): Promise<boolean> {
   return verify(DOMAIN_METADATA, packet, packet?.setterSigningPublicKey, packet?.setterId);
+}
+
+// ----------------------------------------------------------------------------
+// In-room presence  [PU-06]
+// ----------------------------------------------------------------------------
+
+export async function buildRoomPresence(p: {
+  convId: string;
+  publicRoomId?: string;
+  participantId: string;
+  screenName: string;
+  avatarName?: string;
+  publicKey: string;
+  signingPublicKey: string;
+  contactInfo?: ContactInfo;
+  status: PresenceStatus;
+  signingPrivateKey: CryptoKey;
+}): Promise<RoomPresencePacket> {
+  const unsigned: Omit<RoomPresencePacket, 'signature'> = {
+    type: 'room_presence',
+    protocol: PROTOCOL,
+    convId: p.convId,
+    publicRoomId: p.publicRoomId,
+    participantId: p.participantId,
+    screenName: p.screenName,
+    avatarName: p.avatarName,
+    publicKey: normalizePublicKey(p.publicKey),
+    signingPublicKey: normalizePublicKey(p.signingPublicKey),
+    contactInfo: p.contactInfo,
+    status: p.status,
+    timestamp: Date.now(),
+  };
+  return sign<RoomPresencePacket>(DOMAIN_ROOM_PRESENCE, unsigned, p.signingPrivateKey);
+}
+
+export async function verifyRoomPresence(packet: RoomPresencePacket): Promise<boolean> {
+  return verify(DOMAIN_ROOM_PRESENCE, packet, packet?.signingPublicKey, packet?.participantId);
 }
 
 // ----------------------------------------------------------------------------

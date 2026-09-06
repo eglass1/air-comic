@@ -91,7 +91,10 @@ every room; WebRTC is an optional accelerator, never a requirement.
 - **Public rooms**: signed but **not encrypted**. Public means world-readable:
   anything said there is stored on public relays in the clear. They need no
   invitation or approval, are discoverable in the directory, and report
-  approximate occupancy from short-lived pseudonymous beacons.
+  approximate occupancy from short-lived pseudonymous beacons. Being *in* one is
+  not private either: joining announces your name and avatar to that room, so the
+  participant list shows everyone present rather than only those who have spoken.
+  The directory's occupancy figure stays anonymous and separate from it.
 - **Presence is opt-in**: contacts see each other only after exchanging a random
   presence capability. Removing a contact rotates it. Knowing someone's identity
   is not enough to track when they are online.

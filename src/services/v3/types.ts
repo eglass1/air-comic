@@ -194,6 +194,33 @@ export interface RoomMetadataPacket {
   signature: string;
 }
 
+/**
+ * "I am here", announced inside a public room [PU-06].
+ *
+ * A public room has no membership chain to read a roster off, so without this
+ * an occupant is invisible until they happen to speak. It is deliberately
+ * identified -- the anonymous occupancy beacon [PU-04] counts heads and is a
+ * different thing -- so joining a public room is what makes you visible in it.
+ */
+export interface RoomPresencePacket {
+  type: 'room_presence';
+  protocol: Protocol;
+  convId: string;
+  publicRoomId?: string;
+  participantId: string;
+  screenName: string;
+  avatarName?: string;
+  /** Carried so a participant card, contact add or quick message works [PU-06]. */
+  publicKey: string;
+  signingPublicKey: string;
+  contactInfo?: ContactInfo;
+  /** 'offline' is a leave notice; anything else means present. */
+  status: PresenceStatus;
+  timestamp: number;
+  requiredExtensions?: string[];
+  signature: string;
+}
+
 /** WebRTC only in v3 -- there is no roster gossip [H-03][W-06]. */
 export interface IdentityHelloPacket {
   type: 'hello';
