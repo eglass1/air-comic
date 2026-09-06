@@ -94,6 +94,7 @@ import {
   occupancyBucket,
   PublicRoomPresenceBeacon,
 } from './directory';
+import { accelerator } from './accelerator';
 import type {
   AccelerationStatus,
   CapabilityRotationPacket,
@@ -1514,15 +1515,14 @@ export class RoomSession {
     return true;
   }
 
-  /** Hook for the accelerator; wired in phase 5. */
-  private acceleratorSend: ((serialized: string) => void) | null = null;
-
-  setAcceleratorSend(send: ((serialized: string) => void) | null) {
-    this.acceleratorSend = send;
-  }
-
+  /**
+   * Hands the envelope to the accelerator when this room owns the mesh. The
+   * exact same serialized bytes already went to the relays [P-03][G-06].
+   */
   private accelerate(serialized: string) {
-    if (this.acceleratorEligible) this.acceleratorSend?.(serialized);
+    if (this.acceleratorEligible && accelerator.getStatus() === 'active') {
+      accelerator.send(serialized);
+    }
   }
 
   /** Entry point used by the accelerator for inbound envelopes [P-03]. */
@@ -1615,10 +1615,43 @@ export class RoomSession {
     return relayPool.getHealth();
   }
 
-  setForeground(isForeground: boolean) {
+  /**
+   * Selecting another private room closes the previous room's mesh, so at most
+   * one exists at a time [R-03][W-03]. Nostr delivery to background rooms is
+   * unaffected, because their subscriptions live in the shared pool.
+   */
+  setForeground(isForeground: boolean): void {
     if (this.isForeground === isForeground) return;
     this.isForeground = isForeground;
+    if (isForeground) void this.activateAccelerator();
     this.notify();
+  }
+
+  private async activateAccelerator(): Promise<void> {
+    if (!this.profile || !this.signingPrivateKey) return;
+    if (!this.acceleratorEligible) {
+      this.accelerationStatus = 'unavailable';
+      this.notify();
+      return;
+    }
+    await accelerator.activate(
+      {
+        tabId: this.tabId,
+        convId: this.convId,
+        roomSecret: this.roomSecret,
+        roomMode: this.roomMode,
+        isApproved: this.isApproved,
+        memberCount: this.memberCount,
+        receive: (serialized) => this.receiveFromAccelerator(serialized),
+        onStatus: (status, peerCount) => {
+          this.accelerationStatus = status;
+          this.connectedPeersCount = peerCount;
+          this.notify();
+        },
+      },
+      this.profile,
+      this.signingPrivateKey
+    );
   }
 
   async provideRoomSecret(input: string): Promise<void> {
@@ -1643,6 +1676,7 @@ export class RoomSession {
 
   destroy(): void {
     this.isDestroyed = true;
+    if (this.isForeground) accelerator.deactivate();
     this.stopJoinRetry();
     this.subscription?.close();
     this.oldRouteSubscription?.close();
