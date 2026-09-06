@@ -199,12 +199,14 @@ export async function buildRekey(p: {
   action: RekeyAction;
   targetParticipantId?: string;
   targetScreenName?: string;
+  targetAvatarName?: string;
   members: string[];
   publicKeys: Map<string, string>;
   rawEpochKey: ArrayBuffer;
   signerId: string;
   signerSigningPublicKey: string;
   signerScreenName: string;
+  signerAvatarName?: string;
   signingPrivateKey: CryptoKey;
   packetId?: string;
 }): Promise<RekeyPacket> {
@@ -232,9 +234,11 @@ export async function buildRekey(p: {
     action: p.action,
     targetParticipantId: p.targetParticipantId,
     targetScreenName: p.targetScreenName,
+    targetAvatarName: p.targetAvatarName,
     signerId: p.signerId,
     signerSigningPublicKey: normalizePublicKey(p.signerSigningPublicKey),
     signerScreenName: p.signerScreenName,
+    signerAvatarName: p.signerAvatarName,
     timestamp: Date.now(),
     members,
     keys,

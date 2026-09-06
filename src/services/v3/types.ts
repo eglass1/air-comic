@@ -108,9 +108,13 @@ export interface RekeyPacket {
   action: RekeyAction;
   targetParticipantId?: string;
   targetScreenName?: string;
+  targetAvatarName?: string;
   signerId: string;
   signerSigningPublicKey: string;
   signerScreenName: string;
+  /** Carried beside the screen name so an admitted member can be drawn as
+   *  themselves rather than as the default character [PR-04]. */
+  signerAvatarName?: string;
   timestamp: number;
   /** Sorted, deduplicated participantIds. */
   members: string[];

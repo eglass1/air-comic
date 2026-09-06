@@ -154,6 +154,9 @@ describe('room title propagation -- [M-01]', () => {
     const secret = generateRoomSecret();
     const alice = await makeProfile('Alice');
     const bob = await makeProfile('Bob');
+    // Not the default, so drawing the default would be a visible failure.
+    alice.avatarName = 'Susan';
+    bob.avatarName = 'Tux';
 
     const aliceRoom = new RoomSession({
       tabId: 'a',
@@ -186,7 +189,16 @@ describe('room title propagation -- [M-01]', () => {
     expect(alicesEntry!.isApproved).toBe(true);
     // She just signed the admission, so she is genuinely here.
     expect(alicesEntry!.status).toBe('online');
+    // And she is drawn as herself, not as the default character.
+    expect(alicesEntry!.avatarName).toBe('Susan');
     expect(bobRoom.participants.length).toBe(2);
+
+    // The admission names the new member too, so the room she was admitted
+    // into can draw her without waiting for her to speak either.
+    const bobsEntry = aliceRoom.participants.find(
+      (p) => p.participantId === bob.participantId
+    );
+    expect(bobsEntry?.avatarName).toBe('Tux');
 
     aliceRoom.destroy();
     bobRoom.destroy();

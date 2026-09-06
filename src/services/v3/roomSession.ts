@@ -941,11 +941,19 @@ export class RoomSession {
 
     const remember = (
       participantId: string,
-      options: { screenName?: string; signingKey?: string; active?: boolean }
+      options: {
+        screenName?: string;
+        avatarName?: string;
+        signingKey?: string;
+        active?: boolean;
+      }
     ) => {
       if (!participantId || participantId === selfId) return;
       const existing = this.participantsMap.get(participantId);
       const name = options.screenName?.trim() || existing?.screenName || 'Anonymous';
+      // Whoever the packet names is drawn as themselves straight away; the
+      // default character is for someone we genuinely have not met yet.
+      const avatar = options.avatarName?.trim() || existing?.avatarName || 'Armando';
       const signing = options.signingKey
         ? normalizePublicKey(options.signingKey)
         : existing?.signingPublicKey ?? '';
@@ -958,6 +966,7 @@ export class RoomSession {
       if (
         existing &&
         existing.screenName === name &&
+        existing.avatarName === avatar &&
         existing.signingPublicKey === signing &&
         existing.status === status &&
         existing.isApproved === approved
@@ -972,7 +981,7 @@ export class RoomSession {
         publicKey: existing?.publicKey ?? '',
         signingPublicKey: signing,
         screenName: name,
-        avatarName: existing?.avatarName || 'Armando',
+        avatarName: avatar,
         contactInfo: existing?.contactInfo,
         lastSeen: options.active ? packet.timestamp : existing?.lastSeen ?? packet.timestamp,
         isSelf: false,
@@ -987,12 +996,14 @@ export class RoomSession {
     // These two are the only identities a rekey actually names.
     remember(packet.signerId, {
       screenName: packet.signerScreenName,
+      avatarName: packet.signerAvatarName,
       signingKey: packet.signerSigningPublicKey,
       active: true,
     });
     if (packet.targetParticipantId) {
       remember(packet.targetParticipantId, {
         screenName: packet.targetScreenName,
+        avatarName: packet.targetAvatarName,
         active: true,
       });
     }
@@ -1461,6 +1472,7 @@ export class RoomSession {
       action: 'add',
       targetParticipantId: targetId,
       targetScreenName: request.sender.screenName,
+      targetAvatarName: request.sender.avatarName,
       members: [...head.members, targetId],
       parentPacketId: head.packetId,
       parentKeyId: head.keyId,
@@ -1511,12 +1523,15 @@ export class RoomSession {
       parentKeyId: head.parentKeyId,
       action: 'reshare',
       targetParticipantId: request.sender.participantId,
+      targetScreenName: request.sender.screenName,
+      targetAvatarName: request.sender.avatarName,
       members: head.members,
       publicKeys,
       rawEpochKey: raw,
       signerId: this.profile.participantId,
       signerSigningPublicKey: this.profile.signingPublicKeyBase64,
       signerScreenName: this.profile.screenName,
+      signerAvatarName: this.profile.avatarName,
       signingPrivateKey: this.signingPrivateKey,
     });
     await this.publishControl(packet, packet.packetId);
@@ -1539,6 +1554,7 @@ export class RoomSession {
     epoch: number;
     targetParticipantId?: string;
     targetScreenName?: string;
+    targetAvatarName?: string;
   }): Promise<boolean> {
     if (!this.profile || !this.signingPrivateKey) return false;
 
@@ -1561,12 +1577,14 @@ export class RoomSession {
         action: params.action,
         targetParticipantId: params.targetParticipantId,
         targetScreenName: params.targetScreenName,
+        targetAvatarName: params.targetAvatarName,
         members,
         publicKeys,
         rawEpochKey: epochKey.rawBuffer,
         signerId: this.profile.participantId,
         signerSigningPublicKey: this.profile.signingPublicKeyBase64,
         signerScreenName: this.profile.screenName,
+        signerAvatarName: this.profile.avatarName,
         signingPrivateKey: this.signingPrivateKey,
       });
 
