@@ -34,6 +34,7 @@ import {
   MAX_CHAT_TEXT_BYTES,
   OLD_ROUTE_MONITOR_MS,
   PUBLIC_KEY_ID,
+  PUBLIC_PRESENCE_REFRESH_MS,
   ROOT_KEY_ID,
   T_ROOM_PACKET,
   WEBRTC_MEMBER_THRESHOLD,
@@ -88,6 +89,11 @@ import {
   verifyRoomMetadata,
 } from './packets';
 import { byteLength } from './validate';
+import {
+  directoryService,
+  occupancyBucket,
+  PublicRoomPresenceBeacon,
+} from './directory';
 import type {
   AccelerationStatus,
   CapabilityRotationPacket,
@@ -170,6 +176,8 @@ export class RoomSession {
   public failedSendCount = 0;
   public collisions = 0;
   public isForeground = false;
+  /** Public rooms only. Approximate by construction [PU-04]. */
+  public approximateOccupancy: string | null = null;
 
   // --- Internals ------------------------------------------------------------
   private profile: UserProfile | null = null;
@@ -199,6 +207,8 @@ export class RoomSession {
   private orphanControl: Array<RekeyPacket | CapabilityRotationPacket> = [];
   private unsubHealth: (() => void) | null = null;
   private unsubOutbox: (() => void) | null = null;
+  private beacon: PublicRoomPresenceBeacon | null = null;
+  private occupancyTimer: ReturnType<typeof setInterval> | null = null;
 
   private isDestroyed = false;
   private isInitialized = false;
@@ -322,6 +332,10 @@ export class RoomSession {
         void this.sendJoinRequest();
       }
       this.watchPreviousRoutes();
+    } else {
+      // Public rooms have no join request, epoch, rekey or roster [PU-05].
+      await this.persistConversation();
+      await this.startOccupancy();
     }
 
     // Anchor the chain before replaying history: without genesis, every rekey
@@ -329,6 +343,29 @@ export class RoomSession {
     if (this.roomMode === 'private') await this.fetchGenesis();
     await this.catchUpHistory();
     this.notify();
+  }
+
+  /**
+   * Announces our presence in a public room and tracks the approximate count.
+   * The beacon carries no identity beyond a room-scoped pseudonym [PU-04][L-09].
+   */
+  private async startOccupancy(): Promise<void> {
+    if (this.roomMode !== 'public' || !this.profile || !this.publicRoomId) return;
+
+    this.beacon = new PublicRoomPresenceBeacon();
+    await this.beacon.start(this.profile.signingPrivateKeyJwk, this.publicRoomId);
+
+    const refresh = async () => {
+      if (!this.publicRoomId) return;
+      const counts = await directoryService.fetchOccupancy([this.publicRoomId]);
+      const next = occupancyBucket(counts.get(this.publicRoomId) ?? 0);
+      if (next !== this.approximateOccupancy) {
+        this.approximateOccupancy = next;
+        this.notify();
+      }
+    };
+    void refresh();
+    this.occupancyTimer = setInterval(() => void refresh(), PUBLIC_PRESENCE_REFRESH_MS);
   }
 
   private addSelfParticipant() {
@@ -1609,6 +1646,8 @@ export class RoomSession {
     this.stopJoinRetry();
     this.subscription?.close();
     this.oldRouteSubscription?.close();
+    this.beacon?.stop();
+    if (this.occupancyTimer) clearInterval(this.occupancyTimer);
     this.unsubHealth?.();
     this.unsubOutbox?.();
     this.participantsMap.clear();
