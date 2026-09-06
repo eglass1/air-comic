@@ -165,7 +165,9 @@ export class DirectoryService {
    * of the whole directory. The descriptor is what says who created the room,
    * which is the only authority a public room has [PU-02].
    */
-  async fetchRoom(publicRoomId: string): Promise<PublicRoomDescriptorPacket | null> {
+  async fetchRoomStatus(
+    publicRoomId: string
+  ): Promise<{ descriptor: PublicRoomDescriptorPacket | null; isTombstoned: boolean }> {
     const events = await relayPool.query(dTagFilters([publicRoomId], 10), { timeoutMs: 6000 });
 
     let newest: PublicRoomDescriptorPacket | null = null;
@@ -189,15 +191,21 @@ export class DirectoryService {
       }
     }
 
-    if (!newest) return null;
-    if (
+    const isTombstoned = Boolean(
       tombstone &&
-      tombstone.closedAt >= newest.updatedAt &&
-      tombstone.creatorId === newest.creatorId
-    ) {
-      return null;
+      (!newest || (tombstone.closedAt >= newest.updatedAt && tombstone.creatorId === newest.creatorId))
+    );
+
+    if (isTombstoned) {
+      return { descriptor: null, isTombstoned: true };
     }
-    return newest;
+
+    return { descriptor: newest, isTombstoned: false };
+  }
+
+  async fetchRoom(publicRoomId: string): Promise<PublicRoomDescriptorPacket | null> {
+    const { descriptor } = await this.fetchRoomStatus(publicRoomId);
+    return descriptor;
   }
 
   /**

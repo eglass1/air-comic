@@ -52,8 +52,10 @@ import {
 } from '../services/v3/packets';
 import { loadSettings, saveRelayUrls, saveWebrtcEnabled } from '../services/v3/relayConfig';
 import type { AccelerationStatus } from '../services/v3/types';
+import { deserializeChain, wasRemoved } from '../services/v3/epochChain';
 
 const STORAGE_KEY_TABS = 'aircomic_open_tabs';
+const STORAGE_KEY_ACTIVE_TAB = 'aircomic_active_tab';
 
 /** Shared so a room-less render does not hand consumers a new array each time. */
 const EMPTY_PARTICIPANTS: Participant[] = [];
@@ -305,11 +307,25 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const persistTabs = useCallback((next: RoomTab[]) => {
     try {
-      sessionStorage.setItem(STORAGE_KEY_TABS, JSON.stringify(next));
+      const payload = JSON.stringify(next);
+      localStorage.setItem(STORAGE_KEY_TABS, payload);
+      sessionStorage.setItem(STORAGE_KEY_TABS, payload);
     } catch {
-      /* session storage is a convenience only */
+      /* storage is a convenience only */
     }
   }, []);
+
+  const persistActiveTab = useCallback((tabId: string, convId?: string) => {
+    try {
+      const payload = JSON.stringify({ tabId, convId });
+      localStorage.setItem(STORAGE_KEY_ACTIVE_TAB, payload);
+      sessionStorage.setItem(STORAGE_KEY_ACTIVE_TAB, payload);
+    } catch {
+      /* storage is a convenience only */
+    }
+  }, []);
+
+  const omitRoomRef = useRef<(tabId: string) => void>(() => {});
 
   /**
    * A room's name and its secret are decided by the room, not by the tab that
@@ -358,6 +374,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         },
         {
           onStateChange: (s) => {
+            if (s.isRemoved || s.isGone) {
+              omitRoomRef.current(s.tabId);
+              return;
+            }
             syncTabFromSession(s);
             rerender();
           },
@@ -370,6 +390,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
               );
             }
             rerender();
+          },
+          onRemoved: (s) => {
+            omitRoomRef.current(s.tabId);
+          },
+          onRoomGone: (s) => {
+            omitRoomRef.current(s.tabId);
           },
         }
       );
@@ -404,11 +430,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       setActiveTabId(tabId);
       activeTabIdRef.current = tabId;
+      persistActiveTab(tabId, target.convId);
       setTabs((prev) => prev.map((t) => (t.tabId === tabId ? { ...t, unreadCount: 0 } : t)));
       syncBrowserUrl(target);
       rerender();
     },
-    [syncBrowserUrl, rerender]
+    [persistActiveTab, syncBrowserUrl, rerender]
   );
 
   const openTab = useCallback(
@@ -467,16 +494,43 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       persistTabs(next);
       setActiveTabId(tabId);
       activeTabIdRef.current = tabId;
+      persistActiveTab(tabId, tab.convId);
       sessionsRef.current.forEach((session, id) => session.setForeground(id === tabId));
       syncBrowserUrl(tab);
       rerender();
       return tabId;
     },
-    [getOrCreateSession, persistTabs, switchTab, syncBrowserUrl, rerender]
+    [getOrCreateSession, persistTabs, persistActiveTab, switchTab, syncBrowserUrl, rerender]
   );
 
   const openTabRef = useRef(openTab);
   openTabRef.current = openTab;
+
+  const omitRoom = useCallback(
+    (tabId: string) => {
+      sessionsRef.current.get(tabId)?.destroy();
+      sessionsRef.current.delete(tabId);
+
+      const remaining = tabsRef.current.filter((t) => t.tabId !== tabId);
+      tabsRef.current = remaining;
+      setTabs(remaining);
+      persistTabs(remaining);
+
+      if (remaining.length === 0) {
+        openTabRef.current({ roomMode: 'private', isInitialCreator: true });
+        return;
+      }
+      if (activeTabIdRef.current === tabId) {
+        switchTab(remaining[remaining.length - 1].tabId);
+      } else {
+        const currentActive = remaining.find((t) => t.tabId === activeTabIdRef.current);
+        if (currentActive) persistActiveTab(currentActive.tabId, currentActive.convId);
+        rerender();
+      }
+    },
+    [persistTabs, persistActiveTab, switchTab, rerender]
+  );
+  omitRoomRef.current = omitRoom;
 
   const closeTab = useCallback(
     (tabId: string) => {
@@ -492,9 +546,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         openTabRef.current({ roomMode: 'private' });
         return;
       }
-      if (activeTabIdRef.current === tabId) switchTab(remaining[remaining.length - 1].tabId);
+      if (activeTabIdRef.current === tabId) {
+        switchTab(remaining[remaining.length - 1].tabId);
+      } else {
+        const currentActive = remaining.find((t) => t.tabId === activeTabIdRef.current);
+        if (currentActive) persistActiveTab(currentActive.tabId, currentActive.convId);
+      }
     },
-    [persistTabs, switchTab]
+    [persistTabs, persistActiveTab, switchTab]
   );
 
   const createPrivateRoomTab = useCallback(
@@ -596,9 +655,43 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Restore open tabs, or derive the first one from the URL.
       let restored: RoomTab[] = [];
       try {
-        restored = JSON.parse(sessionStorage.getItem(STORAGE_KEY_TABS) || '[]');
+        const rawTabs =
+          sessionStorage.getItem(STORAGE_KEY_TABS) || localStorage.getItem(STORAGE_KEY_TABS);
+        restored = JSON.parse(rawTabs || '[]');
       } catch {
         restored = [];
+      }
+
+      // Filter out invalid tabs or private rooms without secrets
+      restored = restored.filter((tab) => {
+        if (!tab || !tab.convId || !tab.tabId) return false;
+        if (tab.roomMode === 'private' && !tab.roomSecret?.trim()) return false;
+        return true;
+      });
+
+      // Filter out private rooms where stored local chain already records that the user was removed
+      const validRestored: RoomTab[] = [];
+      for (const tab of restored) {
+        if (tab.roomMode === 'private') {
+          const storedChain = await db.getChain(tab.convId);
+          if (storedChain) {
+            const chain = deserializeChain(storedChain);
+            if (wasRemoved(chain, loaded.participantId)) {
+              continue; // Omitted! User was removed
+            }
+          }
+        }
+        validRestored.push(tab);
+      }
+      restored = validRestored;
+
+      let savedActive: { tabId?: string; convId?: string } | null = null;
+      try {
+        const rawActive =
+          sessionStorage.getItem(STORAGE_KEY_ACTIVE_TAB) || localStorage.getItem(STORAGE_KEY_ACTIVE_TAB);
+        if (rawActive) savedActive = JSON.parse(rawActive);
+      } catch {
+        savedActive = null;
       }
 
       const urlRoom = readRoomFromLocation();
@@ -606,16 +699,25 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (restored.length > 0) {
         tabsRef.current = restored;
         setTabs(restored);
+        persistTabs(restored);
         restored.forEach(getOrCreateSession);
-        setActiveTabId(restored[0].tabId);
-        activeTabIdRef.current = restored[0].tabId;
-        sessionsRef.current.get(restored[0].tabId)?.setForeground(true);
+
+        const activeTabToSelect =
+          (savedActive &&
+            (restored.find((t) => t.tabId === savedActive?.tabId) ||
+             restored.find((t) => t.convId === savedActive?.convId))) ||
+          restored[0];
+
+        setActiveTabId(activeTabToSelect.tabId);
+        activeTabIdRef.current = activeTabToSelect.tabId;
+        persistActiveTab(activeTabToSelect.tabId, activeTabToSelect.convId);
+        sessionsRef.current.get(activeTabToSelect.tabId)?.setForeground(true);
 
         // A link pasted into the address bar of a window that already has rooms
         // open is still a request to open that room: restoring the session must
         // not swallow it. openTab switches to the room if it is already here.
         if (urlRoom) openTabRef.current(urlRoom);
-        else syncBrowserUrl(restored[0]);
+        else syncBrowserUrl(activeTabToSelect);
       } else {
         openTabRef.current(urlRoom ?? { roomMode: 'private', isInitialCreator: true });
       }

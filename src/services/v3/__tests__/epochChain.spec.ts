@@ -9,6 +9,7 @@ import {
   deserializeChain,
   isMember,
   serializeChain,
+  wasRemoved,
   type ChainState,
 } from '../epochChain';
 import { MAX_PRIVATE_MEMBERS_HARD } from '../constants';
@@ -43,6 +44,26 @@ function rekey(over: Partial<RekeyPacket>): RekeyPacket {
     keys: Object.fromEntries(members.map((m) => [m, 'wrapped'])),
     ...over,
   } as RekeyPacket;
+}
+
+function rotation(over: Partial<CapabilityRotationPacket> = {}): CapabilityRotationPacket {
+  const members = over.members ?? [ALICE];
+  return {
+    type: 'capability_rotation',
+    convId: CONV,
+    packetId: 'rot-1',
+    generation: 1,
+    newEpoch: 3,
+    newKeyId: 'k3',
+    parentPacketId: 'e2',
+    parentKeyId: 'k2',
+    removedParticipantId: BOB,
+    members,
+    wrapped: Object.fromEntries(members.map((m) => [m, 'sealed'])),
+    signerId: ALICE,
+    timestamp: Date.now(),
+    ...over,
+  } as CapabilityRotationPacket;
 }
 
 let state: ChainState;
@@ -288,26 +309,6 @@ describe('fork resolution -- [PR-05]', () => {
 });
 
 describe('capability rotation -- [X-08]', () => {
-  function rotation(over: Partial<CapabilityRotationPacket> = {}): CapabilityRotationPacket {
-    const members = over.members ?? [ALICE];
-    return {
-      type: 'capability_rotation',
-      convId: CONV,
-      packetId: 'rot-1',
-      generation: 1,
-      newEpoch: 3,
-      newKeyId: 'k3',
-      parentPacketId: 'e2',
-      parentKeyId: 'k2',
-      removedParticipantId: BOB,
-      members,
-      wrapped: Object.fromEntries(members.map((m) => [m, 'sealed'])),
-      signerId: ALICE,
-      timestamp: Date.now(),
-      ...over,
-    } as CapabilityRotationPacket;
-  }
-
   beforeEach(() => {
     openChain();
     applyRekey(state, rekey({
@@ -354,5 +355,40 @@ describe('persistence', () => {
     expect(chainHead(restored)!.packetId).toBe('e2');
     expect(currentMembers(restored)).toEqual([ALICE, BOB]);
     expect(restored.genesis!.creatorId).toBe(ALICE);
+  });
+});
+
+describe('wasRemoved', () => {
+  it('detects when a member was removed by capability rotation', () => {
+    openChain();
+    applyRekey(state, rekey({
+      packetId: 'e2', keyId: 'k2', epoch: 2, action: 'add',
+      parentPacketId: 'e1', parentKeyId: 'k1',
+      targetParticipantId: BOB, members: [ALICE, BOB],
+    }));
+    expect(wasRemoved(state, BOB)).toBe(false);
+    expect(wasRemoved(state, ALICE)).toBe(false);
+    expect(wasRemoved(state, CAROL)).toBe(false);
+
+    applyCapabilityRotation(state, rotation());
+    expect(wasRemoved(state, BOB)).toBe(true);
+    expect(wasRemoved(state, ALICE)).toBe(false);
+    expect(wasRemoved(state, CAROL)).toBe(false);
+  });
+
+  it('detects when a member was removed by rekey', () => {
+    openChain();
+    applyRekey(state, rekey({
+      packetId: 'e2', keyId: 'k2', epoch: 2, action: 'add',
+      parentPacketId: 'e1', parentKeyId: 'k1',
+      targetParticipantId: BOB, members: [ALICE, BOB],
+    }));
+    applyRekey(state, rekey({
+      packetId: 'e3', keyId: 'k3', epoch: 3, action: 'remove',
+      parentPacketId: 'e2', parentKeyId: 'k2',
+      targetParticipantId: BOB, members: [ALICE],
+    }));
+    expect(wasRemoved(state, BOB)).toBe(true);
+    expect(wasRemoved(state, ALICE)).toBe(false);
   });
 });

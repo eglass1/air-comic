@@ -59,6 +59,7 @@ import {
   isMember,
   membersAt,
   serializeChain,
+  wasRemoved,
   type ChainState,
 } from './epochChain';
 import {
@@ -147,6 +148,8 @@ export interface RoomSessionConfig {
 export interface RoomSessionCallbacks {
   onStateChange?: (session: RoomSession) => void;
   onNewMessage?: (session: RoomSession, message: ChatMessage) => void;
+  onRemoved?: (session: RoomSession) => void;
+  onRoomGone?: (session: RoomSession) => void;
 }
 
 export class RoomSession {
@@ -182,6 +185,8 @@ export class RoomSession {
   public roomFingerprint = '';
   public pendingJoinRequests: PendingJoinRequest[] = [];
   public isSecretMissing = false;
+  public isRemoved = false;
+  public isGone = false;
   /** A public room answers to its directory listing's creator alone [PU-02]. */
   public publicRoomCreatorId: string | null = null;
   public pendingSendCount = 0;
@@ -321,7 +326,9 @@ export class RoomSession {
 
     if (this.roomMode === 'private' && !this.roomSecret) {
       this.isSecretMissing = true;
+      this.isGone = true;
       this.connectionStatus = 'error';
+      this.callbacks.onRoomGone?.(this);
       this.notify();
       return;
     }
@@ -330,6 +337,13 @@ export class RoomSession {
     this.addSelfParticipant();
     await this.deriveRoute();
     await this.restoreLocalState();
+
+    if (this.isRemoved) {
+      this.stopJoinRetry();
+      this.callbacks.onRemoved?.(this);
+      this.notify();
+      return;
+    }
 
     this.messages = await this.db.getMessages(this.convId);
 
@@ -371,6 +385,7 @@ export class RoomSession {
     // is unvalidatable and would be buffered rather than applied [L-05].
     if (this.roomMode === 'private') await this.fetchGenesis();
     await this.catchUpHistory();
+    if (this.isRemoved || this.isGone) return;
     // The room's own name, so a member who arrived by link shows what everyone
     // else shows instead of inventing one locally [M-01].
     await this.fetchRoomMetadata();
@@ -411,7 +426,15 @@ export class RoomSession {
     if (this.isInitialCreator) this.publicRoomCreatorId = this.profile.participantId;
     if (!this.publicRoomId) return;
 
-    const descriptor = await directoryService.fetchRoom(this.publicRoomId);
+    const status = await directoryService.fetchRoomStatus(this.publicRoomId);
+    if (status.isTombstoned) {
+      this.isGone = true;
+      this.callbacks.onRoomGone?.(this);
+      this.notify();
+      return;
+    }
+
+    const descriptor = status.descriptor;
     if (!descriptor || descriptor.convId !== this.convId) return;
 
     this.publicDescriptor = descriptor;
@@ -557,6 +580,9 @@ export class RoomSession {
       this.activeKeyId = head.keyId;
       this.activeEpoch = head.epoch;
       this.isApproved = head.members.includes(this.profile.participantId);
+      if (wasRemoved(this.chain, this.profile.participantId)) {
+        this.isRemoved = true;
+      }
       this.syncParticipantApproval();
     }
   }
@@ -1155,9 +1181,18 @@ export class RoomSession {
       const wasApproved = this.isApproved;
       this.isApproved = packet.members.includes(this.profile.participantId);
 
-      if (!this.isApproved && wasApproved) {
-        // Removed. In v3 the route rotates too, so this is mostly informational.
-        this.startJoinRetry();
+      if (
+        (packet.action === 'remove' && packet.targetParticipantId === this.profile.participantId) ||
+        (!this.isApproved && wasApproved) ||
+        wasRemoved(this.chain, this.profile.participantId)
+      ) {
+        this.isApproved = false;
+        this.isRemoved = true;
+        this.stopJoinRetry();
+        this.syncParticipantApproval();
+        this.callbacks.onRemoved?.(this);
+        this.notify();
+        return;
       } else if (this.isApproved) {
         this.stopJoinRetry();
       }
@@ -1192,11 +1227,24 @@ export class RoomSession {
 
     await this.recordChainPacket(packet.packetId, packet.newEpoch, packet);
 
+    if (packet.removedParticipantId === this.profile.participantId) {
+      this.isApproved = false;
+      this.isRemoved = true;
+      this.stopJoinRetry();
+      this.syncParticipantApproval();
+      this.callbacks.onRemoved?.(this);
+      this.notify();
+      return;
+    }
+
     const secrets = await openRotationSlot(packet, this.profile.participantId, this.privateKey);
     if (!secrets) {
       // No slot: we are the removed member. Stop here.
       this.isApproved = false;
+      this.isRemoved = true;
+      this.stopJoinRetry();
       this.syncParticipantApproval();
+      this.callbacks.onRemoved?.(this);
       this.notify();
       return;
     }

@@ -50,6 +50,22 @@ export function isMember(state: ChainState, participantId: string): boolean {
 }
 
 /**
+ * True when a participant was once a member of the room's chain but is not
+ * in the canonical head epoch (i.e. they were removed).
+ */
+export function wasRemoved(state: ChainState, participantId: string): boolean {
+  const head = chainHead(state);
+  if (!head) return false;
+  if (head.members.includes(participantId)) return false;
+  for (const node of state.nodes.values()) {
+    if (node.members.includes(participantId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Membership as it stood at a given time, for authorization checks on packets
  * that arrive out of order [M-02].
  */
