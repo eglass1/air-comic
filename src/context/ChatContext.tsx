@@ -3,7 +3,6 @@ import React, {
   useCallback,
   useContext,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -49,6 +48,9 @@ import { loadSettings, saveRelayUrls, saveWebrtcEnabled } from '../services/v3/r
 import type { AccelerationStatus } from '../services/v3/types';
 
 const STORAGE_KEY_TABS = 'aircomic_open_tabs';
+
+/** Shared so a room-less render does not hand consumers a new array each time. */
+const EMPTY_PARTICIPANTS: Participant[] = [];
 
 export interface QuickMessageTarget {
   participantId: string;
@@ -581,6 +583,19 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Profile and contacts
   // --------------------------------------------------------------------------
 
+  /**
+   * The sessions and the presence service each hold their own copy of the
+   * profile, taken when they started. Nothing else tells them a name or an
+   * avatar changed, so an edit has to be handed to them here.
+   */
+  const propagateProfile = useCallback(async (next: UserProfile) => {
+    await presenceService.applyProfile(next);
+    await Promise.all(
+      Array.from(sessionsRef.current.values()).map((session) => session.applyProfile(next))
+    );
+    rerender();
+  }, [rerender]);
+
   const updateProfile = useCallback(async (updates: Partial<UserProfile>) => {
     const current = profileRef.current;
     if (!current) return;
@@ -588,7 +603,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await db.saveProfile(next);
     setProfile(next);
     profileRef.current = next;
-  }, []);
+    await propagateProfile(next);
+  }, [propagateProfile]);
 
   const regenerateKeypair = useCallback(async () => {
     const current = profileRef.current;
@@ -597,7 +613,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setProfile(next);
     profileRef.current = next;
     setFingerprint(await getPublicKeyFingerprint(next.signingPublicKeyBase64));
-  }, []);
+    await propagateProfile(next);
+  }, [propagateProfile]);
 
   const exportProfileAsJson = useCallback(
     () => (profileRef.current ? JSON.stringify(profileRef.current, null, 2) : ''),
@@ -615,6 +632,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setProfile(next);
       profileRef.current = next;
       setFingerprint(await getPublicKeyFingerprint(next.signingPublicKeyBase64));
+      await propagateProfile(next);
       return true;
     } catch {
       return false;
@@ -1123,11 +1141,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Active-room passthroughs
   // --------------------------------------------------------------------------
 
-  const participants = useMemo(
-    () => (activeSession ? Array.from(activeSession.participantsMap.values()) : []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeSession, activeSession?.participantsMap.size, activeTabId]
-  );
+  // `RoomSession` replaces this array on every roster change, so no memo is
+  // needed and none may be used: keying one on the map's size would miss a
+  // rename, a new avatar or a status flip.
+  const participants = activeSession?.participants ?? EMPTY_PARTICIPANTS;
 
   const approveJoinRequest = useCallback(async (requestOrId: PendingJoinRequest | string) => {
     const session = sessionsRef.current.get(activeTabIdRef.current);

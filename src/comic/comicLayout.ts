@@ -57,7 +57,7 @@ export interface LayoutOptions {
   defaultBackdrop: string;
   roomName: string;
   titleAvatars?: string[];
-  profile?: { screenName?: string; avatarName?: string } | null;
+  profile?: { participantId?: string; screenName?: string; avatarName?: string } | null;
   participants?: Participant[];
   /**
    * Avatar proportions, so the panel camera can size the cast. Returns null for
@@ -304,11 +304,15 @@ export class ComicLayoutEngine {
         : ComicLayoutEngine.getRandomTitleAvatars();
 
     // Collect starring cast members in chronological order of appearance (bumping up when > 3)
+    // Keyed by identity, never by name: someone who renames mid-room would
+    // otherwise star twice, once under each name they have used.
     const seenMembersMap = new Map<string, { screenName: string; avatarName: string }>();
+    const castKey = (id: string | undefined, screenName: string) =>
+      id || `name:${screenName.toLowerCase()}`;
 
     // 1. Initial participant / profile seed
     if (options.profile?.screenName) {
-      seenMembersMap.set(options.profile.screenName.toLowerCase(), {
+      seenMembersMap.set(castKey(options.profile.participantId, options.profile.screenName), {
         screenName: options.profile.screenName,
         avatarName: options.profile.avatarName || 'Armando',
       });
@@ -316,12 +320,13 @@ export class ComicLayoutEngine {
 
     if (options.participants) {
       options.participants.forEach((p) => {
-        if (p.screenName && !seenMembersMap.has(p.screenName.toLowerCase())) {
-          seenMembersMap.set(p.screenName.toLowerCase(), {
-            screenName: p.screenName,
-            avatarName: p.avatarName || 'Susan',
-          });
-        }
+        if (!p.screenName) return;
+        const key = castKey(p.participantId, p.screenName);
+        if (seenMembersMap.has(key)) return;
+        seenMembersMap.set(key, {
+          screenName: p.screenName,
+          avatarName: p.avatarName || 'Susan',
+        });
       });
     }
 
@@ -331,7 +336,7 @@ export class ComicLayoutEngine {
       const sName = msg.sender?.screenName || (msg as any).senderName;
       const aName = msg.sender?.avatarName || (msg as any).avatarName;
       if (sName) {
-        const key = sName.toLowerCase();
+        const key = castKey(msg.senderId, sName);
         seenMembersMap.delete(key);
         seenMembersMap.set(key, {
           screenName: sName,

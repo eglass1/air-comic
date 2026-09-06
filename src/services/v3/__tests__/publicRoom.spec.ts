@@ -113,6 +113,79 @@ describe('public room messaging', () => {
     bobRoom.destroy();
   }, 20000);
 
+  it('replaces the messages array rather than mutating it, so React sees the change', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+
+    const aliceRoom = new RoomSession({
+      tabId: 'ia', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await aliceRoom.init(alice);
+    const bobRoom = new RoomSession({
+      tabId: 'ib', convId, roomMode: 'public', publicJoinToken: joinToken,
+      database: freshDb(),
+    });
+    await bobRoom.init(bob);
+    await settle();
+
+    // The comic strip lays its panels out in a useMemo keyed on this array, so
+    // an in-place splice would leave the view frozen until something else --
+    // a tab switch -- handed it a different reference.
+    const bobBefore = bobRoom.messages;
+    const aliceBefore = aliceRoom.messages;
+
+    await aliceRoom.sendMessage('a new panel please');
+    await settle(120);
+
+    expect(aliceRoom.messages).not.toBe(aliceBefore);
+    expect(bobRoom.messages).not.toBe(bobBefore);
+    expect(bobRoom.messages.some((m) => m.text === 'a new panel please')).toBe(true);
+
+    // The send-state promotion is a replacement too: the record reaches
+    // 'relayed' on a fresh array and a fresh message object.
+    const sent = aliceRoom.messages.find((m) => m.text === 'a new panel please')!;
+    expect(sent.sendState).toBe('relayed');
+    expect(aliceBefore.some((m) => m.id === sent.id)).toBe(false);
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  }, 20000);
+
+  it('carries a renamed profile into the roster and the participants snapshot', async () => {
+    const convId = crypto.randomUUID();
+    const joinToken = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+
+    const room = new RoomSession({
+      tabId: 'ra', convId, roomMode: 'public', publicJoinToken: joinToken,
+      isInitialCreator: true, database: freshDb(),
+    });
+    await room.init(alice);
+    await settle();
+
+    expect(room.participants.map((p) => p.screenName)).toEqual(['Alice']);
+    const before = room.participants;
+
+    // Renaming keeps the identity: the same roster entry, under a new name, on
+    // a new array so a memo downstream of it recomputes.
+    await room.applyProfile({ ...alice, screenName: 'Alicia' });
+
+    expect(room.participants).not.toBe(before);
+    expect(room.participants.map((p) => p.screenName)).toEqual(['Alicia']);
+    expect(room.participantsMap.size).toBe(1);
+    expect(room.participants[0].participantId).toBe(alice.participantId);
+
+    // ...and the name we go on to sign with is the new one.
+    await room.sendMessage('renamed and still me');
+    await settle(120);
+    expect(room.messages.at(-1)!.sender.screenName).toBe('Alicia');
+
+    room.destroy();
+  }, 20000);
+
   it('rejects a public message with a broken signature -- [PU-01]', async () => {
     const convId = crypto.randomUUID();
     const joinToken = generateRoomSecret();

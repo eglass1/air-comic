@@ -290,6 +290,21 @@ export class PresenceService {
     }
   }
 
+  /**
+   * Adopts an edited profile. A rename or a new avatar is announced on the spot
+   * rather than at the next refresh; new key material means new tags and a new
+   * inbox, which only a restart derives.
+   */
+  async applyProfile(profile: UserProfile): Promise<void> {
+    if (!this.profile) return;
+    if (profile.participantId !== this.profile.participantId) {
+      await this.start(profile);
+      return;
+    }
+    this.profile = profile;
+    await this.publishPresence('online');
+  }
+
   // --- Presence -------------------------------------------------------------
 
   async publishPresence(status: PresenceStatus): Promise<void> {

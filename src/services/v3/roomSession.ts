@@ -165,6 +165,12 @@ export class RoomSession {
   public accelerationStatus: AccelerationStatus = 'unavailable';
   public connectedPeersCount = 0;
   public participantsMap: Map<string, Participant> = new Map();
+  /**
+   * A snapshot of `participantsMap`, replaced whenever the map changes. React
+   * reads this: the map is mutated in place, so its identity says nothing about
+   * whether a name, avatar or status moved.
+   */
+  public participants: Participant[] = [];
   public messages: ChatMessage[] = [];
   public activeKeyId: string = ROOT_KEY_ID;
   public activeEpoch = 0;
@@ -273,6 +279,11 @@ export class RoomSession {
     if (!this.isDestroyed) this.callbacks.onStateChange?.(this);
   }
 
+  /** Call after every write to `participantsMap`, so the snapshot keeps up. */
+  private commitParticipants() {
+    this.participants = Array.from(this.participantsMap.values());
+  }
+
   // --------------------------------------------------------------------------
   // Initialisation
   // --------------------------------------------------------------------------
@@ -316,8 +327,9 @@ export class RoomSession {
       void this.refreshSendCounts();
       const message = this.messages.find((m) => m.id === change.packetId);
       if (message && message.sendState !== change.state) {
-        message.sendState = change.state;
-        void this.db.saveMessage(message);
+        const updated = { ...message, sendState: change.state };
+        this.messages = this.messages.map((m) => (m.id === updated.id ? updated : m));
+        void this.db.saveMessage(updated);
         this.notify();
       }
     });
@@ -383,6 +395,34 @@ export class RoomSession {
       status: 'online',
       isApproved: this.isApproved,
     });
+    this.commitParticipants();
+  }
+
+  /**
+   * Adopts an edited profile without tearing the room down. A rename or a new
+   * avatar has to reach the roster and everything we sign from here on;
+   * different key material is a different member, so that re-initialises.
+   */
+  async applyProfile(profile: UserProfile): Promise<void> {
+    if (!this.profile || this.isDestroyed) return;
+
+    if (profile.participantId !== this.profile.participantId) {
+      this.isInitialized = false;
+      this.subscription?.close();
+      this.subscription = null;
+      this.beacon?.stop();
+      this.beacon = null;
+      if (this.occupancyTimer) clearInterval(this.occupancyTimer);
+      this.occupancyTimer = null;
+      this.participantsMap.clear();
+      this.commitParticipants();
+      await this.init(profile);
+      return;
+    }
+
+    this.profile = profile;
+    this.addSelfParticipant();
+    this.notify();
   }
 
   /** Recomputes every route-dependent value from the current room secret. */
@@ -817,6 +857,7 @@ export class RoomSession {
       status: 'online',
       isApproved: this.roomMode === 'public' || isMember(this.chain, payload.senderId),
     });
+    this.commitParticipants();
   }
 
   /** Ordering is deterministic: timestamp, senderId, packetId [D-03]. */
@@ -835,7 +876,12 @@ export class RoomSession {
       if (after) break;
       index--;
     }
-    this.messages.splice(index, 0, message);
+    // A new array, never a splice in place: `messages` is read by React, and a
+    // memo keyed on it (the comic strip's panel layout) only recomputes when the
+    // reference changes.
+    const next = this.messages.slice();
+    next.splice(index, 0, message);
+    this.messages = next;
 
     void this.db.saveMessage(message);
     if (!isBackfill) this.callbacks.onNewMessage?.(this, message);
@@ -1155,6 +1201,7 @@ export class RoomSession {
       status: 'online',
       isApproved: true,
     });
+    this.commitParticipants();
 
     const head = chainHead(this.chain);
     if (!head) return false;
@@ -1402,6 +1449,7 @@ export class RoomSession {
       this.activeKeyId = newKeyId;
       this.activeEpoch = head.epoch + 1;
       this.participantsMap.delete(participantId);
+      this.commitParticipants();
       this.autoApproveIds.delete(participantId);
 
       await this.deriveRoute();
@@ -1427,12 +1475,15 @@ export class RoomSession {
 
   private syncParticipantApproval() {
     const members = currentMembers(this.chain);
+    let changed = false;
     for (const [id, participant] of this.participantsMap.entries()) {
       const approved = this.roomMode === 'public' || members.includes(id);
       if (participant.isApproved !== approved) {
         this.participantsMap.set(id, { ...participant, isApproved: approved });
+        changed = true;
       }
     }
+    if (changed) this.commitParticipants();
   }
 
   private async persistChain(): Promise<void> {
@@ -1685,6 +1736,7 @@ export class RoomSession {
     this.unsubHealth?.();
     this.unsubOutbox?.();
     this.participantsMap.clear();
+    this.commitParticipants();
     this.pendingRequestsMap.clear();
   }
 }
