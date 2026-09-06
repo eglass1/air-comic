@@ -24,11 +24,16 @@ import { getRandomChannelTitle } from '../utils/channelNameGenerator';
 interface CreatePublicRoomDialogProps {
   open: boolean;
   onClose: () => void;
+  onCreateSuccess?: () => void;
 }
 
 const POPULAR_TAGS = ['general', 'comics', 'retro', 'gaming', 'art', 'hangout', 'tech', 'music'];
 
-export const CreatePublicRoomDialog: React.FC<CreatePublicRoomDialogProps> = ({ open, onClose }) => {
+export const CreatePublicRoomDialog: React.FC<CreatePublicRoomDialogProps> = ({
+  open,
+  onClose,
+  onCreateSuccess,
+}) => {
   const { createPublicRoom } = useChat();
 
   const [name, setName] = useState('');
@@ -72,7 +77,11 @@ export const CreatePublicRoomDialog: React.FC<CreatePublicRoomDialogProps> = ({ 
       const combinedTags = Array.from(new Set([...selectedTags, ...extraTags]));
 
       await createPublicRoom(name.trim(), description.trim(), combinedTags, language);
-      onClose();
+      if (onCreateSuccess) {
+        onCreateSuccess();
+      } else {
+        onClose();
+      }
     } catch (err: any) {
       console.error('Failed to create public room:', err);
       setError(err?.message || 'Failed to publish public room to the directory.');
@@ -198,7 +207,7 @@ export const CreatePublicRoomDialog: React.FC<CreatePublicRoomDialogProps> = ({ 
           startIcon={isCreating ? <CircularProgress size={18} color="inherit" /> : <AddCircleOutlineIcon />}
           disabled={isCreating || !name.trim()}
         >
-          {isCreating ? 'Publishing to Directory...' : 'Create & Enter Room'}
+          {isCreating ? 'Publishing to Directory...' : 'Create'}
         </Button>
       </DialogActions>
     </Dialog>

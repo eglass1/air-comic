@@ -207,7 +207,7 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
                   </Typography>
                 </Box>
                 <Button variant="contained" color="primary" startIcon={<AddCircleIcon />} onClick={() => setIsCreateOpen(true)}>
-                  Create a Public Room
+                  Create
                 </Button>
               </Box>
             ) : (
@@ -310,7 +310,14 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
         </DialogActions>
       </Dialog>
 
-      <CreatePublicRoomDialog open={isCreateOpen} onClose={() => setIsCreateOpen(false)} />
+      <CreatePublicRoomDialog
+        open={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        onCreateSuccess={() => {
+          setIsCreateOpen(false);
+          onClose();
+        }}
+      />
 
       <Snackbar
         open={Boolean(snack)}
