@@ -94,6 +94,7 @@ const AppContent: React.FC = () => {
       >
         {/* Navbar */}
         <Navbar
+          isMobile={isMobile}
           themeMode={themeMode}
           onToggleTheme={toggleTheme}
           onOpenProfile={() => setProfileOpen(true)}

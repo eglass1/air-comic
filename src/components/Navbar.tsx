@@ -14,6 +14,8 @@ import {
   Badge,
   CircularProgress,
   Divider,
+  useTheme,
+  useMediaQuery,
 } from '@mui/material';
 import SecurityIcon from '@mui/icons-material/Security';
 import PeopleIcon from '@mui/icons-material/People';
@@ -48,8 +50,42 @@ const LINK_RGB: Record<LinkState, string> = {
 
 const linkTint = (state: LinkState, alpha: number): string => `rgba(${LINK_RGB[state]}, ${alpha})`;
 
-interface NavbarProps {
+export interface ConnectionTooltipParams {
+  online: boolean;
+  connectionStatus: string;
+  connectedPeersCount: number;
+  pendingSendCount?: number;
+  failedSendCount?: number;
+}
+
+export const formatConnectionTooltip = ({
+  online,
+  connectionStatus,
+  connectedPeersCount,
+  pendingSendCount = 0,
+  failedSendCount = 0,
+}: ConnectionTooltipParams): string => {
+  if (!online) {
+    return 'Offline - no network connection';
+  }
+  if (connectionStatus !== 'connected') {
+    return connectionStatus === 'error' ? 'Connection error' : 'Connecting...';
+  }
+  const base =
+    connectedPeersCount > 0
+      ? `Connected - ${connectedPeersCount} Direct Connection${connectedPeersCount === 1 ? '' : 's'}`
+      : 'Connected';
+  const extras = [
+    pendingSendCount > 0 ? `${pendingSendCount} sending` : null,
+    failedSendCount > 0 ? `${failedSendCount} failed to send` : null,
+  ].filter(Boolean);
+
+  return extras.length > 0 ? `${base} | ${extras.join(' | ')}` : base;
+};
+
+export interface NavbarProps {
   themeMode: 'dark' | 'light';
+  isMobile?: boolean;
   onToggleTheme: () => void;
   onOpenProfile: () => void;
   onOpenFriends: () => void;
@@ -64,6 +100,7 @@ interface NavbarProps {
 
 export const Navbar: React.FC<NavbarProps> = ({
   themeMode,
+  isMobile: isMobileProp,
   onToggleTheme,
   onOpenProfile,
   onOpenFriends,
@@ -75,6 +112,10 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenFavorites,
   onOpenInstall,
 }) => {
+  const theme = useTheme();
+  const isMobileBreakpoint = useMediaQuery(theme.breakpoints.down('md'));
+  const isMobile = isMobileProp ?? isMobileBreakpoint;
+
   const {
     profile,
     favoriteRooms,
@@ -104,6 +145,14 @@ export const Navbar: React.FC<NavbarProps> = ({
   // and the indicator says which one it is.
   const isLinked = online && connectionStatus === 'connected';
   const linkState: LinkState = !online ? 'error' : isLinked ? 'success' : 'warning';
+
+  const connectionTooltip = formatConnectionTooltip({
+    online,
+    connectionStatus,
+    connectedPeersCount,
+    pendingSendCount,
+    failedSendCount,
+  });
 
   const handleOpenMenu = (event: React.MouseEvent<HTMLElement>) => {
     setMenuAnchor(event.currentTarget);
@@ -238,30 +287,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           )}
 
           {/* Combined Connection & Peers Status Indicator */}
-          <Tooltip
-            title={
-              // Relay connectivity and direct acceleration are separate facts
-              // and must never be conflated [W-04].
-              !online
-                ? 'Offline - no network connection'
-                : connectionStatus !== 'connected'
-                ? 'Nostr: reconnecting'
-                : [
-                    'Nostr: connected',
-                    accelerationStatus === 'active'
-                      ? `Direct: active (${connectedPeersCount} ${
-                          connectedPeersCount === 1 ? 'peer' : 'peers'
-                        })`
-                      : accelerationStatus === 'disabled'
-                      ? 'Direct: turned off'
-                      : 'Direct: unavailable (messages still flow over relays)',
-                    pendingSendCount > 0 ? `${pendingSendCount} sending` : null,
-                    failedSendCount > 0 ? `${failedSendCount} failed to send` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(' | ')
-            }
-          >
+          <Tooltip title={connectionTooltip}>
             <Box
               sx={{
                 display: 'flex',
@@ -303,73 +329,88 @@ export const Navbar: React.FC<NavbarProps> = ({
           </Tooltip>
         </Box>
 
-        {/* Right Action Icons & Main Dropdown Menu */}
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8 }}>
-          {/* 1. Invite Friend */}
-          {isApproved && (
-            <Tooltip title="Invite Friend">
-              <IconButton color="inherit" onClick={onOpenAddContact}>
-                <PersonAddAlt1Icon />
-              </IconButton>
-            </Tooltip>
-          )}
-
-          {/* 2. Share Invite */}
-          <Tooltip title="Share Invite">
-            <IconButton color="inherit" onClick={onOpenInvite}>
-              <ShareIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* Pending Requests Badge */}
-          {isApproved && pendingJoinRequests.length > 0 && (
-            <Tooltip title={`${pendingJoinRequests.length} pending join request(s)`}>
-              <IconButton color="warning" onClick={onOpenRequests}>
-                <Badge badgeContent={pendingJoinRequests.length} color="error">
-                  <NotificationsActiveIcon />
-                </Badge>
-              </IconButton>
-            </Tooltip>
-          )}
-
-          {/* 3. Public Rooms */}
-          <Tooltip title="Public Rooms">
-            <IconButton color="inherit" onClick={onOpenPublicRooms}>
-              <PublicIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* 4. Favorite Rooms */}
-          <Tooltip title={`Favorite Rooms (${favoriteRooms.length})`}>
-            <IconButton color="inherit" onClick={onOpenFavorites}>
-              <FavoriteIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* 5. Friends */}
-          <Tooltip title={`Friends (${friends.length})`}>
-            <IconButton color="inherit" onClick={onOpenFriends}>
-              <PeopleIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* 6. Profile */}
-          <Tooltip title="Profile">
-            <IconButton color="inherit" onClick={onOpenProfile}>
-              <AccountCircleIcon />
-            </IconButton>
-          </Tooltip>
-
-          {/* 7. Dark/Light Mode */}
-          <Tooltip title="Dark/Light Mode">
-            <IconButton color="inherit" onClick={onToggleTheme}>
-              {themeMode === 'dark' ? <LightModeIcon /> : <DarkModeIcon />}
-            </IconButton>
-          </Tooltip>
-
-          {/* Main Dropdown Menu (Opened via Logo Button) */}
-          <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={handleCloseMenu}>
+        {/* Right Action Icons (Desktop only - hidden in mobile/phone mode) */}
+        {!isMobile && (
+          <Box sx={{ display: { xs: 'none', md: 'flex' }, alignItems: 'center', gap: 0.8 }}>
             {/* 1. Invite Friend */}
+            {isApproved && (
+              <Tooltip title="Invite Friend">
+                <IconButton color="inherit" onClick={onOpenAddContact}>
+                  <PersonAddAlt1Icon />
+                </IconButton>
+              </Tooltip>
+            )}
+
+            {/* 2. Share Invite */}
+            <Tooltip title="Share Invite">
+              <IconButton color="inherit" onClick={onOpenInvite}>
+                <ShareIcon />
+              </IconButton>
+            </Tooltip>
+
+            {/* Pending Requests Badge */}
+            {isApproved && pendingJoinRequests.length > 0 && (
+              <Tooltip title={`${pendingJoinRequests.length} pending join request(s)`}>
+                <IconButton color="warning" onClick={onOpenRequests}>
+                  <Badge badgeContent={pendingJoinRequests.length} color="error">
+                    <NotificationsActiveIcon />
+                  </Badge>
+                </IconButton>
+              </Tooltip>
+            )}
+
+            {/* 3. Public Rooms */}
+            <Tooltip title="Public Rooms">
+              <IconButton color="inherit" onClick={onOpenPublicRooms}>
+                <PublicIcon />
+              </IconButton>
+            </Tooltip>
+
+            {/* 4. Favorite Rooms */}
+            <Tooltip title={`Favorite Rooms (${favoriteRooms.length})`}>
+              <IconButton color="inherit" onClick={onOpenFavorites}>
+                <FavoriteIcon />
+              </IconButton>
+            </Tooltip>
+
+            {/* 5. Friends */}
+            <Tooltip title={`Friends (${friends.length})`}>
+              <IconButton color="inherit" onClick={onOpenFriends}>
+                <PeopleIcon />
+              </IconButton>
+            </Tooltip>
+
+            {/* 6. Profile */}
+            <Tooltip title="Profile">
+              <IconButton color="inherit" onClick={onOpenProfile}>
+                <AccountCircleIcon />
+              </IconButton>
+            </Tooltip>
+
+            {/* 7. Dark/Light Mode */}
+            <Tooltip title="Dark/Light Mode">
+              <IconButton color="inherit" onClick={onToggleTheme}>
+                {themeMode === 'dark' ? <LightModeIcon /> : <DarkModeIcon />}
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )}
+
+        {/* Main Dropdown Menu (Opened via Logo Button) */}
+        <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={handleCloseMenu}>
+          {/* Join Requests (visible when there are pending requests) */}
+          {isApproved && pendingJoinRequests.length > 0 && (
+            <MenuItem onClick={() => { handleCloseMenu(); onOpenRequests(); }}>
+              <ListItemIcon>
+                <Badge badgeContent={pendingJoinRequests.length} color="error">
+                  <NotificationsActiveIcon fontSize="small" color="warning" />
+                </Badge>
+              </ListItemIcon>
+              <ListItemText>Join Requests ({pendingJoinRequests.length})</ListItemText>
+            </MenuItem>
+          )}
+
+          {/* 1. Invite Friend */}
             {isApproved && (
               <MenuItem onClick={() => { handleCloseMenu(); onOpenAddContact(); }}>
                 <ListItemIcon>
@@ -525,7 +566,6 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ListItemText>About...</ListItemText>
             </MenuItem>
           </Menu>
-        </Box>
       </Toolbar>
 
       {/* About Dialog */}
