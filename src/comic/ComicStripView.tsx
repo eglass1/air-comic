@@ -14,6 +14,7 @@ import { ChatMessage, Participant } from '../types';
 import { ComicPanel, AvatarData, BackdropData } from './types';
 import { ComicLayoutEngine } from './comicLayout';
 import { AvatarManager } from './avatarManager';
+import { preloadComicFonts } from './fontLoader';
 import { useChat } from '../context/ChatContext';
 
 interface ComicStripViewProps {
@@ -51,16 +52,18 @@ const ComicPanelItem: React.FC<{
   } | null>(null);
   const [tooltipVisible, setTooltipVisible] = useState<boolean>(false);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [fontsReady, setFontsReady] = useState<boolean>(() => {
-    return typeof document !== 'undefined' && 'fonts' in document && document.fonts.status === 'loaded';
-  });
+  const [fontsReady, setFontsReady] = useState<boolean>(false);
 
   useEffect(() => {
-    if (typeof document !== 'undefined' && 'fonts' in document) {
-      document.fonts.ready.then(() => {
+    let mounted = true;
+    preloadComicFonts().then(() => {
+      if (mounted) {
         setFontsReady(true);
-      });
-    }
+      }
+    });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {

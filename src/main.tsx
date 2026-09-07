@@ -3,9 +3,11 @@ import ReactDOM from 'react-dom/client';
 import './fonts.css';
 import App from './App';
 import { initPwa } from './services/pwa';
+import { preloadComicFonts } from './comic/fontLoader';
 
-// Before render, so the install prompt and connectivity events are never missed.
+// Early initialization for PWA and comic fonts needed by canvas
 initPwa();
+preloadComicFonts();
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>

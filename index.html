@@ -46,6 +46,14 @@
     </style>
   </head>
   <body>
+    <!-- Hidden preloader to trigger immediate browser loading of comic font variants for Canvas -->
+    <div style="position: absolute; width: 0; height: 0; overflow: hidden; opacity: 0; pointer-events: none;" aria-hidden="true">
+      <span style="font-family: 'Comic Sans MS'; font-style: normal; font-weight: 400;">AirComic</span>
+      <span style="font-family: 'Comic Sans MS'; font-style: normal; font-weight: 700;">AirComic</span>
+      <span style="font-family: 'Comic Sans MS'; font-style: italic; font-weight: 400;">AirComic</span>
+      <span style="font-family: 'Comic Sans MS'; font-style: italic; font-weight: 700;">AirComic</span>
+      <span style="font-family: 'Bangers'; font-style: normal; font-weight: 400;">AirComic</span>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
