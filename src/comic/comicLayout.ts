@@ -56,6 +56,7 @@ export interface LayoutOptions {
   panelHeight: number;
   defaultBackdrop: string;
   roomName: string;
+  roomDescription?: string;
   titleAvatars?: string[];
   profile?: { participantId?: string; screenName?: string; avatarName?: string } | null;
   participants?: Participant[];
@@ -379,6 +380,7 @@ export class ComicLayoutEngine {
         isTitlePanel: true,
         title: roomName,
         roomName,
+        description: options.roomDescription,
         backdropName: defaultBackdrop,
         characters: [],
         balloons: [],
@@ -396,6 +398,7 @@ export class ComicLayoutEngine {
       isTitlePanel: true,
       title: roomName,
       roomName,
+      description: options.roomDescription,
       backdropName: defaultBackdrop,
       characters: [],
       balloons: [],
@@ -1524,38 +1527,129 @@ export class ComicLayoutEngine {
     const boxX = 16;
     const boxY = 18;
     const boxW = width - 32;
-    const boxH = 74;
 
+    const episodeTitle = (panel.roomName || 'Burnin\' the Midnight Oil').toUpperCase();
+    const hasDescription = Boolean(panel.description && panel.description.trim().length > 0);
+
+    // Format description text if present
+    let descLines: string[] = [];
+    const maxDescWidth = boxW * 0.5; // 50% width of the outer box
+    const descFont = `italic 12px ${COMIC_FONT_FAMILY}`;
+    const descLineHeight = 16;
+
+    if (hasDescription) {
+      let cleanDesc = panel.description!.trim();
+      if (
+        (cleanDesc.startsWith('"') && cleanDesc.endsWith('"')) ||
+        (cleanDesc.startsWith('“') && cleanDesc.endsWith('”'))
+      ) {
+        cleanDesc = cleanDesc.slice(1, -1).trim();
+      }
+      const quotedDesc = `“${cleanDesc}”`;
+
+      ctx.font = descFont;
+      const rawLines = quotedDesc.split(/\r?\n/);
+      for (const rLine of rawLines) {
+        if (!rLine.trim()) continue;
+        descLines.push(...this.getWrappedLines(ctx, rLine, maxDescWidth));
+      }
+      if (descLines.length === 0 && quotedDesc) {
+        descLines = [quotedDesc];
+      }
+      // Cap at 3 lines if very long so it doesn't crowd out the starring cast
+      if (descLines.length > 3) {
+        descLines = descLines.slice(0, 3);
+        descLines[2] = this.truncateText(ctx, descLines[2], maxDescWidth - 14) + '”';
+      }
+    }
+
+    // Title text measurement
+    this.setLetterSpacing(ctx, this.TITLE_LETTER_SPACING);
+    ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
+    const titleMetrics = ctx.measureText(episodeTitle);
+    const isTwoLineTitle = titleMetrics.width > boxW - 20;
+
+    let titleLine1 = episodeTitle;
+    let titleLine2 = '';
+    if (isTwoLineTitle) {
+      const words = episodeTitle.split(' ');
+      const mid = Math.ceil(words.length / 2);
+      titleLine1 = words.slice(0, mid).join(' ');
+      titleLine2 = words.slice(mid).join(' ');
+    }
+
+    let boxH = 74;
+    let titleY1 = 0;
+    let titleY2 = 0;
+    let descStartY = 0;
+
+    if (hasDescription && descLines.length > 0) {
+      const titleLineHeight = isTwoLineTitle ? 18 : 22;
+      const titleTotalHeight = isTwoLineTitle ? 36 : 22;
+      const descTotalHeight = descLines.length * descLineHeight;
+
+      // Ensure at least 10 px separation from title and bottom of title box
+      const minBoxH = 74;
+      const neededBoxH = 10 + titleTotalHeight + 10 + descTotalHeight + 10;
+      boxH = Math.max(minBoxH, neededBoxH);
+
+      const verticalSlack = boxH - (titleTotalHeight + 10 + descTotalHeight);
+      const topPadding = Math.round(verticalSlack / 2);
+      titleY1 = boxY + topPadding;
+      if (isTwoLineTitle) {
+        titleY2 = titleY1 + titleLineHeight;
+        descStartY = titleY2 + titleLineHeight + 10;
+      } else {
+        descStartY = titleY1 + titleTotalHeight + 10;
+      }
+    } else {
+      boxH = 74;
+    }
+
+    // Draw yellow title box
     ctx.fillStyle = '#ffde59'; // Comic yellow banner
     ctx.fillRect(boxX, boxY, boxW, boxH);
     ctx.lineWidth = 2.5;
     ctx.strokeStyle = '#000000';
     ctx.strokeRect(boxX, boxY, boxW, boxH);
 
-    // Episode title text inside the box
-    const episodeTitle = (panel.roomName || 'Burnin\' the Midnight Oil').toUpperCase();
+    // Draw title and description text
     ctx.fillStyle = '#000000';
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    // Measure and format title text. Bangers sets very tightly, so the letters
-    // are tracked apart a little; measureText accounts for it once it is set.
     this.setLetterSpacing(ctx, this.TITLE_LETTER_SPACING);
-    ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
-    const titleMetrics = ctx.measureText(episodeTitle);
-    if (titleMetrics.width > boxW - 20) {
-      // Wrap into 2 lines if long
-      const words = episodeTitle.split(' ');
-      const mid = Math.ceil(words.length / 2);
-      const line1 = words.slice(0, mid).join(' ');
-      const line2 = words.slice(mid).join(' ');
-      ctx.font = `bold 17px "Bangers", ${COMIC_FONT_FAMILY}`;
-      ctx.fillText(line1, width / 2, boxY + boxH * 0.32);
-      ctx.fillText(line2, width / 2, boxY + boxH * 0.70);
+
+    if (hasDescription && descLines.length > 0) {
+      ctx.textBaseline = 'top';
+      if (isTwoLineTitle) {
+        ctx.font = `bold 17px "Bangers", ${COMIC_FONT_FAMILY}`;
+        ctx.fillText(titleLine1, width / 2, titleY1);
+        ctx.fillText(titleLine2, width / 2, titleY2);
+      } else {
+        ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
+        ctx.fillText(episodeTitle, width / 2, titleY1);
+      }
+      this.setLetterSpacing(ctx, '0px');
+
+      // Description inside yellow title box: smaller, mixed case, italic Comic Sans font
+      ctx.font = descFont;
+      ctx.fillStyle = '#000000';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      descLines.forEach((line, i) => {
+        ctx.fillText(line, width / 2, descStartY + i * descLineHeight);
+      });
     } else {
-      ctx.fillText(episodeTitle, width / 2, boxY + boxH / 2);
+      ctx.textBaseline = 'middle';
+      if (isTwoLineTitle) {
+        ctx.font = `bold 17px "Bangers", ${COMIC_FONT_FAMILY}`;
+        ctx.fillText(titleLine1, width / 2, boxY + boxH * 0.32);
+        ctx.fillText(titleLine2, width / 2, boxY + boxH * 0.70);
+      } else {
+        ctx.font = `bold 22px "Bangers", ${COMIC_FONT_FAMILY}`;
+        ctx.fillText(episodeTitle, width / 2, boxY + boxH / 2);
+      }
+      this.setLetterSpacing(ctx, '0px');
     }
-    this.setLetterSpacing(ctx, '0px');
 
     // 2. STARRING Subtitle
     ctx.font = `bold 16px ${COMIC_FONT_FAMILY}`;

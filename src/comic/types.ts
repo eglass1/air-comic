@@ -217,6 +217,7 @@ export interface ComicPanel {
   isTitlePanel: boolean;
   title?: string;
   roomName?: string;
+  description?: string;
   backdropName: string;
   characters: ComicCharacterInPanel[];
   balloons: ComicBalloon[];

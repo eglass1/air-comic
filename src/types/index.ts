@@ -64,5 +64,6 @@ export interface RoomTab {
   publicJoinToken?: string;
   isInitialCreator?: boolean;
   channelTitle: string;
+  channelDescription?: string;
   unreadCount: number;
 }

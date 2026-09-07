@@ -87,6 +87,7 @@ export interface ConversationRecord {
   activeKeyId: string;
   isCreator: boolean;
   channelTitle: string;
+  channelDescription?: string;
   /** Timestamp of the room_metadata that set `channelTitle` [M-01]. */
   titleUpdatedAt?: number;
   /** The identity a public room's directory listing names, if we have read

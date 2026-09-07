@@ -40,13 +40,15 @@ export const NewRoomDialog: React.FC<NewRoomDialogProps> = ({
 
   const [activeTab, setActiveTab] = useState<number>(0);
   const [customTitle, setCustomTitle] = useState<string>('');
+  const [customDescription, setCustomDescription] = useState<string>('');
   const [joinInput, setJoinInput] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
 
   const handleCreatePrivate = () => {
     const titleToUse = customTitle.trim() || getRandomChannelTitle();
-    createPrivateRoomTab(titleToUse);
+    createPrivateRoomTab(titleToUse, customDescription.trim());
     setCustomTitle('');
+    setCustomDescription('');
     setError(null);
     onClose();
   };
@@ -110,6 +112,21 @@ export const NewRoomDialog: React.FC<NewRoomDialogProps> = ({
               fullWidth
               size="small"
               helperText="Leave empty to automatically assign a fun time-of-day phrase."
+            />
+
+            <TextField
+              label="Description (Optional)"
+              placeholder="What is this room about?"
+              value={customDescription}
+              onChange={(e) => setCustomDescription(e.target.value)}
+              fullWidth
+              multiline
+              rows={2}
+              size="small"
+              helperText="Optional description shown on the comic title panel."
+              slotProps={{
+                htmlInput: { maxLength: 500 },
+              }}
             />
 
             <Button

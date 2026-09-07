@@ -19,6 +19,7 @@ import { useChat } from '../context/ChatContext';
 interface ComicStripViewProps {
   messages: ChatMessage[];
   roomName: string;
+  roomDescription?: string;
   defaultBackdrop?: string;
   onOpenInvite?: () => void;
 }
@@ -271,11 +272,12 @@ const ComicPanelItem: React.FC<{
 export const ComicStripView: React.FC<ComicStripViewProps> = ({
   messages,
   roomName,
+  roomDescription,
   defaultBackdrop = 'room.bgb',
   onOpenInvite,
 }) => {
   const theme = useTheme();
-  const { profile, participants, zoomLevel } = useChat();
+  const { profile, participants, zoomLevel, channelDescription } = useChat();
   const avatarManager = useMemo(() => AvatarManager.getInstance(), []);
   const [loadedAvatars, setLoadedAvatars] = useState<Map<string, AvatarData>>(new Map());
   const [backdropData, setBackdropData] = useState<BackdropData | null>(null);
@@ -327,6 +329,8 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
     return ComicLayoutEngine.getRandomTitleAvatars();
   }, [roomName]);
 
+  const effectiveDescription = roomDescription ?? channelDescription ?? '';
+
   // Generate Panels. `loadedAvatars` is a dependency because the panel camera
   // sizes the cast from each avatar's real proportions; until the art arrives
   // the layout uses estimates, and re-runs once for real when it lands.
@@ -336,12 +340,13 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
       panelHeight,
       defaultBackdrop,
       roomName,
+      roomDescription: effectiveDescription,
       titleAvatars,
       profile,
       participants,
       avatarMetrics: (avatarName) => avatarManager.getAvatarMetrics(avatarName),
     });
-  }, [messages, panelWidth, panelHeight, defaultBackdrop, roomName, titleAvatars, profile, participants, avatarManager, loadedAvatars]);
+  }, [messages, panelWidth, panelHeight, defaultBackdrop, roomName, effectiveDescription, titleAvatars, profile, participants, avatarManager, loadedAvatars]);
 
   // Pre-load Backdrop
   useEffect(() => {

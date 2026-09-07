@@ -33,7 +33,9 @@ import {
   UNTITLED_CHANNEL_TITLE,
   getOrInitChannelTitle,
   getRandomChannelTitle,
+  getStoredChannelDescription,
   getStoredChannelTitle,
+  rememberChannelDescription,
   rememberChannelTitle,
 } from '../utils/channelNameGenerator';
 import { db } from '../services/v3/db';
@@ -66,6 +68,7 @@ interface OpenTabConfig {
   roomSecret?: string;
   publicJoinToken?: string;
   channelTitle?: string;
+  channelDescription?: string;
   isInitialCreator?: boolean;
 }
 
@@ -155,11 +158,12 @@ export interface ChatContextType {
     roomSecret?: string;
     publicJoinToken?: string;
     channelTitle?: string;
+    channelDescription?: string;
     isInitialCreator?: boolean;
   }) => string;
   closeTab: (tabId: string) => void;
   switchTab: (tabId: string) => void;
-  createPrivateRoomTab: (title?: string) => string;
+  createPrivateRoomTab: (title?: string, description?: string) => string;
   joinRoomByUrlOrSecret: (input: string) => string | null;
   joinPublicRoomTab: (descriptor: PublicRoomDescriptorPacket) => string;
 
@@ -171,7 +175,8 @@ export interface ChatContextType {
   publicRoomId: string | null;
   isInitialCreator: boolean;
   channelTitle: string;
-  updateChannelTitle: (newTitle: string) => Promise<boolean>;
+  channelDescription: string;
+  updateChannelTitle: (newTitle: string, newDescription?: string) => Promise<boolean>;
   /** False when this identity may not rename the room, e.g. a public room
    *  they did not create [PU-02]. */
   canRenameRoom: boolean;
@@ -340,6 +345,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!current) return;
 
       const channelTitle = session.channelTitle?.trim() || current.channelTitle;
+      const channelDescription = session.channelDescription !== undefined ? session.channelDescription : (current.channelDescription || '');
       const roomSecret =
         session.roomMode === 'private' && session.roomSecret
           ? session.roomSecret
@@ -347,18 +353,20 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const isInitialCreator = session.isInitialCreator || current.isInitialCreator;
       if (
         channelTitle === current.channelTitle &&
+        channelDescription === current.channelDescription &&
         roomSecret === current.roomSecret &&
         isInitialCreator === current.isInitialCreator
       ) {
         return;
       }
 
-      const updated = { ...current, channelTitle, roomSecret, isInitialCreator };
+      const updated = { ...current, channelTitle, channelDescription, roomSecret, isInitialCreator };
       const next = tabsRef.current.map((t) => (t.tabId === session.tabId ? updated : t));
       tabsRef.current = next;
       setTabs(next);
       persistTabs(next);
       rememberChannelTitle(updated.convId, channelTitle);
+      if (channelDescription) rememberChannelDescription(updated.convId, channelDescription);
       if (session.tabId === activeTabIdRef.current) syncBrowserUrl(updated);
     },
     [persistTabs, syncBrowserUrl]
@@ -378,6 +386,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           publicJoinToken: tab.publicJoinToken,
           isInitialCreator: tab.isInitialCreator,
           channelTitle: tab.channelTitle,
+          channelDescription: tab.channelDescription,
         },
         {
           onStateChange: (s) => {
@@ -491,6 +500,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           config.channelTitle?.trim() ||
           getStoredChannelTitle(convId) ||
           (isInitialCreator ? getOrInitChannelTitle(convId) : UNTITLED_CHANNEL_TITLE),
+        channelDescription:
+          config.channelDescription !== undefined
+            ? config.channelDescription
+            : (getStoredChannelDescription(convId) || ''),
         unreadCount: 0,
       };
 
@@ -564,12 +577,20 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const createPrivateRoomTab = useCallback(
-    (title?: string) =>
-      openTabRef.current({
+    (title?: string, description?: string) => {
+      const convId = crypto.randomUUID();
+      const effTitle = title || getRandomChannelTitle();
+      const effDesc = description || '';
+      rememberChannelTitle(convId, effTitle);
+      if (effDesc) rememberChannelDescription(convId, effDesc);
+      return openTabRef.current({
+        convId,
         roomMode: 'private',
-        channelTitle: title || getRandomChannelTitle(),
+        channelTitle: effTitle,
+        channelDescription: effDesc,
         isInitialCreator: true,
-      }),
+      });
+    },
     []
   );
 
@@ -1249,6 +1270,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         publicJoinToken: session.publicJoinToken ?? undefined,
         capabilityGeneration: session.capabilityGeneration,
         name: session.channelTitle,
+        description: session.channelDescription || undefined,
         members: Array.from(session.participantsMap.values()).map((p) => ({
           participantId: p.participantId,
           screenName: p.screenName,
@@ -1273,6 +1295,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       roomSecret: record.roomSecret,
       publicJoinToken: record.publicJoinToken,
       channelTitle: record.name,
+      channelDescription: record.description,
       isInitialCreator: false,
     });
   }, []);
@@ -1313,11 +1336,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       localStorage.setItem(`aircomic_channel_title_${convId}`, name.trim());
+      if (description) {
+        rememberChannelDescription(convId, description.trim());
+      }
       return openTabRef.current({
         convId,
         roomMode: 'public',
         publicJoinToken: joinToken,
         channelTitle: name.trim(),
+        channelDescription: description?.trim() || '',
         isInitialCreator: true,
       });
     },
@@ -1409,7 +1436,18 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     publicRoomId: activeSession?.publicRoomId ?? null,
     isInitialCreator: activeSession?.isInitialCreator ?? false,
     channelTitle: activeSession?.channelTitle ?? activeTab?.channelTitle ?? '',
-    updateChannelTitle: async (title) => (await activeSession?.updateChannelTitle(title)) ?? false,
+    channelDescription: activeSession?.channelDescription ?? activeTab?.channelDescription ?? '',
+    updateChannelTitle: async (title, description) => {
+      if (!activeSession) return false;
+      const ok = await activeSession.updateChannelTitle(title, description);
+      if (ok && activeSession.convId) {
+        rememberChannelTitle(activeSession.convId, title);
+        if (description !== undefined) {
+          rememberChannelDescription(activeSession.convId, description);
+        }
+      }
+      return ok;
+    },
     canRenameRoom: activeSession?.canRenameRoom ?? false,
     connectionStatus: activeSession?.connectionStatus ?? 'connecting',
     accelerationStatus: activeSession?.accelerationStatus ?? 'unavailable',

@@ -155,6 +155,7 @@ export interface RoomSessionConfig {
   publicJoinToken?: string;
   isInitialCreator?: boolean;
   channelTitle?: string;
+  channelDescription?: string;
   /** Injectable so tests can run isolated profiles against one relay set. */
   database?: DatabaseService;
 }
@@ -176,6 +177,7 @@ export class RoomSession {
   public publicRoomId: string | null;
   public isInitialCreator: boolean;
   public channelTitle: string;
+  public channelDescription: string;
   public routingTag = '';
   public capabilityGeneration = 0;
 
@@ -267,6 +269,7 @@ export class RoomSession {
     this.publicRoomId = null;
     this.isInitialCreator = config.isInitialCreator ?? false;
     this.channelTitle = config.channelTitle || 'Untitled';
+    this.channelDescription = config.channelDescription || '';
     this.callbacks = callbacks;
     this.db = config.database ?? defaultDb;
     this.outbox = outboxFor(this.db);
@@ -339,10 +342,16 @@ export class RoomSession {
       this.capabilityGeneration = stored.capabilityGeneration;
       this.previousRoutes = stored.previousRoutingTags ?? [];
       this.channelTitle = stored.channelTitle || this.channelTitle;
+      if (stored.channelDescription !== undefined && !this.channelDescription) {
+        this.channelDescription = stored.channelDescription;
+      }
       this.titleUpdatedAt = stored.titleUpdatedAt ?? 0;
       this.publicRoomCreatorId = stored.publicRoomCreatorId ?? null;
       if (stored.publicDescriptor && !this.publicDescriptor) {
         this.publicDescriptor = stored.publicDescriptor;
+        if (!this.channelDescription && stored.publicDescriptor.description) {
+          this.channelDescription = stored.publicDescriptor.description;
+        }
       }
       if (stored.isCreator) this.isInitialCreator = true;
     }
@@ -626,6 +635,9 @@ export class RoomSession {
     if (isLive && descriptor) {
       this.publicDescriptor = descriptor;
       this.publicRoomCreatorId = descriptor.creatorId;
+      if (!this.channelDescription && descriptor.description) {
+        this.channelDescription = descriptor.description;
+      }
       await this.persistConversation();
       // The room's name may well have arrived while we were still asking who was
       // entitled to set it; now we can judge it [M-01].
@@ -672,7 +684,7 @@ export class RoomSession {
     }
     const previous = expiredDescriptor || this.publicDescriptor;
     const name = this.channelTitle?.trim() || previous?.name?.trim() || 'Untitled Room';
-    const description = previous?.description || '';
+    const description = this.channelDescription || previous?.description || '';
     const tags = previous?.tags;
     const language = previous?.language;
     const createdAt = previous?.createdAt ?? Date.now();
@@ -729,17 +741,19 @@ export class RoomSession {
    * creator can do this at all -- the descriptor's Nostr key is derived from
    * their signing key, so nobody else's republish would replace it.
    */
-  private async republishPublicDescriptor(name: string): Promise<void> {
+  private async republishPublicDescriptor(name: string, description?: string): Promise<void> {
     if (!this.profile || !this.signingPrivateKey || !this.publicRoomId || !this.publicJoinToken) return;
     if (!this.canRenameRoom) return;
 
     const previous = this.publicDescriptor;
+    const effDescription =
+      description !== undefined ? description : (this.channelDescription || previous?.description || '');
     const descriptor = await buildPublicRoomDescriptor({
       publicRoomId: this.publicRoomId,
       convId: this.convId,
       publicJoinToken: this.publicJoinToken,
       name,
-      description: previous?.description || '',
+      description: effDescription,
       creatorId: this.profile.participantId,
       creatorScreenName: this.profile.screenName,
       creatorSigningPublicKey: this.profile.signingPublicKeyBase64,
@@ -951,6 +965,7 @@ export class RoomSession {
       activeKeyId: this.activeKeyId,
       isCreator,
       channelTitle: this.channelTitle,
+      channelDescription: this.channelDescription,
       titleUpdatedAt: this.titleUpdatedAt,
       publicRoomCreatorId: this.publicRoomCreatorId ?? undefined,
       publicDescriptor: this.publicDescriptor ?? undefined,
@@ -1720,8 +1735,10 @@ export class RoomSession {
     if (!title) return;
 
     this.titleUpdatedAt = packet.timestamp;
-    const changed = title !== this.channelTitle;
+    const nextDesc = packet.description !== undefined ? packet.description : this.channelDescription;
+    const changed = title !== this.channelTitle || nextDesc !== this.channelDescription;
     this.channelTitle = title;
+    this.channelDescription = nextDesc;
     await this.persistConversation();
     if (changed) this.notify();
   }
@@ -1775,6 +1792,7 @@ export class RoomSession {
       convId: this.convId,
       publicRoomId: this.publicRoomId ?? undefined,
       title,
+      description: this.channelDescription || undefined,
       setterId: this.profile.participantId,
       setterSigningPublicKey: this.profile.signingPublicKeyBase64,
       signingPrivateKey: this.signingPrivateKey,
@@ -2308,18 +2326,21 @@ export class RoomSession {
     if (result.ok) await this.acceptEnvelope(result, false);
   }
 
-  async updateChannelTitle(title: string): Promise<boolean> {
+  async updateChannelTitle(title: string, description?: string): Promise<boolean> {
     const clean = title.trim();
     if (!clean || !this.profile || !this.signingPrivateKey) return false;
     // Refuse rather than rename locally into a name nobody else will accept.
     if (this.roomMode === 'public' && !this.canRenameRoom) return false;
 
     this.channelTitle = clean;
+    if (description !== undefined) {
+      this.channelDescription = description.trim();
+    }
     // Publishing queues the event rather than waiting on the relays, so the
     // rename is on screen immediately either way.
     const published = await this.publishRoomMetadata();
     // The directory listing is the room's public name; it must not go stale.
-    if (this.roomMode === 'public') await this.republishPublicDescriptor(clean);
+    if (this.roomMode === 'public') await this.republishPublicDescriptor(clean, this.channelDescription);
     await this.persistConversation();
     this.notify();
     return published;

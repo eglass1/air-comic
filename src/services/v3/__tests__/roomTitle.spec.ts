@@ -398,4 +398,57 @@ describe('room title propagation -- [M-01]', () => {
     bobRoom.destroy();
     carolRoom.destroy();
   }, 30000);
+
+  it('synchronizes and persists room description when title and description are updated', async () => {
+    const convId = crypto.randomUUID();
+    const secret = generateRoomSecret();
+    const alice = await makeProfile('Alice');
+    const bob = await makeProfile('Bob');
+    const aliceDb = freshDb();
+    const bobDb = freshDb();
+
+    const aliceRoom = new RoomSession({
+      tabId: 'a',
+      convId,
+      roomMode: 'private',
+      roomSecret: secret,
+      isInitialCreator: true,
+      channelTitle: 'Room A',
+      channelDescription: 'Initial Alice Room Description',
+      database: aliceDb,
+    });
+    await aliceRoom.init(alice);
+    await settle();
+
+    const bobRoom = new RoomSession({
+      tabId: 'b',
+      convId,
+      roomMode: 'private',
+      roomSecret: secret,
+      database: bobDb,
+    });
+    await bobRoom.init(bob);
+    await settle();
+    await aliceRoom.approveJoinRequest(aliceRoom.pendingJoinRequests[0].requestId);
+    await settle();
+
+    // Alice updates title and description
+    await aliceRoom.updateChannelTitle('Room A Renamed', 'Updated Alice Room Description');
+    await settle();
+
+    expect(aliceRoom.channelTitle).toBe('Room A Renamed');
+    expect(aliceRoom.channelDescription).toBe('Updated Alice Room Description');
+
+    // Bob receives metadata update
+    expect(bobRoom.channelTitle).toBe('Room A Renamed');
+    expect(bobRoom.channelDescription).toBe('Updated Alice Room Description');
+
+    // Check DB persistence
+    const savedAlice = await aliceDb.getConversation(convId);
+    expect(savedAlice?.channelTitle).toBe('Room A Renamed');
+    expect(savedAlice?.channelDescription).toBe('Updated Alice Room Description');
+
+    aliceRoom.destroy();
+    bobRoom.destroy();
+  });
 });

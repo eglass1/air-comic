@@ -13,6 +13,7 @@ import {
   ToggleButtonGroup,
   ToggleButton,
   Collapse,
+  ClickAwayListener,
 } from '@mui/material';
 import FavoriteIcon from '@mui/icons-material/Favorite';
 import FavoriteBorderIcon from '@mui/icons-material/FavoriteBorder';
@@ -69,6 +70,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     isRekeying,
     connectedPeersCount,
     channelTitle,
+    channelDescription,
     updateChannelTitle,
     canRenameRoom,
     roomMode,
@@ -83,19 +85,25 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
   const [titleInput, setTitleInput] = useState<string>(channelTitle);
+  const [descriptionInput, setDescriptionInput] = useState<string>(channelDescription);
 
   useEffect(() => {
     setTitleInput(channelTitle);
   }, [channelTitle]);
 
   useEffect(() => {
+    setDescriptionInput(channelDescription);
+  }, [channelDescription]);
+
+  useEffect(() => {
     if (!canRenameRoom) setIsEditingTitle(false);
   }, [canRenameRoom]);
 
   const handleSaveTitle = async () => {
-    const trimmed = titleInput.trim();
-    if (trimmed && trimmed !== channelTitle) {
-      await updateChannelTitle(trimmed);
+    const trimmedTitle = titleInput.trim();
+    const trimmedDesc = descriptionInput.trim();
+    if (trimmedTitle && (trimmedTitle !== channelTitle || trimmedDesc !== channelDescription)) {
+      await updateChannelTitle(trimmedTitle, trimmedDesc);
     }
     setIsEditingTitle(false);
   };
@@ -174,44 +182,95 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           borderColor: 'divider',
           bgcolor: 'background.paper',
           position: 'relative',
+          zIndex: 10,
         }}
       >
         {/* Left balance spacer */}
         <Box sx={{ width: { xs: 0, sm: 40 }, flexShrink: 0 }} />
 
         {/* Centered Channel Title Widget */}
-        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexGrow: 1 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexGrow: 1, position: 'relative' }}>
           {isEditingTitle ? (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-              <TextField
-                size="small"
-                variant="outlined"
-                value={titleInput}
-                onChange={(e) => setTitleInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleSaveTitle();
-                  if (e.key === 'Escape') setIsEditingTitle(false);
-                }}
-                autoFocus
-                placeholder="Channel Title..."
-                sx={{
-                  '& .MuiInputBase-input': {
-                    py: 0.3,
-                    px: 1,
-                    fontSize: '0.85rem',
-                    fontWeight: 700,
-                    textAlign: 'center',
-                  },
-                  width: { xs: 150, sm: 220 },
-                }}
-              />
-              <IconButton size="small" color="primary" onClick={handleSaveTitle}>
-                <CheckIcon fontSize="small" />
-              </IconButton>
-              <IconButton size="small" onClick={() => setIsEditingTitle(false)}>
-                <CloseIcon fontSize="small" />
-              </IconButton>
-            </Box>
+            <ClickAwayListener onClickAway={handleSaveTitle}>
+              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', position: 'relative' }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  <TextField
+                    size="small"
+                    variant="outlined"
+                    value={titleInput}
+                    onChange={(e) => setTitleInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleSaveTitle();
+                      if (e.key === 'Escape') setIsEditingTitle(false);
+                    }}
+                    autoFocus
+                    placeholder="Channel Title..."
+                    sx={{
+                      '& .MuiInputBase-input': {
+                        py: 0.3,
+                        px: 1,
+                        fontSize: '0.85rem',
+                        fontWeight: 700,
+                        textAlign: 'center',
+                      },
+                      width: { xs: 150, sm: 220 },
+                    }}
+                  />
+                  <IconButton size="small" color="primary" onClick={handleSaveTitle} aria-label="Save">
+                    <CheckIcon fontSize="small" />
+                  </IconButton>
+                  <IconButton size="small" onClick={() => setIsEditingTitle(false)} aria-label="Cancel">
+                    <CloseIcon fontSize="small" />
+                  </IconButton>
+                </Box>
+
+                {/* Popped up description textarea box underneath */}
+                <Paper
+                  elevation={6}
+                  sx={{
+                    position: 'absolute',
+                    top: 'calc(100% + 8px)',
+                    zIndex: 1200,
+                    p: 1.5,
+                    width: { xs: 260, sm: 340 },
+                    bgcolor: 'background.paper',
+                    borderRadius: 2,
+                    border: '1px solid',
+                    borderColor: 'divider',
+                    boxShadow: '0 6px 20px rgba(0,0,0,0.18)',
+                  }}
+                >
+                  <TextField
+                    label="Description"
+                    variant="outlined"
+                    size="small"
+                    fullWidth
+                    multiline
+                    minRows={2}
+                    maxRows={4}
+                    value={descriptionInput}
+                    onChange={(e) => setDescriptionInput(e.target.value)}
+                    placeholder="What is this room about?"
+                    slotProps={{
+                      inputLabel: { shrink: true },
+                      htmlInput: { maxLength: 500 },
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setIsEditingTitle(false);
+                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault();
+                        handleSaveTitle();
+                      }
+                    }}
+                    sx={{
+                      '& .MuiInputBase-input': {
+                        fontSize: '0.85rem',
+                      },
+                    }}
+                  />
+                </Paper>
+              </Box>
+            </ClickAwayListener>
           ) : (
             <Box
               sx={{
@@ -227,6 +286,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 canRenameRoom
                   ? () => {
                       setTitleInput(channelTitle);
+                      setDescriptionInput(channelDescription);
                       setIsEditingTitle(true);
                     }
                   : undefined
@@ -331,6 +391,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       <ComicStripView
         messages={messages}
         roomName={channelTitle}
+        roomDescription={channelDescription}
         defaultBackdrop={currentBackdropName}
         onOpenInvite={onOpenInvite}
       />

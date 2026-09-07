@@ -168,6 +168,7 @@ export function getRandomChannelTitle(): string {
 export const UNTITLED_CHANNEL_TITLE = 'Untitled Room';
 
 const titleKey = (convId: string) => `aircomic_channel_title_${convId}`;
+const descKey = (convId: string) => `aircomic_channel_description_${convId}`;
 
 /** The last title we saw for this room, or null if we have never seen one. */
 export function getStoredChannelTitle(convId: string): string | null {
@@ -187,6 +188,25 @@ export function rememberChannelTitle(convId: string, title: string): void {
     if (typeof localStorage !== 'undefined') localStorage.setItem(titleKey(convId), clean);
   } catch (err) {
     console.warn('Failed to save channel title to localStorage:', err);
+  }
+}
+
+/** The last description we saw for this room, or null if we have never seen one. */
+export function getStoredChannelDescription(convId: string): string | null {
+  try {
+    const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(descKey(convId)) : null;
+    return saved !== null ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Caches a description so a reload shows the right description before relays answer. */
+export function rememberChannelDescription(convId: string, description: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(descKey(convId), description);
+  } catch (err) {
+    console.warn('Failed to save channel description to localStorage:', err);
   }
 }
 
