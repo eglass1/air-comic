@@ -54,7 +54,7 @@ I used Antigravity to "port" the comic stuff in (really, reimplement as TypeScri
   - Gesture quick-pick bar (Wave, Point at Other, Point at Self, Shrug).
   - Real-time facial expression and pose canvas preview as you adjust the wheel.
 - **Natural Language Emotion Heuristics**: Automatic emotion detection based on text sentiment, smileys, exclamation marks, all-caps shouts, laughs, greetings, and pronouns.
-- **View Mode Switcher**: Seamlessly switch between the dynamic Comic Strip view and classic transcript text view with smooth auto-scrolling and high-DPI scaling.
+- **Comic Strip Presentation**: Dynamic comic book layout with high-DPI canvas scaling, automatic speech balloons, thought clouds, and authentic visual narrative.
 - **Light Mode by Default**: Modern clean theme with light mode default and dark mode support.
 
 ---

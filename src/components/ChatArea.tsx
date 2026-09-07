@@ -1,11 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Box,
   TextField,
   IconButton,
   Typography,
   Paper,
-  Fab,
   Chip,
   Button,
   Alert,
@@ -18,7 +17,6 @@ import {
 import FavoriteIcon from '@mui/icons-material/Favorite';
 import FavoriteBorderIcon from '@mui/icons-material/FavoriteBorder';
 import SendIcon from '@mui/icons-material/Send';
-import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import SecurityIcon from '@mui/icons-material/Security';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive';
@@ -26,8 +24,6 @@ import VpnKeyIcon from '@mui/icons-material/VpnKey';
 import HourglassTopIcon from '@mui/icons-material/HourglassTop';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CancelIcon from '@mui/icons-material/Cancel';
-import AutoAwesomeMosaicIcon from '@mui/icons-material/AutoAwesomeMosaic';
-import TextSnippetIcon from '@mui/icons-material/TextSnippet';
 import EmojiEmotionsIcon from '@mui/icons-material/EmojiEmotions';
 import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import RecordVoiceOverIcon from '@mui/icons-material/RecordVoiceOver';
@@ -38,7 +34,6 @@ import EditIcon from '@mui/icons-material/Edit';
 import CheckIcon from '@mui/icons-material/Check';
 import CloseIcon from '@mui/icons-material/Close';
 import { useChat } from '../context/ChatContext';
-import { MessageItem } from './MessageItem';
 import { ComicStripView } from '../comic/ComicStripView';
 import { EmotionWheel } from '../comic/EmotionWheel';
 import { EM_NEUTRAL, BalloonMode } from '../comic/types';
@@ -80,19 +75,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   } = useChat();
 
   const [inputText, setInputText] = useState<string>('');
-  const [viewMode, setViewMode] = useState<'comic' | 'text'>('comic');
   const [showEmotionWheel, setShowEmotionWheel] = useState<boolean>(false);
   const [balloonMode, setBalloonMode] = useState<BalloonMode>('say');
   const [selectedEmotion, setSelectedEmotion] = useState<number>(EM_NEUTRAL);
   const [selectedIntensity, setSelectedIntensity] = useState<number>(0.0);
-  const [showScrollBottom, setShowScrollBottom] = useState<boolean>(false);
   const [approvingReqId, setApprovingReqId] = useState<string | null>(null);
 
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
   const [titleInput, setTitleInput] = useState<string>(channelTitle);
-
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setTitleInput(channelTitle);
@@ -108,25 +98,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       await updateChannelTitle(trimmed);
     }
     setIsEditingTitle(false);
-  };
-
-  useEffect(() => {
-    if (viewMode === 'text' && messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [messages, viewMode]);
-
-  const handleScroll = () => {
-    if (!scrollContainerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
-    const isUp = scrollHeight - scrollTop - clientHeight > 150;
-    setShowScrollBottom(isUp);
-  };
-
-  const scrollToBottom = () => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
   };
 
   const handleSend = async () => {
@@ -191,7 +162,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         overflow: 'hidden',
       }}
     >
-      {/* View Mode Bar: Comic Strip vs Text View */}
+      {/* Room Header Bar */}
       <Box
         sx={{
           display: 'flex',
@@ -206,7 +177,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         }}
       >
         {/* Left balance spacer */}
-        <Box sx={{ width: { xs: 0, sm: 80 }, flexShrink: 0 }} />
+        <Box sx={{ width: { xs: 0, sm: 40 }, flexShrink: 0 }} />
 
         {/* Centered Channel Title Widget */}
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexGrow: 1 }}>
@@ -275,10 +246,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           )}
         </Box>
 
-        {/* Right Toggle Buttons (Icon-only with Tooltips) */}
+        {/* Right Actions */}
         <Box
           sx={{
-            width: { xs: 'auto', sm: 116 },
+            width: { xs: 'auto', sm: 40 },
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'flex-end',
@@ -303,27 +274,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </IconButton>
             </span>
           </Tooltip>
-
-          <ToggleButtonGroup
-            value={viewMode}
-            exclusive
-            onChange={(_, newMode) => {
-              if (newMode) setViewMode(newMode);
-            }}
-            size="small"
-            sx={{ height: 30 }}
-          >
-            <Tooltip title="Comic View">
-              <ToggleButton value="comic" sx={{ px: 1, py: 0.5 }}>
-                <AutoAwesomeMosaicIcon sx={{ fontSize: 18 }} />
-              </ToggleButton>
-            </Tooltip>
-            <Tooltip title="Text View">
-              <ToggleButton value="text" sx={{ px: 1, py: 0.5 }}>
-                <TextSnippetIcon sx={{ fontSize: 18 }} />
-              </ToggleButton>
-            </Tooltip>
-          </ToggleButtonGroup>
         </Box>
       </Box>
 
@@ -377,83 +327,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </Alert>
       )}
 
-      {/* Main Conversation Area: Comic Strip View vs Classic Text View */}
-      {viewMode === 'comic' ? (
-        <ComicStripView
-          messages={messages}
-          roomName={channelTitle}
-          defaultBackdrop={currentBackdropName}
-          onOpenInvite={onOpenInvite}
-        />
-      ) : (
-        <Box
-          ref={scrollContainerRef}
-          onScroll={handleScroll}
-          sx={{
-            flexGrow: 1,
-            overflowY: 'auto',
-            py: 2,
-            display: 'flex',
-            flexDirection: 'column',
-          }}
-        >
-          {messages.length === 0 ? (
-            <Box
-              sx={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                height: '100%',
-                p: 3,
-                textAlign: 'center',
-                color: 'text.secondary',
-              }}
-            >
-              <SecurityIcon sx={{ fontSize: 56, color: 'primary.main', mb: 2, opacity: 0.8 }} />
-              <Typography variant="h6" sx={{ fontWeight: 700, color: 'text.primary', mb: 1 }}>
-                AirComic End-to-End Encrypted Group Chat
-              </Typography>
-              <Typography variant="body2" sx={{ maxWidth: 450, mb: 3 }}>
-                Messages automatically generate real-time comic strips with avatars, word balloons, and emotional expressions.
-              </Typography>
-
-              <Chip
-                icon={<ContentCopyIcon />}
-                label="Copy Invite Link"
-                onClick={onOpenInvite}
-                color="primary"
-                variant="outlined"
-                sx={{ cursor: 'pointer' }}
-              />
-            </Box>
-          ) : (
-            <>
-              {messages.map((msg) => (
-                <MessageItem key={msg.id} message={msg} />
-              ))}
-              <div ref={messagesEndRef} />
-            </>
-          )}
-        </Box>
-      )}
-
-      {/* Scroll to bottom button */}
-      {showScrollBottom && (
-        <Fab
-          size="small"
-          color="primary"
-          onClick={scrollToBottom}
-          sx={{
-            position: 'absolute',
-            bottom: 85,
-            right: 24,
-            zIndex: 10,
-          }}
-        >
-          <KeyboardArrowDownIcon />
-        </Fab>
-      )}
+      {/* Main Conversation Area: Comic Strip View */}
+      <ComicStripView
+        messages={messages}
+        roomName={channelTitle}
+        defaultBackdrop={currentBackdropName}
+        onOpenInvite={onOpenInvite}
+      />
 
       {/* Message Input Box or Guest Pending Card */}
       <Paper
