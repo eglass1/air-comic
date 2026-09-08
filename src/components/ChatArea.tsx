@@ -162,6 +162,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     <Box
       sx={{
         flexGrow: 1,
+        minWidth: 0,
         height: '100%',
         display: 'flex',
         flexDirection: 'column',

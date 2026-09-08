@@ -226,6 +226,80 @@ describe('application mount', () => {
     });
   }, 30000);
 
+  it('renders desktop participants sidebar with flexShrink 0 and minWidth 310px to prevent squishing', async () => {
+    const [{ default: App }, { ChatProvider }, { ThemeProvider, CssBaseline }, { createAppTheme }] =
+      await Promise.all([
+        import('../App'),
+        import('../context/ChatContext'),
+        import('@mui/material'),
+        import('../theme'),
+      ]);
+
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: !query.includes('max-width:900px') && (query.includes('min-width') || false),
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      })),
+      configurable: true,
+      writable: true,
+    });
+
+    let container: HTMLElement | null = null;
+    await act(async () => {
+      const result = render(
+        <ThemeProvider theme={createAppTheme('light')}>
+          <CssBaseline />
+          <ChatProvider>
+            <App />
+          </ChatProvider>
+        </ThemeProvider>
+      );
+      container = result.container;
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+
+    const headers = Array.from(container!.querySelectorAll('.MuiTypography-subtitle2'));
+    const partHeader = headers.find((el) => el.textContent?.includes('Participants'));
+    expect(partHeader).toBeDefined();
+
+    // Traverse up to the Sidebar root container
+    let el: HTMLElement | null = partHeader as HTMLElement;
+    let sidebarRoot: HTMLElement | null = null;
+    while (el && el !== container) {
+      const style = window.getComputedStyle(el);
+      if (style.flexShrink === '0') {
+        sidebarRoot = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+
+    expect(sidebarRoot).not.toBeNull();
+    const computedStyle = window.getComputedStyle(sidebarRoot!);
+    expect(computedStyle.flexShrink).toBe('0');
+
+    // Emotion inserts media queries into document style tags which JSDOM does not evaluate for getComputedStyle.
+    // Verify that the generated CSS rule for this sidebar element includes min-width: 310px or 310px width.
+    const styleTags = Array.from(document.querySelectorAll('style'));
+    const allCss = styleTags.map((s) => s.textContent || '').join('\n');
+    expect(allCss).toContain('min-width:310px');
+
+    Object.defineProperty(window, 'matchMedia', {
+      value: originalMatchMedia,
+      configurable: true,
+      writable: true,
+    });
+  }, 30000);
+
   it('opens the room named by the address even with rooms already restored', async () => {
     const { ChatProvider, useChat } = await import('../context/ChatContext');
     const { generateRoomSecret } = await import('../services/v3/keys');

@@ -80,6 +80,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <Box
       sx={{
         width: { xs: '100%', md: 310 },
+        minWidth: { md: 310 },
+        flexShrink: 0,
         height: '100%',
         bgcolor: 'background.paper',
         borderRight: '1px solid',
@@ -102,7 +104,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <PeopleIcon color="primary" fontSize="small" />
-          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 700 }} noWrap>
             Participants ({onlineApprovedCount})
           </Typography>
         </Box>

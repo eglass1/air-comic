@@ -435,6 +435,8 @@ export const ComicStripView: React.FC<ComicStripViewProps> = ({
       ref={scrollContainerRef}
       sx={{
         flex: '1 1 auto',
+        width: '100%',
+        minWidth: 0,
         minHeight: 0,
         overflowY: 'auto',
         p: { xs: 1, sm: 2 },
