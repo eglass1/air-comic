@@ -90,13 +90,13 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <PersonAddAlt1Icon color="primary" />
           <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            Invite Friend to Conversation
+            Invite Friend
           </Typography>
         </DialogTitle>
 
         <DialogContent dividers sx={{ minHeight: 320 }}>
           <TextField
-            placeholder="Search contacts by name, info, notes..."
+            placeholder="Search friends by name or info..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             fullWidth
@@ -208,7 +208,7 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
               onOpenFriends();
             }}
           >
-            Manage Friends Directory
+            Manage Friends
           </Button>
           <Button onClick={onClose}>Close</Button>
         </DialogActions>

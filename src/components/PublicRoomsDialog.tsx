@@ -137,8 +137,7 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
         <DialogContent dividers sx={{ display: 'flex', flexDirection: 'column', gap: 2, minHeight: 420 }}>
           {/* [PU-01]: say plainly what public costs, before someone joins. */}
           <Alert severity="warning" sx={{ py: 0.5 }}>
-            Public rooms are <strong>not encrypted</strong>. Anything you say is stored on
-            public relays in the clear and can be read and kept by anyone.
+            Public rooms are <strong>not encrypted</strong>. Anything you say can be read and kept by anyone.
           </Alert>
           {/* Search & Tag Filter Bar */}
           <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -200,10 +199,10 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
                 <PublicIcon sx={{ fontSize: 48, color: 'text.disabled' }} />
                 <Box>
                   <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                    {searchQuery || selectedTag ? 'No matching public rooms found' : 'No active public rooms discovered yet'}
+                    {searchQuery || selectedTag ? 'No matching public rooms found' : 'No active public rooms currently'}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    {searchQuery || selectedTag ? 'Try adjusting your search or filter.' : 'Be the first to create and advertise a room in the directory!'}
+                    {searchQuery || selectedTag ? 'Try adjusting your search or filter.' : 'Start a party - create a public room'}
                   </Typography>
                 </Box>
                 <Button variant="contained" color="primary" startIcon={<AddCircleIcon />} onClick={() => setIsCreateOpen(true)}>

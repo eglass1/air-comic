@@ -37,13 +37,13 @@ export const InviteDialog: React.FC<InviteDialogProps> = ({ open, onClose }) => 
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <ShareIcon color="primary" />
           <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            Invite To Conversation
+            Share Invite
           </Typography>
         </DialogTitle>
 
         <DialogContent dividers sx={{ pt: 2.5, pb: 2.5 }}>
           <TextField
-            label="Shareable Invite Link"
+            label="Invite Link"
             value={inviteUrl}
             fullWidth
             slotProps={{

@@ -40,7 +40,7 @@ import VerifiedIcon from '@mui/icons-material/Verified';
 import FaceRetouchingNaturalIcon from '@mui/icons-material/FaceRetouchingNatural';
 import WallpaperIcon from '@mui/icons-material/Wallpaper';
 import { useChat } from '../context/ChatContext';
-import { getPublicKeyFingerprint } from '../services/crypto';
+import { getPublicKeyFingerprint, getParticipantId } from '../services/crypto';
 import { AvatarManager } from '../comic/avatarManager';
 import { AvatarData, BackdropData, EM_NEUTRAL } from '../comic/types';
 
@@ -301,8 +301,19 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   const [fingerprint, setFingerprint] = useState<string>('');
   const [signFingerprint, setSignFingerprint] = useState<string>('');
   const [showPrivateKey, setShowPrivateKey] = useState<boolean>(false);
-  const [importJsonText, setImportJsonText] = useState<string>('');
+  const [importedProfile, setImportedProfile] = useState<{
+    screenName: string;
+    participantId: string;
+    created: string;
+    rawJson: string;
+  } | null>(null);
   const [snack, setSnack] = useState<{ message: string; severity: 'success' | 'error' } | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setImportedProfile(null);
+    }
+  }, [open]);
 
   useEffect(() => {
     if (profile) {
@@ -364,31 +375,67 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   };
 
   const handleImportJson = async () => {
-    if (!importJsonText.trim()) {
-      setSnack({ message: 'Please paste profile JSON first', severity: 'error' });
+    if (!importedProfile) {
+      setSnack({ message: 'No profile loaded for import', severity: 'error' });
       return;
     }
-    const success = await importProfileFromJson(importJsonText.trim());
+    const success = await importProfileFromJson(importedProfile.rawJson);
     if (success) {
       setSnack({ message: 'Profile & Keypairs restored!', severity: 'success' });
-      setImportJsonText('');
+      setImportedProfile(null);
     } else {
       setSnack({ message: 'Invalid profile JSON format or corrupted keys', severity: 'error' });
     }
+  };
+
+  const handleClearImport = () => {
+    setImportedProfile(null);
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = (event) => {
+      reader.onload = async (event) => {
         const content = event.target?.result as string;
         if (content) {
-          setImportJsonText(content);
+          try {
+            const parsed = JSON.parse(content);
+            if (!parsed || typeof parsed !== 'object') {
+              throw new Error('Invalid JSON file format');
+            }
+            if (!parsed.signingPublicKeyBase64 && !parsed.participantId) {
+              throw new Error('Invalid profile backup: missing identity keys');
+            }
+            let pid = parsed.participantId || '';
+            if (!pid && parsed.signingPublicKeyBase64) {
+              try {
+                pid = await getParticipantId(parsed.signingPublicKeyBase64);
+              } catch {
+                pid = 'Unknown';
+              }
+            }
+            let createdStr = 'Unknown';
+            if (parsed.createdAt) {
+              const d = new Date(parsed.createdAt);
+              createdStr = isNaN(d.getTime()) ? String(parsed.createdAt) : d.toLocaleString();
+            }
+            setImportedProfile({
+              screenName: parsed.screenName || 'Unknown',
+              participantId: pid || 'Unknown',
+              created: createdStr,
+              rawJson: content,
+            });
+            setSnack({ message: 'Profile backup file loaded and ready to restore.', severity: 'success' });
+          } catch (err: any) {
+            setSnack({ message: err?.message || 'Invalid profile JSON file', severity: 'error' });
+            setImportedProfile(null);
+          }
         }
       };
       reader.readAsText(file);
     }
+    e.target.value = '';
   };
 
   return (
@@ -398,9 +445,21 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           <Typography variant="h5" sx={{ fontWeight: 800, display: 'flex', alignItems: 'center', gap: 1 }}>
             <FaceRetouchingNaturalIcon color="primary" /> Profile
           </Typography>
-          <Tabs value={tabIndex} onChange={(_, v) => setTabIndex(v)} sx={{ mt: 1 }}>
-            <Tab label="Comic Avatar & Stage" icon={<FaceRetouchingNaturalIcon fontSize="small" />} iconPosition="start" />
-            <Tab label="Identity & Information" icon={<AccountCircleIcon fontSize="small" />} iconPosition="start" />
+          <Tabs
+            value={tabIndex}
+            onChange={(_, v) => setTabIndex(v)}
+            variant="scrollable"
+            scrollButtons="auto"
+            allowScrollButtonsMobile
+            sx={{
+              mt: 1,
+              '& .MuiTabs-scrollButtons': {
+                width: 28,
+              },
+            }}
+          >
+            <Tab label="Avatar & Backdrop" icon={<FaceRetouchingNaturalIcon fontSize="small" />} iconPosition="start" />
+            <Tab label="Identity" icon={<AccountCircleIcon fontSize="small" />} iconPosition="start" />
             <Tab label="Encryption & Keys" icon={<KeyIcon fontSize="small" />} iconPosition="start" />
             <Tab label="Backup & Restore" icon={<DownloadIcon fontSize="small" />} iconPosition="start" />
           </Tabs>
@@ -411,7 +470,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           {tabIndex === 0 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 0.5 }}>
               <Alert severity="info" sx={{ py: 0.5 }}>
-                Choose your character from the authentic MS Comic Chat cast and pick your default comic strip backdrop.
+                Choose your avatar character and pick your comic strip backdrop.
               </Alert>
 
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
@@ -441,7 +500,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                   </Box>
 
                   {/* Backdrop Blurb & Selector Column */}
-                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, maxWidth: 195 }}>
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, maxWidth: 195 }}>
                     <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.35, display: { xs: 'none', md: 'block' } }}>
                       Your default backdrop is the comic panel background that will be used.
                     </Typography>
@@ -471,7 +530,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                   onClick={handleSaveProfile}
                   sx={{ height: 42, px: 2.5, fontWeight: 700, whiteSpace: 'nowrap' }}
                 >
-                  Save Selections
+                  Save
                 </Button>
               </Box>
 
@@ -504,21 +563,32 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
             </Box>
           )}
 
-          {/* TAB 1: Identity & Information */}
+          {/* TAB 1: Identity */}
           {tabIndex === 1 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: 1 }}>
               <Alert severity="info" sx={{ py: 0.5 }}>
                 Your screen name and optional biography/information are shared with participants in your encrypted channel.
               </Alert>
 
-              <TextField
-                label="Screen Name *"
-                value={screenName}
-                onChange={(e) => setScreenName(e.target.value)}
-                fullWidth
-                helperText="Appears as your character's name in comic strips and chat."
-                required
-              />
+              <Box sx={{ display: 'flex', gap: 2, alignItems: 'flex-start' }}>
+                <TextField
+                  label="Screen Name"
+                  value={screenName}
+                  onChange={(e) => setScreenName(e.target.value)}
+                  fullWidth
+                  helperText="Appears as your character's name in comic strips and chat."
+                  required
+                />
+                <Button
+                  variant="contained"
+                  color="primary"
+                  startIcon={<SaveIcon />}
+                  onClick={handleSaveProfile}
+                  sx={{ height: 42, px: 2.5, fontWeight: 700, whiteSpace: 'nowrap', mt: '7px' }}
+                >
+                  Save
+                </Button>
+              </Box>
 
               <Typography variant="subtitle2" color="primary" sx={{ fontWeight: 600, mt: 1 }}>
                 OPTIONAL INFORMATION & BIOGRAPHY
@@ -534,12 +604,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                 placeholder="Write a biography, notes, interests, links, or other info about yourself..."
                 helperText="Optional. Anyone in your conversation can view this when viewing your participant card."
               />
-
-              <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 2 }}>
-                <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSaveProfile}>
-                  Save Profile Changes
-                </Button>
-              </Box>
             </Box>
           )}
 
@@ -635,48 +699,91 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           {tabIndex === 3 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: 1 }}>
               <Alert severity="info" sx={{ py: 0.5 }}>
-                Export your AirComic profile and private keys to a JSON backup file to transfer between devices.
+                Export or import your identity to transfer between devices.
               </Alert>
 
               <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                 <Button variant="contained" color="primary" startIcon={<DownloadIcon />} onClick={handleExportJson}>
-                  Download Profile Backup (.json)
+                  Export File
                 </Button>
                 <Button variant="outlined" component="label" startIcon={<UploadFileIcon />}>
-                  Upload Backup File
+                  Import File
                   <input type="file" accept=".json" hidden onChange={handleFileUpload} />
                 </Button>
               </Box>
 
-              <Divider sx={{ my: 1 }} />
+              {importedProfile && (
+                <>
+                  <Divider sx={{ my: 0.5 }} />
 
-              <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-                RESTORE FROM JSON TEXT
-              </Typography>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                    Information
+                  </Typography>
 
-              <TextField
-                multiline
-                rows={4}
-                placeholder="Paste exported profile JSON here..."
-                value={importJsonText}
-                onChange={(e) => setImportJsonText(e.target.value)}
-                fullWidth
-                slotProps={{
-                  input: {
-                    sx: { fontFamily: 'monospace', fontSize: '0.75rem' },
-                  },
-                }}
-              />
+                  <Box
+                    sx={{
+                      p: 2,
+                      bgcolor: 'background.default',
+                      borderRadius: 2,
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 1.5,
+                    }}
+                  >
+                    <Box>
+                      <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, display: 'block' }}>
+                        Screen Name
+                      </Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                        {importedProfile.screenName}
+                      </Typography>
+                    </Box>
+                    <Box>
+                      <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, display: 'block' }}>
+                        Participant ID
+                      </Typography>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          fontFamily: 'monospace',
+                          wordBreak: 'break-all',
+                          fontSize: '0.8rem',
+                          color: 'secondary.main',
+                        }}
+                      >
+                        {importedProfile.participantId}
+                      </Typography>
+                    </Box>
+                    <Box>
+                      <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, display: 'block' }}>
+                        Created
+                      </Typography>
+                      <Typography variant="body2">
+                        {importedProfile.created}
+                      </Typography>
+                    </Box>
+                  </Box>
 
-              <Button
-                variant="contained"
-                color="secondary"
-                onClick={handleImportJson}
-                disabled={!importJsonText.trim()}
-                sx={{ alignSelf: 'flex-start' }}
-              >
-                Restore Profile & Keys
-              </Button>
+                  <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                    <Button
+                      variant="contained"
+                      color="primary"
+                      onClick={handleImportJson}
+                    >
+                      Restore
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      color="inherit"
+                      onClick={handleClearImport}
+                    >
+                      Clear Import
+                    </Button>
+                  </Box>
+                </>
+              )}
             </Box>
           )}
         </DialogContent>
