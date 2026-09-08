@@ -56,6 +56,27 @@ export interface PublishOutcome {
 }
 
 export class DirectoryService {
+  private cachedDescriptors = new Map<string, PublicRoomDescriptorPacket>();
+  private cachedTombstones = new Map<string, PublicRoomTombstonePacket>();
+
+  cacheDescriptor(descriptor: PublicRoomDescriptorPacket): void {
+    if (descriptor?.publicRoomId) {
+      this.cachedDescriptors.set(descriptor.publicRoomId, descriptor);
+      this.cachedTombstones.delete(descriptor.publicRoomId);
+    }
+  }
+
+  getCachedDescriptor(publicRoomId: string): PublicRoomDescriptorPacket | null {
+    const cached = this.cachedDescriptors.get(publicRoomId);
+    if (!cached || cached.expiresAt <= Date.now() - 60000) return null;
+    return cached;
+  }
+
+  clearCache(): void {
+    this.cachedDescriptors.clear();
+    this.cachedTombstones.clear();
+  }
+
   /**
    * Per-room, deterministic Nostr key. Stable enough for NIP-33 replacement and
    * isolated from the creator's presence identity and their other rooms [PU-02].
@@ -71,6 +92,7 @@ export class DirectoryService {
     descriptor: PublicRoomDescriptorPacket;
     signingPrivateKeyJwk: JsonWebKey;
   }): Promise<PublishOutcome> {
+    this.cacheDescriptor(params.descriptor);
     const secretKey = await this.roomKey(
       params.signingPrivateKeyJwk,
       params.descriptor.publicRoomId
@@ -94,6 +116,8 @@ export class DirectoryService {
     tombstone: PublicRoomTombstonePacket;
     signingPrivateKeyJwk: JsonWebKey;
   }): Promise<PublishOutcome> {
+    this.cachedTombstones.set(params.tombstone.publicRoomId, params.tombstone);
+    this.cachedDescriptors.delete(params.tombstone.publicRoomId);
     const secretKey = await this.roomKey(
       params.signingPrivateKeyJwk,
       params.tombstone.publicRoomId
@@ -197,7 +221,13 @@ export class DirectoryService {
     );
 
     if (isTombstoned) {
+      this.cachedDescriptors.delete(publicRoomId);
+      if (tombstone) this.cachedTombstones.set(publicRoomId, tombstone);
       return { descriptor: null, isTombstoned: true };
+    }
+
+    if (newest) {
+      this.cacheDescriptor(newest);
     }
 
     return { descriptor: newest, isTombstoned: false };

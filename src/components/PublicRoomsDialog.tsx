@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -43,6 +43,11 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
     joinPublicRoom,
     convId: currentConvId,
     roomMode: currentRoomMode,
+    currentPublicRoomDescriptor,
+    channelTitle,
+    channelDescription,
+    publicRoomId,
+    publicJoinToken,
   } = useChat();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -66,30 +71,82 @@ export const PublicRoomsDialog: React.FC<PublicRoomsDialogProps> = ({ open, onCl
     }
   }, [open]);
 
+  // Ensure the current public room is always included if the user is in a public room
+  const effectiveRoomsList = useMemo(() => {
+    const list = [...publicRoomsList];
+    if (currentRoomMode === 'public' && currentConvId) {
+      const hasCurrent = list.some((r) => r.convId === currentConvId);
+      if (!hasCurrent) {
+        const currentDesc: PublicRoomDescriptorPacket = currentPublicRoomDescriptor || {
+          type: 'public_room_descriptor',
+          protocol: 'airthread/3',
+          extension: 'airthread/3-public-rooms',
+          descriptorVersion: 3,
+          publicRoomId: publicRoomId || currentConvId,
+          convId: currentConvId,
+          publicJoinToken: publicJoinToken || '',
+          name: channelTitle || 'Current Public Room',
+          description: channelDescription || '',
+          creatorId: '',
+          creatorScreenName: 'Room Host',
+          creatorSigningPublicKey: '',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          expiresAt: Date.now() + 3600000,
+          relayUrls: [],
+          language: 'en',
+          tags: [],
+          historyPolicy: 'peer_sync',
+          contentPolicy: 'public',
+          signature: '',
+        };
+        list.unshift(currentDesc);
+      }
+    }
+    return list;
+  }, [
+    publicRoomsList,
+    currentRoomMode,
+    currentConvId,
+    currentPublicRoomDescriptor,
+    publicRoomId,
+    publicJoinToken,
+    channelTitle,
+    channelDescription,
+  ]);
+
   // Extract all unique tags
   const allTags = Array.from(
     new Set(
-      publicRoomsList
+      effectiveRoomsList
         .flatMap((r) => r.tags || [])
         .map((t) => t.trim().toLowerCase())
         .filter((t) => t.length > 0)
     )
   );
 
-  // Filtered rooms
-  const filteredRooms = publicRoomsList.filter((room) => {
-    const q = searchQuery.toLowerCase().trim();
-    const matchesSearch =
-      !q ||
-      room.name.toLowerCase().includes(q) ||
-      room.description.toLowerCase().includes(q) ||
-      room.creatorScreenName.toLowerCase().includes(q) ||
-      (room.tags && room.tags.some((t) => t.toLowerCase().includes(q)));
+  // Filtered rooms, with current room sorted first
+  const filteredRooms = effectiveRoomsList
+    .filter((room) => {
+      const q = searchQuery.toLowerCase().trim();
+      const matchesSearch =
+        !q ||
+        room.name.toLowerCase().includes(q) ||
+        room.description.toLowerCase().includes(q) ||
+        room.creatorScreenName.toLowerCase().includes(q) ||
+        (room.tags && room.tags.some((t) => t.toLowerCase().includes(q)));
 
-    const matchesTag = !selectedTag || (room.tags && room.tags.includes(selectedTag));
+      const matchesTag = !selectedTag || (room.tags && room.tags.includes(selectedTag));
 
-    return matchesSearch && matchesTag;
-  });
+      return matchesSearch && matchesTag;
+    })
+    .sort((a, b) => {
+      const aIsCurrent = currentRoomMode === 'public' && currentConvId === a.convId;
+      const bIsCurrent = currentRoomMode === 'public' && currentConvId === b.convId;
+      if (aIsCurrent && !bIsCurrent) return -1;
+      if (!aIsCurrent && bIsCurrent) return 1;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
 
   const handleCopyLink = (room: PublicRoomDescriptorPacket) => {
     const link = `${window.location.origin}${window.location.pathname}?id=${encodeURIComponent(room.convId)}&public=1&join=${encodeURIComponent(room.publicJoinToken)}`;

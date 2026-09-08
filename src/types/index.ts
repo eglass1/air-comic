@@ -52,7 +52,7 @@ export type {
 
 export type { RelayHealth } from '../services/nostr/relayPool';
 
-import type { ContactInfo, RoomMode } from '../services/v3/types';
+import type { ContactInfo, RoomMode, PublicRoomDescriptorPacket } from '../services/v3/types';
 import type {
   ConversationRecord,
   FavoriteRoomRecord,
@@ -69,6 +69,7 @@ export interface RoomTab {
   roomSecret?: string;
   publicRoomId?: string;
   publicJoinToken?: string;
+  publicDescriptor?: PublicRoomDescriptorPacket;
   isInitialCreator?: boolean;
   channelTitle: string;
   channelDescription?: string;

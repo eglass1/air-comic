@@ -68,6 +68,7 @@ interface OpenTabConfig {
   roomMode?: RoomMode;
   roomSecret?: string;
   publicJoinToken?: string;
+  publicDescriptor?: PublicRoomDescriptorPacket;
   channelTitle?: string;
   channelDescription?: string;
   isInitialCreator?: boolean;
@@ -158,6 +159,7 @@ export interface ChatContextType {
     roomMode?: RoomMode;
     roomSecret?: string;
     publicJoinToken?: string;
+    publicDescriptor?: PublicRoomDescriptorPacket;
     channelTitle?: string;
     channelDescription?: string;
     isInitialCreator?: boolean;
@@ -239,6 +241,7 @@ export interface ChatContextType {
 
   // Public directory
   publicRoomsList: PublicRoomDescriptorPacket[];
+  currentPublicRoomDescriptor: PublicRoomDescriptorPacket | null;
   refreshPublicRoomsList: () => Promise<PublicRoomDescriptorPacket[]>;
   createPublicRoom: (
     name: string,
@@ -352,16 +355,18 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           ? session.roomSecret
           : current.roomSecret;
       const isInitialCreator = session.isInitialCreator || current.isInitialCreator;
+      const publicDescriptor = session.publicDescriptor || current.publicDescriptor;
       if (
         channelTitle === current.channelTitle &&
         channelDescription === current.channelDescription &&
         roomSecret === current.roomSecret &&
-        isInitialCreator === current.isInitialCreator
+        isInitialCreator === current.isInitialCreator &&
+        publicDescriptor === current.publicDescriptor
       ) {
         return;
       }
 
-      const updated = { ...current, channelTitle, channelDescription, roomSecret, isInitialCreator };
+      const updated = { ...current, channelTitle, channelDescription, roomSecret, isInitialCreator, publicDescriptor };
       const next = tabsRef.current.map((t) => (t.tabId === session.tabId ? updated : t));
       tabsRef.current = next;
       setTabs(next);
@@ -385,6 +390,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           roomMode: tab.roomMode,
           roomSecret: tab.roomSecret,
           publicJoinToken: tab.publicJoinToken,
+          publicDescriptor: tab.publicDescriptor,
           isInitialCreator: tab.isInitialCreator,
           channelTitle: tab.channelTitle,
           channelDescription: tab.channelDescription,
@@ -494,6 +500,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             : undefined,
         publicJoinToken:
           mode === 'public' ? config.publicJoinToken || generateRoomSecret() : undefined,
+        publicDescriptor: config.publicDescriptor,
         isInitialCreator,
         // Only a creator names a room. A joiner waits for the room's own
         // metadata instead of generating a title nobody else can see [M-01].
@@ -645,14 +652,28 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const joinPublicRoomTab = useCallback(
-    (descriptor: PublicRoomDescriptorPacket) =>
-      openTabRef.current({
+    (descriptor: PublicRoomDescriptorPacket) => {
+      directoryService.cacheDescriptor(descriptor);
+      setPublicRoomsList((prev) => [
+        descriptor,
+        ...prev.filter((r) => r.publicRoomId !== descriptor.publicRoomId),
+      ]);
+      if (profileRef.current?.signingPrivateKeyJwk && descriptor.expiresAt > Date.now()) {
+        void directoryService.publishDescriptor({
+          descriptor,
+          signingPrivateKeyJwk: profileRef.current.signingPrivateKeyJwk,
+        });
+      }
+      return openTabRef.current({
         convId: descriptor.convId,
         roomMode: 'public',
         publicJoinToken: descriptor.publicJoinToken,
+        publicDescriptor: descriptor,
         channelTitle: descriptor.name,
+        channelDescription: descriptor.description,
         isInitialCreator: false,
-      }),
+      });
+    },
     []
   );
 
@@ -1075,6 +1096,26 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
               const channelDescription = r.channelDescription || '';
               rememberChannelTitle(convId, channelTitle);
               if (channelDescription) rememberChannelDescription(convId, channelDescription);
+              const isCreator = Boolean(
+                r.isInitialCreator ||
+                (r.publicDescriptor && r.publicDescriptor.creatorId === participantId)
+              );
+              if (r.publicDescriptor) {
+                directoryService.cacheDescriptor(r.publicDescriptor);
+                setPublicRoomsList((prev) => [
+                  r.publicDescriptor,
+                  ...prev.filter((p) => p.publicRoomId !== r.publicDescriptor.publicRoomId),
+                ]);
+                if (
+                  rawProfile.signingPrivateKeyJwk &&
+                  r.publicDescriptor.expiresAt > Date.now()
+                ) {
+                  void directoryService.publishDescriptor({
+                    descriptor: r.publicDescriptor,
+                    signingPrivateKeyJwk: rawProfile.signingPrivateKeyJwk,
+                  });
+                }
+              }
               return {
                 tabId,
                 convId,
@@ -1082,7 +1123,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 roomSecret: r.roomSecret,
                 publicRoomId: r.publicRoomId,
                 publicJoinToken: r.publicJoinToken,
-                isInitialCreator: Boolean(r.isInitialCreator),
+                publicDescriptor: r.publicDescriptor,
+                isInitialCreator: isCreator,
                 channelTitle,
                 channelDescription,
                 unreadCount: 0,
@@ -1587,8 +1629,25 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshPublicRoomsList = useCallback(async () => {
     const rooms = await directoryService.fetchRooms();
-    setPublicRoomsList(rooms);
-    return rooms;
+    const roomsMap = new Map<string, PublicRoomDescriptorPacket>();
+    for (const r of rooms) {
+      roomsMap.set(r.publicRoomId, r);
+    }
+
+    for (const session of sessionsRef.current.values()) {
+      if (session.roomMode === 'public') {
+        const desc = await session.getOrSynthesizePublicDescriptor();
+        if (desc && (!roomsMap.has(desc.publicRoomId) || !roomsMap.get(desc.publicRoomId)?.signature)) {
+          roomsMap.set(desc.publicRoomId, desc);
+        }
+      }
+    }
+
+    const merged = Array.from(roomsMap.values()).sort(
+      (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
+    );
+    setPublicRoomsList(merged);
+    return merged;
   }, []);
 
   const createPublicRoom = useCallback(
@@ -1620,6 +1679,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         signingPrivateKeyJwk: current.signingPrivateKeyJwk,
       });
 
+      setPublicRoomsList((prev) => [
+        descriptor,
+        ...prev.filter((r) => r.publicRoomId !== descriptor.publicRoomId),
+      ]);
+
       localStorage.setItem(`aircomic_channel_title_${convId}`, name.trim());
       if (description) {
         rememberChannelDescription(convId, description.trim());
@@ -1628,6 +1692,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         convId,
         roomMode: 'public',
         publicJoinToken: joinToken,
+        publicDescriptor: descriptor,
         channelTitle: name.trim(),
         channelDescription: description?.trim() || '',
         isInitialCreator: true,
@@ -1784,6 +1849,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     openFavoriteRoom,
 
     publicRoomsList,
+    currentPublicRoomDescriptor: activeSession?.publicDescriptor ?? null,
     refreshPublicRoomsList,
     createPublicRoom,
     joinPublicRoom: joinPublicRoomTab,

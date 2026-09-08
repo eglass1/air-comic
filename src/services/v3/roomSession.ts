@@ -30,12 +30,15 @@ import {
   D_GENESIS_PREFIX,
   D_METADATA_PREFIX,
   D_ROOM_PRESENCE_PREFIX,
+  EXT_PUBLIC_ROOMS,
   JOIN_REQUEST_MAX_ATTEMPTS,
   JOIN_REQUEST_RETRY_MS,
   LIVE_PAST_WINDOW_MS,
   MAX_CHAT_TEXT_BYTES,
   OLD_ROUTE_MONITOR_MS,
+  PROTOCOL,
   PUBLIC_DESCRIPTOR_REFRESH_MS,
+  PUBLIC_DESCRIPTOR_SEC,
   PUBLIC_KEY_ID,
   PUBLIC_PRESENCE_REFRESH_MS,
   ROOM_PRESENCE_FRESH_MS,
@@ -153,6 +156,7 @@ export interface RoomSessionConfig {
   roomMode: RoomMode;
   roomSecret?: string;
   publicJoinToken?: string;
+  publicDescriptor?: PublicRoomDescriptorPacket;
   isInitialCreator?: boolean;
   channelTitle?: string;
   channelDescription?: string;
@@ -247,7 +251,7 @@ export class RoomSession {
   private orphanControl: Array<RekeyPacket | CapabilityRotationPacket> = [];
   private unsubHealth: (() => void) | null = null;
   private unsubOutbox: (() => void) | null = null;
-  private publicDescriptor: PublicRoomDescriptorPacket | null = null;
+  public publicDescriptor: PublicRoomDescriptorPacket | null = null;
   private beacon: PublicRoomPresenceBeacon | null = null;
   private occupancyTimer: ReturnType<typeof setInterval> | null = null;
   private roomPresenceTimer: ReturnType<typeof setInterval> | null = null;
@@ -266,6 +270,10 @@ export class RoomSession {
     this.roomMode = config.roomMode;
     this.roomSecret = config.roomSecret || '';
     this.publicJoinToken = config.publicJoinToken || null;
+    this.publicDescriptor = config.publicDescriptor ?? null;
+    if (config.publicDescriptor?.creatorId) {
+      this.publicRoomCreatorId = config.publicDescriptor.creatorId;
+    }
     this.publicRoomId = null;
     this.isInitialCreator = config.isInitialCreator ?? false;
     this.channelTitle = config.channelTitle || 'Untitled';
@@ -349,6 +357,7 @@ export class RoomSession {
       this.publicRoomCreatorId = stored.publicRoomCreatorId ?? null;
       if (stored.publicDescriptor && !this.publicDescriptor) {
         this.publicDescriptor = stored.publicDescriptor;
+        directoryService.cacheDescriptor(stored.publicDescriptor);
         if (!this.channelDescription && stored.publicDescriptor.description) {
           this.channelDescription = stored.publicDescriptor.description;
         }
@@ -634,6 +643,7 @@ export class RoomSession {
 
     if (isLive && descriptor) {
       this.publicDescriptor = descriptor;
+      directoryService.cacheDescriptor(descriptor);
       this.publicRoomCreatorId = descriptor.creatorId;
       if (!this.channelDescription && descriptor.description) {
         this.channelDescription = descriptor.description;
@@ -643,6 +653,7 @@ export class RoomSession {
       // entitled to set it; now we can judge it [M-01].
       await this.applyPendingMetadata();
       if (this.canRenameRoom) {
+        void this.refreshPublicDescriptor();
         this.startDescriptorRefresh();
       }
       this.notify();
@@ -654,20 +665,29 @@ export class RoomSession {
     // so it shows up in the active rooms directory again.
     const isCreator = Boolean(
       this.canRespawnPublicRoom ||
-      (descriptor && descriptor.convId === this.convId && descriptor.creatorId === this.profile.participantId)
+      (descriptor && descriptor.convId === this.convId && descriptor.creatorId === this.profile.participantId) ||
+      (this.publicDescriptor && this.publicDescriptor.convId === this.convId && this.publicDescriptor.creatorId === this.profile.participantId)
     );
 
     if (isCreator && this.publicJoinToken && this.signingPrivateKey) {
-      await this.respawnPublicRoom(descriptor);
+      await this.respawnPublicRoom(descriptor || this.publicDescriptor);
       return;
     }
 
     // For a non-creator where relays are quiet or descriptor expired, remember
     // who the listing named if we previously knew it.
-    if (descriptor && descriptor.convId === this.convId) {
-      this.publicRoomCreatorId = descriptor.creatorId;
+    const fallback = descriptor || this.publicDescriptor;
+    if (fallback && fallback.convId === this.convId) {
+      this.publicRoomCreatorId = fallback.creatorId;
       await this.persistConversation();
       await this.applyPendingMetadata();
+      // If relays were quiet or missing the listing, re-broadcast the creator's unexpired signed descriptor
+      if (!status.descriptor && this.publicDescriptor && this.publicDescriptor.expiresAt > Date.now() && this.profile.signingPrivateKeyJwk) {
+        void directoryService.publishDescriptor({
+          descriptor: this.publicDescriptor,
+          signingPrivateKeyJwk: this.profile.signingPrivateKeyJwk,
+        });
+      }
       this.notify();
     }
   }
@@ -716,6 +736,73 @@ export class RoomSession {
     await this.applyPendingMetadata();
     this.startDescriptorRefresh();
     this.notify();
+  }
+
+  /**
+   * Retrieves or constructs a descriptor for this public room session.
+   * Guaranteed to provide a descriptor representation when the session is public.
+   */
+  async getOrSynthesizePublicDescriptor(): Promise<PublicRoomDescriptorPacket | null> {
+    if (this.roomMode !== 'public') return null;
+    const now = Date.now();
+    if (this.publicDescriptor && this.publicDescriptor.expiresAt > now - 60000) {
+      return this.publicDescriptor;
+    }
+
+    if (!this.publicRoomId && this.convId) {
+      this.publicRoomId = await derivePublicRoomId(this.convId, this.publicJoinToken || '');
+    }
+
+    if (this.publicRoomId) {
+      const cached = directoryService.getCachedDescriptor(this.publicRoomId);
+      if (cached && cached.expiresAt > now - 60000) {
+        this.publicDescriptor = cached;
+        return cached;
+      }
+      const status = await directoryService.fetchRoomStatus(this.publicRoomId);
+      if (status.descriptor && !status.isTombstoned && status.descriptor.expiresAt > now - 60000) {
+        this.publicDescriptor = status.descriptor;
+        this.publicRoomCreatorId = status.descriptor.creatorId;
+        return status.descriptor;
+      }
+    }
+
+    if (this.canRespawnPublicRoom && this.publicJoinToken && this.signingPrivateKey) {
+      await this.respawnPublicRoom(this.publicDescriptor);
+      if (this.publicDescriptor) return this.publicDescriptor;
+    }
+
+    const publicRoomId =
+      this.publicRoomId || (await derivePublicRoomId(this.convId, this.publicJoinToken || ''));
+    const hostScreenName =
+      (this.publicRoomCreatorId && this.participantsMap.get(this.publicRoomCreatorId)?.screenName) ||
+      (this.isInitialCreator ? this.profile?.screenName : undefined) ||
+      'Host';
+
+    const fallback: PublicRoomDescriptorPacket = {
+      type: 'public_room_descriptor',
+      protocol: PROTOCOL,
+      extension: EXT_PUBLIC_ROOMS,
+      descriptorVersion: 3,
+      publicRoomId,
+      convId: this.convId,
+      publicJoinToken: this.publicJoinToken || '',
+      name: this.channelTitle?.trim() || 'Public Room',
+      description: this.channelDescription || '',
+      creatorId: this.publicRoomCreatorId || this.profile?.participantId || 'unknown',
+      creatorScreenName: hostScreenName,
+      creatorSigningPublicKey: '',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: now + PUBLIC_DESCRIPTOR_SEC * 1000,
+      relayUrls: [],
+      language: 'en',
+      tags: [],
+      historyPolicy: 'peer_sync',
+      contentPolicy: 'public',
+      signature: '',
+    };
+    return fallback;
   }
 
   /** True when this identity is allowed to rename the room [PU-02][M-01]. */

@@ -67,7 +67,7 @@ export const ROOM_PRESENCE_SEC = 180;
 export const USER_PRESENCE_SEC = 900;
 export const QUICK_MESSAGE_SEC = 3600;
 export const INVITE_SEC = 7 * 24 * 3600;
-export const PUBLIC_DESCRIPTOR_SEC = 1800;
+export const PUBLIC_DESCRIPTOR_SEC = 24 * 3600;
 
 // ============================================================================
 // CADENCES
