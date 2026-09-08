@@ -133,7 +133,31 @@ describe('Export and Import Functionality', () => {
       await chat!.toggleFavoriteRoom();
     });
 
-    // 5. Store a cached message in the database for the active room
+    // 5. Save an old, closed room directly into the database (not open in tabs, not a favorite)
+    const closedConvId = crypto.randomUUID();
+    await db.saveConversation({
+      convId: closedConvId,
+      roomMode: 'private',
+      routingTag: 'closed-routing-tag',
+      capabilityGeneration: 1,
+      previousRoutingTags: [],
+      activeEpoch: 1,
+      activeKeyId: 'closed-key-1',
+      isCreator: false,
+      channelTitle: 'Old Closed Room From Database',
+      historyPolicy: 'from_admission',
+      metadataPolicy: 'members',
+      updatedAt: Date.now() - 100000,
+    });
+    await db.saveEpochKey({
+      convId: closedConvId,
+      keyId: 'closed-key-1',
+      epoch: 1,
+      rawBase64Url: 'fake-closed-epoch-key',
+      members: ['someone-else'],
+    });
+
+    // 6. Store a cached message in the database for the active room
     const testMsg: ChatMessage = {
       id: 'msg-cached-999',
       convId: chat!.convId,
@@ -149,7 +173,7 @@ describe('Export and Import Functionality', () => {
     const messagesBefore = await db.getMessages(chat!.convId);
     expect(messagesBefore.length).toBeGreaterThan(0);
 
-    // 6. Perform Export
+    // 7. Perform Export
     let exportedJson = '';
     await act(async () => {
       exportedJson = await chat!.exportProfileAsJson();
@@ -179,6 +203,13 @@ describe('Export and Import Functionality', () => {
     // Check exported favorite rooms
     expect(parsed.favoriteRooms).toBeInstanceOf(Array);
     expect(parsed.favoriteRooms.length).toBe(1);
+
+    // Verify closed rooms from the database are NOT exported
+    expect(parsed.currentRooms.some((r: any) => r.convId === closedConvId)).toBe(false);
+    expect(parsed.favoriteRooms.some((r: any) => r.convId === closedConvId)).toBe(false);
+    expect(parsed.conversations.some((c: any) => c.convId === closedConvId)).toBe(false);
+    expect(parsed.epochKeys.some((k: any) => k.convId === closedConvId)).toBe(false);
+    expect(JSON.stringify(parsed)).not.toContain('Old Closed Room From Database');
 
     // Verify messages are NOT exported anywhere
     expect(parsed.messages).toBeUndefined();

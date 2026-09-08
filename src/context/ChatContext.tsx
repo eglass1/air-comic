@@ -844,13 +844,28 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const currentTabs = tabsRef.current;
     const currentActiveTab = activeTabIdRef.current;
 
-    const [conversations, epochKeys, membershipHeads, chainPackets, settings] = await Promise.all([
-      db.getConversations().catch(() => []),
-      db.getAllEpochKeys().catch(() => []),
-      db.getAllChains().catch(() => []),
-      db.getAllChainPackets().catch(() => []),
-      db.getSettings().catch(() => undefined),
-    ]);
+    const [allConversations, allEpochKeys, allChains, allChainPackets, settings] =
+      await Promise.all([
+        db.getConversations().catch(() => []),
+        db.getAllEpochKeys().catch(() => []),
+        db.getAllChains().catch(() => []),
+        db.getAllChainPackets().catch(() => []),
+        db.getSettings().catch(() => undefined),
+      ]);
+
+    // Only export rooms that are currently open in tabs or saved as favorites
+    const allowedConvIds = new Set<string>();
+    currentTabs.forEach((t) => {
+      if (t.convId) allowedConvIds.add(t.convId);
+    });
+    currentFavorites.forEach((f) => {
+      if (f.convId) allowedConvIds.add(f.convId);
+    });
+
+    const conversations = allConversations.filter((c) => allowedConvIds.has(c.convId));
+    const epochKeys = allEpochKeys.filter((k) => allowedConvIds.has(k.convId));
+    const membershipHeads = allChains.filter((m) => allowedConvIds.has(m.convId));
+    const chainPackets = allChainPackets.filter((p) => allowedConvIds.has(p.convId));
 
     const exportPayload = {
       version: 3,
