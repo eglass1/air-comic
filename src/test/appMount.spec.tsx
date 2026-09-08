@@ -172,6 +172,60 @@ describe('application mount', () => {
     expect(realErrors()).toEqual([]);
   }, 30000);
 
+  it('renders mobile floating participant Fab with zIndex above header bar in mobile mode', async () => {
+    const [{ default: App }, { ChatProvider }, { ThemeProvider, CssBaseline }, { createAppTheme }] =
+      await Promise.all([
+        import('../App'),
+        import('../context/ChatContext'),
+        import('@mui/material'),
+        import('../theme'),
+      ]);
+
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: query.includes('max-width:900px'),
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      })),
+      configurable: true,
+      writable: true,
+    });
+
+    let container: HTMLElement | null = null;
+    await act(async () => {
+      const result = render(
+        <ThemeProvider theme={createAppTheme('light')}>
+          <CssBaseline />
+          <ChatProvider>
+            <App />
+          </ChatProvider>
+        </ThemeProvider>
+      );
+      container = result.container;
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 500));
+    });
+
+    const fab = container!.querySelector('.MuiFab-root');
+    expect(fab).not.toBeNull();
+    const computedStyle = window.getComputedStyle(fab!);
+    // Fab zIndex must be at least 1050 (theme.zIndex.fab), safely higher than Room Header Bar (zIndex 10)
+    expect(Number(computedStyle.zIndex)).toBeGreaterThanOrEqual(1050);
+
+    Object.defineProperty(window, 'matchMedia', {
+      value: originalMatchMedia,
+      configurable: true,
+      writable: true,
+    });
+  }, 30000);
+
   it('opens the room named by the address even with rooms already restored', async () => {
     const { ChatProvider, useChat } = await import('../context/ChatContext');
     const { generateRoomSecret } = await import('../services/v3/keys');

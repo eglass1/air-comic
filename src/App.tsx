@@ -169,7 +169,7 @@ const AppContent: React.FC = () => {
               size="small"
               color="secondary"
               onClick={() => setMobileDrawerOpen(true)}
-              sx={{ position: 'absolute', top: 12, left: 12, zIndex: 5 }}
+              sx={{ position: 'absolute', top: 12, left: 12, zIndex: (theme) => theme.zIndex.fab }}
             >
               <Badge badgeContent={isApproved ? pendingJoinRequests.length : 0} color="error">
                 <PeopleIcon fontSize="small" />
