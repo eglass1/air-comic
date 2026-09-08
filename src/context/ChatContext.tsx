@@ -22,6 +22,7 @@ import type {
   RoomMode,
   RoomTab,
   UserProfile,
+  ContactInfo,
 } from '../types';
 import {
   getParticipantId,
@@ -121,7 +122,7 @@ export interface ChatContextType {
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
   regenerateKeypair: () => Promise<void>;
   importProfileFromJson: (jsonStr: string) => Promise<boolean>;
-  exportProfileAsJson: () => string;
+  exportProfileAsJson: () => Promise<string>;
   addFriend: (friend: Omit<Friend, 'id' | 'createdAt' | 'updatedAt'>) => Promise<void>;
   updateFriend: (friend: Friend) => Promise<void>;
   deleteFriend: (id: string) => Promise<void>;
@@ -834,28 +835,297 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await propagateProfile(next);
   }, [propagateProfile]);
 
-  const exportProfileAsJson = useCallback(
-    () => (profileRef.current ? JSON.stringify(profileRef.current, null, 2) : ''),
-    []
-  );
+  const exportProfileAsJson = useCallback(async (): Promise<string> => {
+    const currentProfile = profileRef.current;
+    if (!currentProfile) return '';
 
-  const importProfileFromJson = useCallback(async (jsonStr: string) => {
-    try {
-      const parsed = JSON.parse(jsonStr) as UserProfile;
-      if (!parsed?.signingPublicKeyBase64 || !parsed?.signingPrivateKeyJwk) return false;
-      // Trust the key material, not the claimed id.
-      const participantId = await getParticipantId(parsed.signingPublicKeyBase64);
-      const next: UserProfile = { ...parsed, id: 'current_user', participantId };
-      await db.saveProfile(next);
-      setProfile(next);
-      profileRef.current = next;
-      setFingerprint(await getPublicKeyFingerprint(next.signingPublicKeyBase64));
-      await propagateProfile(next);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
+    const currentFriends = friendsRef.current;
+    const currentFavorites = favoriteRooms;
+    const currentTabs = tabsRef.current;
+    const currentActiveTab = activeTabIdRef.current;
+
+    const [conversations, epochKeys, membershipHeads, chainPackets, settings] = await Promise.all([
+      db.getConversations().catch(() => []),
+      db.getAllEpochKeys().catch(() => []),
+      db.getAllChains().catch(() => []),
+      db.getAllChainPackets().catch(() => []),
+      db.getSettings().catch(() => undefined),
+    ]);
+
+    const exportPayload = {
+      version: 3,
+      exportedAt: Date.now(),
+      participantId: currentProfile.participantId,
+      screenName: currentProfile.screenName,
+      info: currentProfile.contactInfo?.info || '',
+      contactInfo: currentProfile.contactInfo || {},
+      profile: currentProfile,
+      favoriteRooms: currentFavorites,
+      currentRooms: currentTabs,
+      activeTabId: currentActiveTab,
+      friends: currentFriends,
+      conversations,
+      epochKeys,
+      membershipHeads,
+      chainPackets,
+      settings: settings
+        ? { relayUrls: settings.relayUrls, webrtcEnabled: settings.webrtcEnabled }
+        : undefined,
+    };
+
+    return JSON.stringify(exportPayload, null, 2);
+  }, [favoriteRooms]);
+
+  const importProfileFromJson = useCallback(
+    async (jsonStr: string): Promise<boolean> => {
+      try {
+        const parsed = JSON.parse(jsonStr);
+        if (!parsed || typeof parsed !== 'object') return false;
+
+        const rawProfile =
+          parsed.profile && typeof parsed.profile === 'object' ? parsed.profile : parsed;
+
+        if (!rawProfile?.signingPublicKeyBase64 || !rawProfile?.signingPrivateKeyJwk) {
+          return false;
+        }
+
+        // Validate and re-derive participant ID
+        const participantId = await getParticipantId(rawProfile.signingPublicKeyBase64);
+
+        const screenName = parsed.screenName || rawProfile.screenName || 'Anonymous';
+        const bioInfo =
+          parsed.info ?? parsed.contactInfo?.info ?? rawProfile.contactInfo?.info ?? '';
+        const contactInfo: ContactInfo = {
+          ...(rawProfile.contactInfo || {}),
+          ...(parsed.contactInfo || {}),
+          ...(bioInfo ? { info: bioInfo } : {}),
+        };
+
+        const nextProfile: UserProfile = {
+          ...rawProfile,
+          id: 'current_user',
+          participantId,
+          screenName,
+          avatarName: rawProfile.avatarName || 'Armando',
+          backdropName: rawProfile.backdropName || 'room.bgb',
+          contactInfo,
+          updatedAt: Date.now(),
+        };
+
+        // 1. Teardown active room sessions
+        sessionsRef.current.forEach((session) => session.destroy());
+        sessionsRef.current.clear();
+
+        // 2. Stop presence service
+        await presenceService.stop().catch(() => {});
+
+        // 3. Clear all database stores (yielding a blank slate with zero messages)
+        await db.clearAll();
+
+        // 4. Clear browser storage (tabs, active tab, cached titles)
+        try {
+          localStorage.removeItem(STORAGE_KEY_TABS);
+          localStorage.removeItem(STORAGE_KEY_ACTIVE_TAB);
+          sessionStorage.removeItem(STORAGE_KEY_TABS);
+          sessionStorage.removeItem(STORAGE_KEY_ACTIVE_TAB);
+          for (let i = localStorage.length - 1; i >= 0; i--) {
+            const key = localStorage.key(i);
+            if (
+              key &&
+              (key.startsWith('aircomic_channel_title_') ||
+                key.startsWith('aircomic_channel_desc_') ||
+                key.startsWith('aircomic_channel_description_'))
+            ) {
+              localStorage.removeItem(key);
+            }
+          }
+        } catch {
+          /* storage is a convenience only */
+        }
+
+        // 5. Populate database with imported profile and configurations
+        await db.saveProfile(nextProfile);
+
+        // Friends
+        const importedFriends: Friend[] = Array.isArray(parsed.friends) ? parsed.friends : [];
+        for (const f of importedFriends) {
+          if (f.participantId && f.publicKey && f.signingPublicKey) {
+            await db.saveFriend({
+              ...f,
+              publicKey: normalizePublicKey(f.publicKey),
+              signingPublicKey: normalizePublicKey(f.signingPublicKey),
+              id: f.id || crypto.randomUUID(),
+              createdAt: f.createdAt || Date.now(),
+              updatedAt: Date.now(),
+            });
+          }
+        }
+        const loadedFriends = await db.getFriends();
+
+        // Favorite rooms
+        const rawFavorites = Array.isArray(parsed.favoriteRooms)
+          ? parsed.favoriteRooms
+          : Array.isArray(parsed.favorites)
+          ? parsed.favorites
+          : [];
+        const importedFavorites: FavoriteRoomRecord[] = [];
+        for (const fav of rawFavorites) {
+          if (fav.convId && fav.roomMode) {
+            const record: FavoriteRoomRecord = {
+              id: fav.id || crypto.randomUUID(),
+              convId: fav.convId,
+              roomMode: fav.roomMode,
+              roomSecret: fav.roomSecret,
+              publicJoinToken: fav.publicJoinToken,
+              capabilityGeneration: fav.capabilityGeneration,
+              name: fav.name || 'Saved Room',
+              description: fav.description,
+              members: Array.isArray(fav.members) ? fav.members : [],
+              membersUpdatedAt: fav.membersUpdatedAt,
+              savedAt: fav.savedAt || Date.now(),
+            };
+            await db.saveFavorite(record);
+            importedFavorites.push(record);
+          }
+        }
+
+        // Underlying crypto and room records (conversations, epochKeys, membershipHeads, chainPackets)
+        if (Array.isArray(parsed.conversations)) {
+          for (const c of parsed.conversations) {
+            if (c.convId) await db.saveConversation(c);
+          }
+        }
+        if (Array.isArray(parsed.epochKeys)) {
+          for (const k of parsed.epochKeys) {
+            if (k.convId && k.keyId && k.rawBase64Url) await db.saveEpochKey(k);
+          }
+        }
+        if (Array.isArray(parsed.membershipHeads)) {
+          for (const m of parsed.membershipHeads) {
+            if (m.convId) await db.saveChain(m);
+          }
+        }
+        if (Array.isArray(parsed.chainPackets)) {
+          for (const p of parsed.chainPackets) {
+            if (p.convId && p.packetId) await db.saveChainPacket(p);
+          }
+        }
+        if (parsed.settings) {
+          if (Array.isArray(parsed.settings.relayUrls)) {
+            await saveRelayUrls(parsed.settings.relayUrls);
+            setRelayUrlsState(parsed.settings.relayUrls);
+            relayPool.configure(parsed.settings.relayUrls);
+          }
+          if (typeof parsed.settings.webrtcEnabled === 'boolean') {
+            await saveWebrtcEnabled(parsed.settings.webrtcEnabled);
+            setWebrtcEnabledState(parsed.settings.webrtcEnabled);
+          }
+        }
+
+        // Notice: Messages are NOT populated! db.getMessages(convId) is [] (blank slate)
+
+        // 6. Update in-memory state
+        setProfile(nextProfile);
+        profileRef.current = nextProfile;
+        setFingerprint(await getPublicKeyFingerprint(nextProfile.signingPublicKeyBase64));
+
+        setFriends(loadedFriends);
+        friendsRef.current = loadedFriends;
+
+        setFavoriteRooms(importedFavorites);
+
+        setPendingInvites([]);
+        pendingInvitesRef.current = [];
+        setIncomingInvites([]);
+        setIncomingQuickMessage(null);
+        setQuickMessageTarget(null);
+
+        // 7. Reconstruct current rooms / tabs
+        const rawRooms = Array.isArray(parsed.currentRooms)
+          ? parsed.currentRooms
+          : Array.isArray(parsed.rooms)
+          ? parsed.rooms
+          : Array.isArray(parsed.tabs)
+          ? parsed.tabs
+          : [];
+
+        let restoredTabs: RoomTab[] = [];
+        if (rawRooms.length > 0) {
+          restoredTabs = rawRooms
+            .filter((r: any) => r && r.convId && (r.roomMode === 'public' || r.roomSecret))
+            .map((r: any) => {
+              const tabId = r.tabId || crypto.randomUUID();
+              const convId = r.convId;
+              const channelTitle = r.channelTitle || getOrInitChannelTitle(convId);
+              const channelDescription = r.channelDescription || '';
+              rememberChannelTitle(convId, channelTitle);
+              if (channelDescription) rememberChannelDescription(convId, channelDescription);
+              return {
+                tabId,
+                convId,
+                roomMode: r.roomMode,
+                roomSecret: r.roomSecret,
+                publicRoomId: r.publicRoomId,
+                publicJoinToken: r.publicJoinToken,
+                isInitialCreator: Boolean(r.isInitialCreator),
+                channelTitle,
+                channelDescription,
+                unreadCount: 0,
+              };
+            });
+        }
+
+        if (restoredTabs.length === 0) {
+          const defaultConvId = crypto.randomUUID();
+          const defaultTabId = crypto.randomUUID();
+          const defaultTitle = getOrInitChannelTitle(defaultConvId);
+          const defaultSecret = generateRoomSecret();
+          rememberChannelTitle(defaultConvId, defaultTitle);
+          restoredTabs = [
+            {
+              tabId: defaultTabId,
+              convId: defaultConvId,
+              roomMode: 'private',
+              roomSecret: defaultSecret,
+              isInitialCreator: true,
+              channelTitle: defaultTitle,
+              channelDescription: '',
+              unreadCount: 0,
+            },
+          ];
+        }
+
+        tabsRef.current = restoredTabs;
+        setTabs(restoredTabs);
+        persistTabs(restoredTabs);
+
+        const targetActiveTab =
+          (parsed.activeTabId && restoredTabs.find((t) => t.tabId === parsed.activeTabId)) ||
+          restoredTabs[0];
+
+        setActiveTabId(targetActiveTab.tabId);
+        activeTabIdRef.current = targetActiveTab.tabId;
+        persistActiveTab(targetActiveTab.tabId, targetActiveTab.convId);
+
+        // Instantiate sessions for each restored tab
+        restoredTabs.forEach((tab) => {
+          getOrCreateSession(tab);
+        });
+        sessionsRef.current.get(targetActiveTab.tabId)?.setForeground(true);
+        syncBrowserUrl(targetActiveTab);
+
+        // Start presence
+        await presenceService.start(nextProfile);
+        await presenceService.watchContacts(loadedFriends);
+
+        rerender();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [getOrCreateSession, persistActiveTab, persistTabs, rerender, syncBrowserUrl]
+  );
 
   const refreshFriends = useCallback(async () => {
     const all = await db.getFriends();

@@ -339,6 +339,21 @@ export class DatabaseService {
     });
   }
 
+  /** Clears every object store in the database, leaving a completely blank slate. */
+  async clearAll(): Promise<void> {
+    const db = await this.getDB();
+    const storeNames = Array.from(db.objectStoreNames);
+    if (storeNames.length === 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(storeNames, 'readwrite');
+      for (const name of storeNames) {
+        transaction.objectStore(name).clear();
+      }
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  }
+
   // --- Profile -------------------------------------------------------------
 
   async getProfile(): Promise<UserProfile | undefined> {
@@ -462,9 +477,15 @@ export class DatabaseService {
     return rows.sort((a, b) => a.epoch - b.epoch);
   }
 
-  async saveEpochKey(record: Omit<StoredEpochKey, 'id' | 'savedAt'>): Promise<void> {
+  async getAllEpochKeys(): Promise<StoredEpochKey[]> {
+    return this.all<StoredEpochKey>('keys');
+  }
+
+  async saveEpochKey(
+    record: Omit<StoredEpochKey, 'id' | 'savedAt'> & Partial<Pick<StoredEpochKey, 'id' | 'savedAt'>>
+  ): Promise<void> {
     await this.tx('keys', 'readwrite', (s) =>
-      s.put({ ...record, id: `${record.convId}::${record.keyId}`, savedAt: Date.now() })
+      s.put({ ...record, id: `${record.convId}::${record.keyId}`, savedAt: record.savedAt ?? Date.now() })
     );
     const rows = await this.getEpochKeys(record.convId);
     if (rows.length > MAX_STORED_KEYS_PER_CONV) {
@@ -481,6 +502,10 @@ export class DatabaseService {
     return this.tx<StoredChain | undefined>('membershipHeads', 'readonly', (s) => s.get(convId));
   }
 
+  async getAllChains(): Promise<StoredChain[]> {
+    return this.all<StoredChain>('membershipHeads');
+  }
+
   async saveChain(chain: StoredChain): Promise<void> {
     await this.tx('membershipHeads', 'readwrite', (s) => s.put(chain));
   }
@@ -491,9 +516,15 @@ export class DatabaseService {
     return rows.sort((a, b) => a.epoch - b.epoch || a.savedAt - b.savedAt);
   }
 
-  async saveChainPacket(record: Omit<ChainPacketRecord, 'id' | 'savedAt'>): Promise<void> {
+  async getAllChainPackets(): Promise<ChainPacketRecord[]> {
+    return this.all<ChainPacketRecord>('chainPackets');
+  }
+
+  async saveChainPacket(
+    record: Omit<ChainPacketRecord, 'id' | 'savedAt'> & Partial<Pick<ChainPacketRecord, 'id' | 'savedAt'>>
+  ): Promise<void> {
     await this.tx('chainPackets', 'readwrite', (s) =>
-      s.put({ ...record, id: `${record.convId}::${record.packetId}`, savedAt: Date.now() })
+      s.put({ ...record, id: `${record.convId}::${record.packetId}`, savedAt: record.savedAt ?? Date.now() })
     );
   }
 

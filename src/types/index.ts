@@ -52,7 +52,14 @@ export type {
 
 export type { RelayHealth } from '../services/nostr/relayPool';
 
-import type { RoomMode } from '../services/v3/types';
+import type { ContactInfo, RoomMode } from '../services/v3/types';
+import type {
+  ConversationRecord,
+  FavoriteRoomRecord,
+  Friend,
+  StoredEpochKey,
+  UserProfile,
+} from '../services/v3/db';
 
 /** An open room tab. Local UI state; never on the wire. */
 export interface RoomTab {
@@ -66,4 +73,26 @@ export interface RoomTab {
   channelTitle: string;
   channelDescription?: string;
   unreadCount: number;
+}
+
+export interface AirComicBackup {
+  version: number;
+  exportedAt: number;
+  participantId: string;
+  screenName: string;
+  info?: string;
+  contactInfo?: ContactInfo;
+  profile: UserProfile;
+  favoriteRooms: FavoriteRoomRecord[];
+  currentRooms: RoomTab[];
+  activeTabId?: string;
+  friends: Friend[];
+  conversations?: ConversationRecord[];
+  epochKeys?: StoredEpochKey[];
+  membershipHeads?: unknown[];
+  chainPackets?: unknown[];
+  settings?: {
+    relayUrls?: string[];
+    webrtcEnabled?: boolean;
+  };
 }

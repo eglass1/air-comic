@@ -304,6 +304,10 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   const [importedProfile, setImportedProfile] = useState<{
     screenName: string;
     participantId: string;
+    info?: string;
+    favoriteRoomsCount?: number;
+    currentRoomsCount?: number;
+    friendsCount?: number;
     created: string;
     rawJson: string;
   } | null>(null);
@@ -362,16 +366,30 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
     }
   };
 
-  const handleExportJson = () => {
-    const jsonStr = exportProfileAsJson();
+  const handleExportJson = async () => {
+    if (screenName.trim()) {
+      await updateProfile({
+        screenName: screenName.trim(),
+        avatarName: selectedAvatar,
+        backdropName: selectedBackdrop,
+        contactInfo: {
+          info: info.trim(),
+        },
+      });
+    }
+    const jsonStr = await exportProfileAsJson();
+    if (!jsonStr) {
+      setSnack({ message: 'Failed to export profile data', severity: 'error' });
+      return;
+    }
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `aircomic-profile-${screenName.toLowerCase().replace(/\s+/g, '-')}.json`;
+    a.download = `aircomic-backup-${screenName.toLowerCase().replace(/\s+/g, '-')}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setSnack({ message: 'Profile & Keypairs exported successfully!', severity: 'success' });
+    setSnack({ message: 'Profile, rooms, and friends exported successfully!', severity: 'success' });
   };
 
   const handleImportJson = async () => {
@@ -381,10 +399,10 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
     }
     const success = await importProfileFromJson(importedProfile.rawJson);
     if (success) {
-      setSnack({ message: 'Profile & Keypairs restored!', severity: 'success' });
+      setSnack({ message: 'Profile, rooms, and friends restored! Messages cleared.', severity: 'success' });
       setImportedProfile(null);
     } else {
-      setSnack({ message: 'Invalid profile JSON format or corrupted keys', severity: 'error' });
+      setSnack({ message: 'Invalid profile backup JSON format or corrupted keys', severity: 'error' });
     }
   };
 
@@ -404,31 +422,49 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
             if (!parsed || typeof parsed !== 'object') {
               throw new Error('Invalid JSON file format');
             }
-            if (!parsed.signingPublicKeyBase64 && !parsed.participantId) {
-              throw new Error('Invalid profile backup: missing identity keys');
+            const profileData =
+              parsed.profile && typeof parsed.profile === 'object' ? parsed.profile : parsed;
+            if (
+              !profileData.signingPublicKeyBase64 &&
+              !profileData.participantId &&
+              !parsed.participantId
+            ) {
+              throw new Error('Invalid backup: missing identity keys');
             }
-            let pid = parsed.participantId || '';
-            if (!pid && parsed.signingPublicKeyBase64) {
+            let pid = parsed.participantId || profileData.participantId || '';
+            if (!pid && profileData.signingPublicKeyBase64) {
               try {
-                pid = await getParticipantId(parsed.signingPublicKeyBase64);
+                pid = await getParticipantId(profileData.signingPublicKeyBase64);
               } catch {
                 pid = 'Unknown';
               }
             }
             let createdStr = 'Unknown';
-            if (parsed.createdAt) {
-              const d = new Date(parsed.createdAt);
-              createdStr = isNaN(d.getTime()) ? String(parsed.createdAt) : d.toLocaleString();
+            const timestamp = parsed.exportedAt || profileData.createdAt || parsed.createdAt;
+            if (timestamp) {
+              const d = new Date(timestamp);
+              createdStr = isNaN(d.getTime()) ? String(timestamp) : d.toLocaleString();
             }
+            const scrName = parsed.screenName || profileData.screenName || 'Unknown';
+            const bioInfo =
+              parsed.info ?? parsed.contactInfo?.info ?? profileData.contactInfo?.info ?? '';
+            const favCount = (parsed.favoriteRooms || parsed.favorites || []).length;
+            const roomsCount = (parsed.currentRooms || parsed.rooms || parsed.tabs || []).length;
+            const friendsCount = (parsed.friends || []).length;
+
             setImportedProfile({
-              screenName: parsed.screenName || 'Unknown',
+              screenName: scrName,
               participantId: pid || 'Unknown',
+              info: bioInfo,
+              favoriteRoomsCount: favCount,
+              currentRoomsCount: roomsCount,
+              friendsCount,
               created: createdStr,
               rawJson: content,
             });
-            setSnack({ message: 'Profile backup file loaded and ready to restore.', severity: 'success' });
+            setSnack({ message: 'Backup file loaded and ready to restore.', severity: 'success' });
           } catch (err: any) {
-            setSnack({ message: err?.message || 'Invalid profile JSON file', severity: 'error' });
+            setSnack({ message: err?.message || 'Invalid backup JSON file', severity: 'error' });
             setImportedProfile(null);
           }
         }
@@ -699,7 +735,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           {tabIndex === 3 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: 1 }}>
               <Alert severity="info" sx={{ py: 0.5 }}>
-                Export or import your identity to transfer between devices.
+                Export or import your user profile, favorite rooms, open rooms, and friend list to transfer between devices. Saved/cached messages are excluded to provide a fresh start.
               </Alert>
 
               <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
@@ -717,7 +753,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                   <Divider sx={{ my: 0.5 }} />
 
                   <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-                    Information
+                    Backup Details
                   </Typography>
 
                   <Box
@@ -756,9 +792,39 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                         {importedProfile.participantId}
                       </Typography>
                     </Box>
+                    {importedProfile.info && (
+                      <Box>
+                        <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, display: 'block' }}>
+                          Info / Biography
+                        </Typography>
+                        <Typography variant="body2">
+                          {importedProfile.info}
+                        </Typography>
+                      </Box>
+                    )}
+                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mt: 0.5 }}>
+                      <Chip
+                        size="small"
+                        color="primary"
+                        variant="outlined"
+                        label={`${importedProfile.currentRoomsCount ?? 0} Current Rooms`}
+                      />
+                      <Chip
+                        size="small"
+                        color="secondary"
+                        variant="outlined"
+                        label={`${importedProfile.favoriteRoomsCount ?? 0} Favorite Rooms`}
+                      />
+                      <Chip
+                        size="small"
+                        color="info"
+                        variant="outlined"
+                        label={`${importedProfile.friendsCount ?? 0} Friends`}
+                      />
+                    </Box>
                     <Box>
                       <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, display: 'block' }}>
-                        Created
+                        Exported / Created
                       </Typography>
                       <Typography variant="body2">
                         {importedProfile.created}
@@ -766,13 +832,17 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
                     </Box>
                   </Box>
 
+                  <Alert severity="warning" sx={{ py: 0.5 }}>
+                    Restoring will clear all cached messages and conversations, reconstruct your user profile, favorite rooms, open rooms, and friend list as a blank slate, and allow you to pick right up with new messages.
+                  </Alert>
+
                   <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
                     <Button
                       variant="contained"
                       color="primary"
                       onClick={handleImportJson}
                     >
-                      Restore
+                      Restore (Clear &amp; Load)
                     </Button>
                     <Button
                       variant="outlined"
