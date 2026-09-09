@@ -21,23 +21,14 @@ import {
   Chip,
 } from '@mui/material';
 import PeopleIcon from '@mui/icons-material/People';
-import PersonAddIcon from '@mui/icons-material/PersonAdd';
 import SearchIcon from '@mui/icons-material/Search';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
-import ContentCopyIcon from '@mui/icons-material/ContentCopy';
-import EmailIcon from '@mui/icons-material/Email';
-import PhoneIcon from '@mui/icons-material/Phone';
-import HomeIcon from '@mui/icons-material/Home';
 import NotesIcon from '@mui/icons-material/Notes';
-import KeyIcon from '@mui/icons-material/VpnKey';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import SendIcon from '@mui/icons-material/Send';
 import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
-import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useChat } from '../context/ChatContext';
 import { Friend } from '../types';
-import { normalizePublicKey, spkiToPem, getParticipantId } from '../services/crypto';
 import { PresenceDot } from './PresenceDot';
 
 interface FriendsDialogProps {
@@ -48,7 +39,6 @@ interface FriendsDialogProps {
 export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) => {
   const {
     friends,
-    addFriend,
     updateFriend,
     deleteFriend,
     inviteFriendToRoom,
@@ -58,20 +48,11 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     participants,
     isApproved,
     isRekeying,
-    openQuickMessage,
   } = useChat();
 
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [editingFriend, setEditingFriend] = useState<Friend | null>(null);
-  const [isAdding, setIsAdding] = useState<boolean>(false);
-
-  // Form fields
-  const [formScreenName, setFormScreenName] = useState<string>('');
-  const [formPublicKey, setFormPublicKey] = useState<string>('');
-  const [formSigningPublicKey, setFormSigningPublicKey] = useState<string>('');
-  const [formInfo, setFormInfo] = useState<string>('');
-  const [formNotes, setFormNotes] = useState<string>('');
-
+  const [editingNoteFriendId, setEditingNoteFriendId] = useState<string | null>(null);
+  const [noteDraft, setNoteDraft] = useState<string>('');
   const [snack, setSnack] = useState<string | null>(null);
 
   const approvedIds = new Set(
@@ -88,90 +69,39 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     const term = searchTerm.toLowerCase();
     return (
       f.screenName.toLowerCase().includes(term) ||
-      (f.contactInfo?.info && f.contactInfo.info.toLowerCase().includes(term)) ||
       (f.notes && f.notes.toLowerCase().includes(term))
     );
   });
 
-  const openAddForm = () => {
-    setIsAdding(true);
-    setEditingFriend(null);
-    setFormScreenName('');
-    setFormPublicKey('');
-    setFormSigningPublicKey('');
-    setFormInfo('');
-    setFormNotes('');
+  const handleStartEditNote = (friend: Friend) => {
+    setEditingNoteFriendId(friend.id);
+    setNoteDraft(friend.notes || '');
   };
 
-  const openEditForm = (friend: Friend) => {
-    setEditingFriend(friend);
-    setIsAdding(false);
-    setFormScreenName(friend.screenName);
-    setFormPublicKey(friend.publicKey);
-    setFormSigningPublicKey(friend.signingPublicKey || '');
-    setFormInfo(friend.contactInfo?.info || friend.contactInfo?.name || '');
-    setFormNotes(friend.notes || '');
+  const handleCancelEditNote = () => {
+    setEditingNoteFriendId(null);
+    setNoteDraft('');
   };
 
-  const handleSaveForm = async () => {
-    if (!formScreenName.trim()) {
-      alert('Screen name is required');
-      return;
-    }
-    if (!formPublicKey.trim()) {
-      alert('Public key is required');
-      return;
-    }
-
-    const cleanPubKey = normalizePublicKey(formPublicKey.trim());
-    const cleanSignKey = formSigningPublicKey.trim()
-      ? normalizePublicKey(formSigningPublicKey.trim())
-      : cleanPubKey; // fallback
-
-    const participantId = await getParticipantId(cleanSignKey);
-
-    if (editingFriend) {
-      await updateFriend({
-        ...editingFriend,
-        participantId,
-        screenName: formScreenName.trim(),
-        publicKey: cleanPubKey,
-        signingPublicKey: cleanSignKey,
-        contactInfo: {
-          info: formInfo.trim(),
-        },
-        notes: formNotes.trim(),
-      });
-      setSnack(`Updated ${formScreenName}`);
-    } else {
-      await addFriend({
-        participantId,
-        screenName: formScreenName.trim(),
-        publicKey: cleanPubKey,
-        signingPublicKey: cleanSignKey,
-        contactInfo: {
-          info: formInfo.trim(),
-        },
-        notes: formNotes.trim(),
-      });
-      setSnack(`Added ${formScreenName} to friends directory`);
-    }
-
-    setIsAdding(false);
-    setEditingFriend(null);
+  const handleSaveNote = async (friend: Friend) => {
+    await updateFriend({
+      ...friend,
+      notes: noteDraft.trim(),
+    });
+    setEditingNoteFriendId(null);
+    setNoteDraft('');
+    setSnack(`Updated note for ${friend.screenName}`);
   };
 
   const handleDelete = async (id: string, name: string) => {
-    if (window.confirm(`Delete ${name} from your friends directory?`)) {
+    if (window.confirm(`Delete ${name} from your friends?`)) {
+      if (editingNoteFriendId === id) {
+        setEditingNoteFriendId(null);
+        setNoteDraft('');
+      }
       await deleteFriend(id);
       setSnack(`Removed ${name}`);
     }
-  };
-
-  const handleCopyKey = (key: string, label: string) => {
-    const pem = spkiToPem(key);
-    navigator.clipboard.writeText(pem);
-    setSnack(`${label} PEM copied to clipboard!`);
   };
 
   const handleInvite = async (friend: Friend) => {
@@ -185,14 +115,20 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     }
   };
 
+  const handleClose = () => {
+    setEditingNoteFriendId(null);
+    setNoteDraft('');
+    onClose();
+  };
+
   return (
     <>
-      <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+      <Dialog open={open} onClose={handleClose} maxWidth="md" fullWidth>
         <DialogTitle sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
             <PeopleIcon color="primary" />
             <Typography variant="h6" sx={{ fontWeight: 700 }}>
-              Friends Directory ({friends.length})
+              Friends ({friends.length})
             </Typography>
             {friends.length > 0 && (
               <Chip
@@ -204,282 +140,213 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
               />
             )}
           </Box>
-          {!isAdding && !editingFriend && (
-            <Button
-              variant="contained"
-              color="primary"
-              size="small"
-              startIcon={<PersonAddIcon />}
-              onClick={openAddForm}
-            >
-              Add Friend
-            </Button>
-          )}
         </DialogTitle>
 
         <DialogContent dividers sx={{ minHeight: 420 }}>
-          {isAdding || editingFriend ? (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
-              <Typography variant="subtitle1" sx={{ fontWeight: 700, color: 'primary.main' }}>
-                {editingFriend ? `Edit Friend: ${editingFriend.screenName}` : 'Add New Friend'}
+          <TextField
+            placeholder="Search friends by name, notes..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            fullWidth
+            size="small"
+            sx={{ mb: 2 }}
+            slotProps={{
+              input: {
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon color="action" />
+                  </InputAdornment>
+                ),
+              },
+            }}
+          />
+
+          {friends.length === 0 ? (
+            <Box sx={{ textAlign: 'center', py: 6, color: 'text.secondary' }}>
+              <PeopleIcon sx={{ fontSize: 48, opacity: 0.4, mb: 1 }} />
+              <Typography variant="h6">No friends yet</Typography>
+              <Typography variant="body2">
+                When you accept entry requests or meet participants, they are saved here.
               </Typography>
-
-              <Grid container spacing={2}>
-                <Grid size={{ xs: 12 }}>
-                  <TextField
-                    label="Screen Name *"
-                    value={formScreenName}
-                    onChange={(e) => setFormScreenName(e.target.value)}
-                    fullWidth
-                    required
-                    placeholder="e.g. Bob"
-                  />
-                </Grid>
-                <Grid size={{ xs: 12 }}>
-                  <TextField
-                    label="Encryption Public Key (RSA-OAEP Base-64 or PEM) *"
-                    value={formPublicKey}
-                    onChange={(e) => setFormPublicKey(e.target.value)}
-                    fullWidth
-                    multiline
-                    rows={2}
-                    required
-                    placeholder="Paste participant's RSA-OAEP public key PEM or base64 SPKI here..."
-                    slotProps={{
-                      input: { sx: { fontFamily: 'monospace', fontSize: '0.8rem' } },
-                    }}
-                  />
-                </Grid>
-                <Grid size={{ xs: 12 }}>
-                  <TextField
-                    label="Signing Public Key (ECDSA Base-64 or PEM, Optional)"
-                    value={formSigningPublicKey}
-                    onChange={(e) => setFormSigningPublicKey(e.target.value)}
-                    fullWidth
-                    multiline
-                    rows={2}
-                    placeholder="Paste participant's ECDSA signing public key (optional)..."
-                    slotProps={{
-                      input: { sx: { fontFamily: 'monospace', fontSize: '0.8rem' } },
-                    }}
-                  />
-                </Grid>
-                <Grid size={{ xs: 12 }}>
-                  <TextField
-                    label="Information / Biography (Optional)"
-                    value={formInfo}
-                    onChange={(e) => setFormInfo(e.target.value)}
-                    fullWidth
-                    multiline
-                    rows={3}
-                    placeholder="Notes, interests, bio, or info about this contact..."
-                  />
-                </Grid>
-                <Grid size={{ xs: 12 }}>
-                  <TextField
-                    label="Personal Notes (Optional)"
-                    value={formNotes}
-                    onChange={(e) => setFormNotes(e.target.value)}
-                    fullWidth
-                    multiline
-                    rows={2}
-                    placeholder="Private notes for yourself..."
-                  />
-                </Grid>
-              </Grid>
-
-              <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1.5, mt: 2 }}>
-                <Button onClick={() => { setIsAdding(false); setEditingFriend(null); }}>
-                  Cancel
-                </Button>
-                <Button variant="contained" color="primary" onClick={handleSaveForm}>
-                  Save Friend
-                </Button>
-              </Box>
             </Box>
+          ) : filteredFriends.length === 0 ? (
+            <Typography sx={{ py: 4, textAlign: 'center', color: 'text.secondary' }}>
+              No friends matched "{searchTerm}"
+            </Typography>
           ) : (
-            <Box>
-              <TextField
-                placeholder="Search friends by name, info, notes..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                fullWidth
-                size="small"
-                sx={{ mb: 2 }}
-                slotProps={{
-                  input: {
-                    startAdornment: (
-                      <InputAdornment position="start">
-                        <SearchIcon color="action" />
-                      </InputAdornment>
-                    ),
-                  },
-                }}
-              />
+            <Grid container spacing={2}>
+              {filteredFriends.map((f) => {
+                const isAlreadyIn = approvedIds.has(f.participantId);
+                const online = isFriendOnline(f.participantId);
+                const pendingInvite = invitesByParticipant.get(f.participantId);
+                const isEditingNote = editingNoteFriendId === f.id;
 
-              {friends.length === 0 ? (
-                <Box sx={{ textAlign: 'center', py: 6, color: 'text.secondary' }}>
-                  <PeopleIcon sx={{ fontSize: 48, opacity: 0.4, mb: 1 }} />
-                  <Typography variant="h6">No friends in directory yet</Typography>
-                  <Typography variant="body2" sx={{ mb: 2 }}>
-                    When you accept entry requests or meet participants, they are saved here. You can also add contacts manually.
-                  </Typography>
-                  <Button variant="outlined" startIcon={<PersonAddIcon />} onClick={openAddForm}>
-                    Add First Friend
-                  </Button>
-                </Box>
-              ) : filteredFriends.length === 0 ? (
-                <Typography sx={{ py: 4, textAlign: 'center', color: 'text.secondary' }}>
-                  No friends matched "{searchTerm}"
-                </Typography>
-              ) : (
-                <Grid container spacing={2}>
-                  {filteredFriends.map((f) => {
-                    const isAlreadyIn = approvedIds.has(f.participantId);
-                    const online = isFriendOnline(f.participantId);
-                    const pendingInvite = invitesByParticipant.get(f.participantId);
+                return (
+                  <Grid size={{ xs: 12, sm: 6 }} key={f.id}>
+                    <Card
+                      variant="outlined"
+                      sx={{
+                        height: '100%',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        bgcolor: 'background.default',
+                      }}
+                    >
+                      <CardContent sx={{ flexGrow: 1, pb: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
+                          <PresenceDot online={online}>
+                            <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
+                              {f.screenName.charAt(0).toUpperCase()}
+                            </Avatar>
+                          </PresenceDot>
+                          <Box sx={{ overflow: 'hidden', flexGrow: 1 }}>
+                            <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+                              {f.screenName}
+                            </Typography>
+                            <Typography
+                              variant="caption"
+                              sx={{ color: online ? 'success.main' : 'text.disabled', fontWeight: 600 }}
+                            >
+                              {online ? 'Online' : 'Offline'}
+                            </Typography>
+                          </Box>
+                        </Box>
 
-                    return (
-                      <Grid size={{ xs: 12, sm: 6 }} key={f.id}>
-                        <Card variant="outlined" sx={{ height: '100%', display: 'flex', flexDirection: 'column', bgcolor: 'background.default' }}>
-                          <CardContent sx={{ flexGrow: 1, pb: 1 }}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
-                              <PresenceDot online={online}>
-                                <Avatar sx={{ bgcolor: 'secondary.main', color: '#fff', fontWeight: 'bold' }}>
-                                  {f.screenName.charAt(0).toUpperCase()}
-                                </Avatar>
-                              </PresenceDot>
-                              <Box sx={{ overflow: 'hidden', flexGrow: 1 }}>
-                                <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
-                                  {f.screenName}
-                                </Typography>
-                                <Typography
-                                  variant="caption"
-                                  sx={{ color: online ? 'success.main' : 'text.disabled', fontWeight: 600 }}
-                                >
-                                  {online ? 'Online' : 'Offline'}
-                                </Typography>
-                              </Box>
-                              {online && (
-                                <Tooltip title="Quick Message">
-                                  <IconButton
-                                    size="small"
-                                    color="primary"
-                                    onClick={() => {
-                                      openQuickMessage({
-                                        participantId: f.participantId,
-                                        screenName: f.screenName,
-                                        avatarName: f.avatarName,
-                                        publicKey: f.publicKey,
-                                        signingPublicKey: f.signingPublicKey,
-                                      });
-                                    }}
-                                    sx={{ p: 0.5, border: '1px solid', borderColor: 'divider' }}
-                                  >
-                                    <ChatBubbleOutlineIcon fontSize="small" />
-                                  </IconButton>
-                                </Tooltip>
-                              )}
-                              {isAlreadyIn && (
-                                <Chip
-                                  icon={<CheckCircleIcon sx={{ fontSize: '13px !important' }} />}
-                                  label="In Room"
-                                  color="success"
-                                  size="small"
-                                  variant="outlined"
-                                  sx={{ height: 20, fontSize: '0.65rem' }}
-                                />
-                              )}
-                            </Box>
-
-                            {/* Contact Details / Info */}
-                            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, mb: 1.5 }}>
-                              {(f.contactInfo?.info || f.contactInfo?.name) && (
-                                <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'pre-wrap', fontStyle: 'italic' }}>
-                                  "{f.contactInfo.info || f.contactInfo.name}"
-                                </Typography>
-                              )}
-                              {f.notes && (
-                                <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, mt: 0.5 }}>
-                                  <NotesIcon fontSize="small" color="action" sx={{ fontSize: 16, mt: 0.2 }} />
-                                  <Typography variant="caption" color="text.secondary">
-                                    {f.notes}
-                                  </Typography>
-                                </Box>
-                              )}
-                            </Box>
-
-                            {/* Key Snippet */}
-                            <Box sx={{ p: 1, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
-                              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                <Typography variant="caption" color="primary" sx={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                                  <KeyIcon sx={{ fontSize: 14 }} /> ID: {f.participantId.substring(0, 12)}...
-                                </Typography>
-                                <Tooltip title="Copy Public Key PEM">
-                                  <IconButton size="small" onClick={() => handleCopyKey(f.publicKey, 'Public Key')}>
-                                    <ContentCopyIcon sx={{ fontSize: 14 }} />
-                                  </IconButton>
-                                </Tooltip>
-                              </Box>
-                              <Typography variant="caption" sx={{ fontFamily: 'monospace', fontSize: '0.68rem', color: 'text.secondary', display: 'block', wordBreak: 'break-all' }}>
-                                {f.publicKey.substring(0, 30)}...
-                              </Typography>
-                            </Box>
-                          </CardContent>
-
-                          <CardActions sx={{ justifyContent: 'space-between', px: 2, pt: 0, pb: 1.5 }}>
-                            {isApproved && !isAlreadyIn && !pendingInvite ? (
+                        {/* Notes with pencil icon to edit */}
+                        {isEditingNote ? (
+                          <Box sx={{ mt: 1 }}>
+                            <TextField
+                              size="small"
+                              fullWidth
+                              multiline
+                              minRows={2}
+                              maxRows={4}
+                              placeholder="Add a note..."
+                              value={noteDraft}
+                              onChange={(e) => setNoteDraft(e.target.value)}
+                              autoFocus
+                              onKeyDown={(e) => {
+                                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleSaveNote(f);
+                                } else if (e.key === 'Escape') {
+                                  handleCancelEditNote();
+                                }
+                              }}
+                              sx={{ mb: 1, '& .MuiInputBase-input': { fontSize: '0.82rem' } }}
+                            />
+                            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1 }}>
+                              <Button size="small" onClick={handleCancelEditNote}>
+                                Cancel
+                              </Button>
                               <Button
                                 size="small"
-                                variant="outlined"
+                                variant="contained"
                                 color="primary"
-                                startIcon={<SendIcon />}
-                                onClick={() => handleInvite(f)}
-                                disabled={isRekeying}
+                                onClick={() => handleSaveNote(f)}
                               >
-                                Invite to Room
-                              </Button>
-                            ) : pendingInvite && !isAlreadyIn ? (
-                              <Tooltip
-                                title={
-                                  online
-                                    ? 'Invitation delivered — waiting for them to accept'
-                                    : 'Queued: delivered as soon as they come online'
-                                }
-                              >
-                                <Chip
-                                  icon={<ScheduleSendIcon sx={{ fontSize: '13px !important' }} />}
-                                  label={online ? 'Invite sent' : 'Invite queued'}
-                                  color="info"
-                                  size="small"
-                                  variant="outlined"
-                                  onDelete={() => cancelPendingInvite(pendingInvite.inviteId)}
-                                  sx={{ height: 24, fontSize: '0.68rem' }}
-                                />
-                              </Tooltip>
-                            ) : <Box />}
-
-                            <Box sx={{ display: 'flex', gap: 0.5 }}>
-                              <Button size="small" startIcon={<EditIcon />} onClick={() => openEditForm(f)}>
-                                Edit
-                              </Button>
-                              <Button size="small" color="error" startIcon={<DeleteIcon />} onClick={() => handleDelete(f.id, f.screenName)}>
-                                Delete
+                                Save
                               </Button>
                             </Box>
-                          </CardActions>
-                        </Card>
-                      </Grid>
-                    );
-                  })}
-                </Grid>
-              )}
-            </Box>
+                          </Box>
+                        ) : (
+                          <Box
+                            sx={{
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              justifyContent: 'space-between',
+                              gap: 1,
+                              mt: 0.5,
+                            }}
+                          >
+                            <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, flexGrow: 1, minWidth: 0 }}>
+                              <NotesIcon fontSize="small" color="action" sx={{ fontSize: 16, mt: 0.25, flexShrink: 0 }} />
+                              <Typography
+                                variant="caption"
+                                sx={{
+                                  color: f.notes?.trim() ? 'text.secondary' : 'text.disabled',
+                                  fontStyle: f.notes?.trim() ? 'normal' : 'italic',
+                                  wordBreak: 'break-word',
+                                  whiteSpace: 'pre-wrap',
+                                  fontSize: '0.78rem',
+                                  lineHeight: 1.4,
+                                }}
+                              >
+                                {f.notes?.trim() || 'No notes'}
+                              </Typography>
+                            </Box>
+                            <Tooltip title="Edit note">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleStartEditNote(f)}
+                                sx={{
+                                  p: 0.25,
+                                  flexShrink: 0,
+                                  color: 'text.secondary',
+                                  '&:hover': { color: 'primary.main' },
+                                }}
+                                aria-label={`Edit note for ${f.screenName}`}
+                              >
+                                <EditIcon sx={{ fontSize: 16 }} />
+                              </IconButton>
+                            </Tooltip>
+                          </Box>
+                        )}
+                      </CardContent>
+
+                      <CardActions sx={{ justifyContent: 'space-between', px: 2, pt: 0, pb: 1.5 }}>
+                        {isApproved && !isAlreadyIn && !pendingInvite ? (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            color="primary"
+                            startIcon={<SendIcon />}
+                            onClick={() => handleInvite(f)}
+                            disabled={isRekeying}
+                          >
+                            Invite to Room
+                          </Button>
+                        ) : pendingInvite && !isAlreadyIn ? (
+                          <Tooltip
+                            title={
+                              online
+                                ? 'Invitation delivered — waiting for them to accept'
+                                : 'Queued: delivered as soon as they come online'
+                            }
+                          >
+                            <Chip
+                              icon={<ScheduleSendIcon sx={{ fontSize: '13px !important' }} />}
+                              label={online ? 'Invite sent' : 'Invite queued'}
+                              color="info"
+                              size="small"
+                              variant="outlined"
+                              onDelete={() => cancelPendingInvite(pendingInvite.inviteId)}
+                              sx={{ height: 24, fontSize: '0.68rem' }}
+                            />
+                          </Tooltip>
+                        ) : (
+                          <Box />
+                        )}
+
+                        <Button
+                          size="small"
+                          color="error"
+                          startIcon={<DeleteIcon />}
+                          onClick={() => handleDelete(f.id, f.screenName)}
+                        >
+                          Delete
+                        </Button>
+                      </CardActions>
+                    </Card>
+                  </Grid>
+                );
+              })}
+            </Grid>
           )}
         </DialogContent>
 
         <DialogActions sx={{ px: 3, py: 1.5 }}>
-          <Button onClick={onClose}>Close</Button>
+          <Button onClick={handleClose}>Close</Button>
         </DialogActions>
       </Dialog>
 

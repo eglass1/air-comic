@@ -85,7 +85,7 @@ export const ContactCardDialog: React.FC<ContactCardDialogProps> = ({ participan
       contactInfo: participant.contactInfo || {},
       notes: `Encountered in AirComic on ${new Date().toLocaleDateString()}`,
     });
-    setSnackMessage(`${participant.screenName} added to Friends Directory!`);
+    setSnackMessage(`${participant.screenName} added to Friends!`);
   };
 
   return (
@@ -109,7 +109,7 @@ export const ContactCardDialog: React.FC<ContactCardDialogProps> = ({ participan
               />
             </Box>
             <Typography variant="caption" color="text.secondary">
-              {isFriend ? 'In Friends Directory' : 'Participant'}
+              {isFriend ? 'In Friends' : 'Participant'}
             </Typography>
           </Box>
         </DialogTitle>

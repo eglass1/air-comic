@@ -115,7 +115,7 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
 
           {friends.length === 0 ? (
             <Box sx={{ textAlign: 'center', py: 4, color: 'text.secondary' }}>
-              <Typography variant="body2">No contacts saved in your friends directory yet.</Typography>
+              <Typography variant="body2">No contacts saved in your friends yet.</Typography>
             </Box>
           ) : filteredFriends.length === 0 ? (
             <Typography sx={{ py: 3, textAlign: 'center', color: 'text.secondary' }}>
