@@ -21,8 +21,8 @@ describe('FriendsDialog', () => {
     id: 'friend-1',
     participantId: 'GtlJBFqqZnA6test123',
     screenName: 'Dave',
-    publicKey: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...',
-    signingPublicKey: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...',
+    publicKey: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAAAAA',
+    signingPublicKey: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAA',
     contactInfo: {
       info: 'Secret Bio Info that should not show',
     },
@@ -192,5 +192,37 @@ describe('FriendsDialog', () => {
     });
     expect(window.confirm).toHaveBeenCalled();
     expect(mockChatState.deleteFriend).toHaveBeenCalledWith('friend-1');
+  });
+
+  it('displays the info icon on the friend card and opens the details popup window when clicked', async () => {
+    await renderDialog(true);
+
+    const infoBtn = screen.getByLabelText('View details for Dave');
+    expect(infoBtn).toBeTruthy();
+
+    // Initially popup is closed
+    expect(screen.queryByText('INFORMATION / BIOGRAPHY')).toBeNull();
+
+    // Click info icon
+    await act(async () => {
+      fireEvent.click(infoBtn);
+    });
+
+    // Contact card details popup is now open
+    expect(screen.getByText('INFORMATION / BIOGRAPHY')).toBeTruthy();
+    expect(screen.getByText('PUBLIC KEYS & IDENTITY')).toBeTruthy();
+    expect(screen.getByText('Secret Bio Info that should not show')).toBeTruthy();
+    expect(screen.getByText('GtlJBFqqZnA6test123')).toBeTruthy();
+    expect(screen.getByText('Saved in Friends')).toBeTruthy();
+
+    // Close the details popup
+    const closeButtons = screen.getAllByRole('button', { name: /close/i });
+    // The details dialog has its own Close button
+    await act(async () => {
+      fireEvent.click(closeButtons[closeButtons.length - 1]);
+    });
+
+    // Contact card details popup is closed
+    expect(screen.queryByText('INFORMATION / BIOGRAPHY')).toBeNull();
   });
 });

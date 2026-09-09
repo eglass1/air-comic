@@ -272,4 +272,25 @@ describe('ProfileDialog Export & Import UI', () => {
     URL.createObjectURL = originalCreateObjectURL;
     URL.revokeObjectURL = originalRevokeObjectURL;
   });
+
+  it('does not include the Encryption & Keys tab on the profile dialog', async () => {
+    const { ChatProvider } = await import('../context/ChatContext');
+
+    await act(async () => {
+      render(
+        <ChatProvider>
+          <ProfileDialog open={true} onClose={() => {}} />
+        </ChatProvider>
+      );
+    });
+
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 400));
+    });
+
+    const tabs = screen.getAllByRole('tab');
+    const tabLabels = tabs.map((t) => t.textContent?.trim());
+    expect(tabLabels).toEqual(['Avatar & Backdrop', 'Identity', 'Backup & Restore']);
+    expect(screen.queryByText(/Encryption & Keys/i)).toBeNull();
+  });
 });

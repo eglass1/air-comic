@@ -14,33 +14,21 @@ import {
   Alert,
   Snackbar,
   Grid,
-  Accordion,
-  AccordionSummary,
-  AccordionDetails,
   Chip,
   Card,
   CardActionArea,
-  CardContent,
   MenuItem,
   Select,
   FormControl,
   InputLabel,
 } from '@mui/material';
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
-import ContentCopyIcon from '@mui/icons-material/ContentCopy';
-import VisibilityIcon from '@mui/icons-material/Visibility';
-import VisibilityOffIcon from '@mui/icons-material/VisibilityOff';
-import RefreshIcon from '@mui/icons-material/Refresh';
 import DownloadIcon from '@mui/icons-material/Download';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
 import SaveIcon from '@mui/icons-material/Save';
-import KeyIcon from '@mui/icons-material/VpnKey';
 import AccountCircleIcon from '@mui/icons-material/AccountCircle';
-import VerifiedIcon from '@mui/icons-material/Verified';
 import FaceRetouchingNaturalIcon from '@mui/icons-material/FaceRetouchingNatural';
-import WallpaperIcon from '@mui/icons-material/Wallpaper';
 import { useChat } from '../context/ChatContext';
-import { getPublicKeyFingerprint, getParticipantId } from '../services/crypto';
+import { getParticipantId } from '../services/crypto';
 import { AvatarManager } from '../comic/avatarManager';
 import { AvatarData, BackdropData, EM_NEUTRAL } from '../comic/types';
 
@@ -286,7 +274,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   const {
     profile,
     updateProfile,
-    regenerateKeypair,
     exportProfileAsJson,
     importProfileFromJson,
   } = useChat();
@@ -298,9 +285,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   const [selectedBackdrop, setSelectedBackdrop] = useState<string>('room.bgb');
   const [screenName, setScreenName] = useState<string>('');
   const [info, setInfo] = useState<string>('');
-  const [fingerprint, setFingerprint] = useState<string>('');
-  const [signFingerprint, setSignFingerprint] = useState<string>('');
-  const [showPrivateKey, setShowPrivateKey] = useState<boolean>(false);
   const [importedProfile, setImportedProfile] = useState<{
     screenName: string;
     participantId: string;
@@ -325,10 +309,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
       setSelectedBackdrop(profile.backdropName || 'room.bgb');
       setScreenName(profile.screenName || 'AirComic User');
       setInfo(profile.contactInfo?.info || profile.contactInfo?.name || '');
-      getPublicKeyFingerprint(profile.publicKeyBase64).then(setFingerprint);
-      if (profile.signingPublicKeyBase64) {
-        getPublicKeyFingerprint(profile.signingPublicKeyBase64).then(setSignFingerprint);
-      }
     }
   }, [profile, open]);
 
@@ -348,22 +328,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
     });
 
     setSnack({ message: 'Profile & Avatar updated successfully!', severity: 'success' });
-  };
-
-  const handleCopy = (text: string, label: string) => {
-    navigator.clipboard.writeText(text);
-    setSnack({ message: `${label} copied to clipboard!`, severity: 'success' });
-  };
-
-  const handleRegenerateKeypair = async () => {
-    if (
-      window.confirm(
-        'Are you sure you want to generate a new keypair bundle? This will rotate both your encryption and digital signature keys.'
-      )
-    ) {
-      await regenerateKeypair();
-      setSnack({ message: 'New RSA-OAEP and ECDSA keypair bundle generated!', severity: 'success' });
-    }
   };
 
   const handleExportJson = async () => {
@@ -496,7 +460,6 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           >
             <Tab label="Avatar & Backdrop" icon={<FaceRetouchingNaturalIcon fontSize="small" />} iconPosition="start" />
             <Tab label="Identity" icon={<AccountCircleIcon fontSize="small" />} iconPosition="start" />
-            <Tab label="Encryption & Keys" icon={<KeyIcon fontSize="small" />} iconPosition="start" />
             <Tab label="Backup & Restore" icon={<DownloadIcon fontSize="small" />} iconPosition="start" />
           </Tabs>
         </DialogTitle>
@@ -643,96 +606,8 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
             </Box>
           )}
 
-          {/* TAB 2: Keys */}
+          {/* TAB 2: Backup & Restore */}
           {tabIndex === 2 && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: 1 }}>
-              <Alert severity="success" sx={{ py: 0.5 }}>
-                AirComic uses <strong>RSA-OAEP 2048-bit</strong> for asymmetric encryption and <strong>ECDSA P-256</strong> for digital signatures on rekeys and join requests.
-              </Alert>
-
-              {/* Encryption Key */}
-              <Box sx={{ p: 2, bgcolor: 'background.default', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
-                  <Typography variant="subtitle2" sx={{ fontWeight: 700, color: 'primary.main', display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                    <KeyIcon fontSize="small" /> RSA-OAEP 2048-BIT ENCRYPTION PUBLIC KEY
-                  </Typography>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    startIcon={<ContentCopyIcon fontSize="small" />}
-                    onClick={() => handleCopy(profile?.publicKeyPem || '', 'Encryption Public Key PEM')}
-                  >
-                    Copy PEM
-                  </Button>
-                </Box>
-
-                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
-                  SHA-256 Fingerprint: <code>{fingerprint}</code>
-                </Typography>
-
-                <TextField
-                  multiline
-                  rows={3}
-                  value={profile?.publicKeyPem || ''}
-                  slotProps={{
-                    input: {
-                      readOnly: true,
-                      sx: { fontFamily: 'monospace', fontSize: '0.72rem' },
-                    },
-                  }}
-                  fullWidth
-                />
-              </Box>
-
-              {/* Signing Key */}
-              <Box sx={{ p: 2, bgcolor: 'background.default', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
-                  <Typography variant="subtitle2" sx={{ fontWeight: 700, color: 'secondary.main', display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                    <VerifiedIcon fontSize="small" /> ECDSA P-256 DIGITAL SIGNING PUBLIC KEY
-                  </Typography>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    color="secondary"
-                    startIcon={<ContentCopyIcon fontSize="small" />}
-                    onClick={() => handleCopy(profile?.signingPublicKeyPem || '', 'Signing Public Key PEM')}
-                  >
-                    Copy PEM
-                  </Button>
-                </Box>
-
-                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
-                  SHA-256 Fingerprint: <code>{signFingerprint}</code>
-                </Typography>
-
-                <TextField
-                  multiline
-                  rows={2}
-                  value={profile?.signingPublicKeyPem || ''}
-                  slotProps={{
-                    input: {
-                      readOnly: true,
-                      sx: { fontFamily: 'monospace', fontSize: '0.72rem' },
-                    },
-                  }}
-                  fullWidth
-                />
-              </Box>
-
-              {/* Keypair Rotation */}
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 1 }}>
-                <Typography variant="caption" color="error.main">
-                  Warning: Rotating keys generates a brand-new cryptographic identity.
-                </Typography>
-                <Button variant="outlined" color="error" size="small" startIcon={<RefreshIcon />} onClick={handleRegenerateKeypair}>
-                  Rotate Cryptographic Keys
-                </Button>
-              </Box>
-            </Box>
-          )}
-
-          {/* TAB 3: Backup & Restore */}
-          {tabIndex === 3 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: 1 }}>
               <Alert severity="info" sx={{ py: 0.5 }}>
                 Export or import your user profile, favorite rooms, open rooms, and friend list to transfer between devices. Saved/cached messages are excluded to provide a fresh start.

@@ -27,9 +27,11 @@ import EditIcon from '@mui/icons-material/Edit';
 import NotesIcon from '@mui/icons-material/Notes';
 import SendIcon from '@mui/icons-material/Send';
 import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import { useChat } from '../context/ChatContext';
-import { Friend } from '../types';
+import { Friend, Participant } from '../types';
 import { PresenceDot } from './PresenceDot';
+import { ContactCardDialog } from './ContactCardDialog';
 
 interface FriendsDialogProps {
   open: boolean;
@@ -54,6 +56,7 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
   const [editingNoteFriendId, setEditingNoteFriendId] = useState<string | null>(null);
   const [noteDraft, setNoteDraft] = useState<string>('');
   const [snack, setSnack] = useState<string | null>(null);
+  const [selectedParticipant, setSelectedParticipant] = useState<Participant | null>(null);
 
   const approvedIds = new Set(
     participants.filter((p) => p.isApproved).map((p) => p.participantId)
@@ -115,9 +118,27 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     }
   };
 
+  const handleViewDetails = (friend: Friend) => {
+    const currentParticipant = participants.find((p) => p.participantId === friend.participantId);
+    const online = isFriendOnline(friend.participantId);
+    setSelectedParticipant({
+      participantId: friend.participantId,
+      screenName: friend.screenName,
+      avatarName: friend.avatarName || currentParticipant?.avatarName,
+      publicKey: friend.publicKey,
+      signingPublicKey: friend.signingPublicKey,
+      contactInfo: friend.contactInfo || currentParticipant?.contactInfo,
+      lastSeen: currentParticipant?.lastSeen || friend.lastSeen || Date.now(),
+      isSelf: false,
+      status: currentParticipant?.status || (online ? 'online' : 'offline'),
+      isApproved: approvedIds.has(friend.participantId),
+    });
+  };
+
   const handleClose = () => {
     setEditingNoteFriendId(null);
     setNoteDraft('');
+    setSelectedParticipant(null);
     onClose();
   };
 
@@ -210,6 +231,18 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
                               {online ? 'Online' : 'Offline'}
                             </Typography>
                           </Box>
+                          <Tooltip title="View Details">
+                            <IconButton
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleViewDetails(f);
+                              }}
+                              aria-label={`View details for ${f.screenName}`}
+                            >
+                              <InfoOutlinedIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
                         </Box>
 
                         {/* Notes with pencil icon to edit */}
@@ -349,6 +382,14 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
           <Button onClick={handleClose}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      {selectedParticipant && (
+        <ContactCardDialog
+          participant={selectedParticipant}
+          open={Boolean(selectedParticipant)}
+          onClose={() => setSelectedParticipant(null)}
+        />
+      )}
 
       <Snackbar
         open={Boolean(snack)}
