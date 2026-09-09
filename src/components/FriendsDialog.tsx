@@ -28,6 +28,7 @@ import NotesIcon from '@mui/icons-material/Notes';
 import SendIcon from '@mui/icons-material/Send';
 import ScheduleSendIcon from '@mui/icons-material/ScheduleSend';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
+import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useChat } from '../context/ChatContext';
 import { Friend, Participant } from '../types';
 import { PresenceDot } from './PresenceDot';
@@ -50,6 +51,7 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     participants,
     isApproved,
     isRekeying,
+    openQuickMessage,
   } = useChat();
 
   const [searchTerm, setSearchTerm] = useState<string>('');
@@ -132,6 +134,18 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
       isSelf: false,
       status: currentParticipant?.status || (online ? 'online' : 'offline'),
       isApproved: approvedIds.has(friend.participantId),
+    });
+  };
+
+  const handleQuickMessage = (friend: Friend) => {
+    const currentParticipant = participants.find((p) => p.participantId === friend.participantId);
+    openQuickMessage({
+      participantId: friend.participantId,
+      screenName: friend.screenName,
+      avatarName: friend.avatarName || currentParticipant?.avatarName,
+      publicKey: friend.publicKey,
+      signingPublicKey: friend.signingPublicKey,
+      peerId: currentParticipant?.peerId,
     });
   };
 
@@ -231,18 +245,38 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
                               {online ? 'Online' : 'Offline'}
                             </Typography>
                           </Box>
-                          <Tooltip title="View Details">
-                            <IconButton
-                              size="small"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleViewDetails(f);
-                              }}
-                              aria-label={`View details for ${f.screenName}`}
-                            >
-                              <InfoOutlinedIcon fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}>
+                            {online && (
+                              <Tooltip title="Quick Message">
+                                <IconButton
+                                  size="small"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleQuickMessage(f);
+                                  }}
+                                  aria-label={`Quick message to ${f.screenName}`}
+                                  sx={{
+                                    color: 'text.secondary',
+                                    '&:hover': { color: 'primary.main' },
+                                  }}
+                                >
+                                  <ChatBubbleOutlineIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
+                            )}
+                            <Tooltip title="View Details">
+                              <IconButton
+                                size="small"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleViewDetails(f);
+                                }}
+                                aria-label={`View details for ${f.screenName}`}
+                              >
+                                <InfoOutlinedIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          </Box>
                         </Box>
 
                         {/* Notes with pencil icon to edit */}

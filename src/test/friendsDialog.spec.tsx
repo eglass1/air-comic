@@ -43,6 +43,7 @@ describe('FriendsDialog', () => {
       participants: [],
       isApproved: true,
       isRekeying: false,
+      openQuickMessage: vi.fn(),
     };
   });
 
@@ -224,5 +225,35 @@ describe('FriendsDialog', () => {
 
     // Contact card details popup is closed
     expect(screen.queryByText('INFORMATION / BIOGRAPHY')).toBeNull();
+  });
+
+  it('does not display the Quick Message balloon icon when the friend is offline', async () => {
+    mockChatState.isFriendOnline = vi.fn().mockReturnValue(false);
+    await renderDialog(true);
+
+    expect(screen.queryByLabelText('Quick message to Dave')).toBeNull();
+    expect(screen.queryByRole('button', { name: /quick message/i })).toBeNull();
+  });
+
+  it('displays the Quick Message balloon icon when the friend is online and opens quick message on click', async () => {
+    mockChatState.isFriendOnline = vi.fn().mockReturnValue(true);
+    await renderDialog(true);
+
+    const quickMsgBtn = screen.getByLabelText('Quick message to Dave');
+    expect(quickMsgBtn).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(quickMsgBtn);
+    });
+
+    expect(mockChatState.openQuickMessage).toHaveBeenCalledTimes(1);
+    expect(mockChatState.openQuickMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        participantId: 'GtlJBFqqZnA6test123',
+        screenName: 'Dave',
+        publicKey: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAAAAA',
+        signingPublicKey: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAA',
+      })
+    );
   });
 });
