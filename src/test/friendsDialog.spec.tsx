@@ -256,4 +256,26 @@ describe('FriendsDialog', () => {
       })
     );
   });
+
+  it('displays friend as online and messagable when present in room participants', async () => {
+    mockChatState.isFriendOnline = vi.fn().mockReturnValue(false);
+    mockChatState.participants = [
+      {
+        participantId: 'GtlJBFqqZnA6test123',
+        screenName: 'Dave',
+        publicKey: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAAAAA',
+        signingPublicKey: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAA',
+        status: 'online',
+        isSelf: false,
+        isApproved: true,
+        lastSeen: Date.now(),
+      },
+    ];
+    await renderDialog(true);
+
+    expect(screen.getByText('1 online')).toBeTruthy();
+    expect(screen.getByText('Online')).toBeTruthy();
+    expect(screen.queryByText('Offline')).toBeNull();
+    expect(screen.getByLabelText('Quick message to Dave')).toBeTruthy();
+  });
 });

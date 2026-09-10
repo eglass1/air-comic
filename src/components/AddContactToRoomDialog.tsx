@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -53,6 +53,15 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
 
   const approvedIds = new Set(
     participants.filter((p) => p.isApproved).map((p) => p.participantId)
+  );
+
+  const checkIsFriendOnline = useCallback(
+    (participantId: string) => {
+      if (isFriendOnline(participantId)) return true;
+      const p = participants.find((part) => part.participantId === participantId);
+      return Boolean(p && !p.isSelf && p.status === 'online');
+    },
+    [isFriendOnline, participants]
   );
 
   const filteredFriends = friends.filter((f) => {
@@ -125,7 +134,7 @@ export const AddContactToRoomDialog: React.FC<AddContactToRoomDialogProps> = ({
             <List sx={{ pt: 0 }}>
               {filteredFriends.map((f) => {
                 const isAlreadyIn = approvedIds.has(f.participantId);
-                const online = isFriendOnline(f.participantId);
+                const online = checkIsFriendOnline(f.participantId);
                 const isInvited = invitedParticipantIds.has(f.participantId);
 
                 return (

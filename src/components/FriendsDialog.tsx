@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -68,7 +68,16 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
     pendingInvites.map((invite) => [invite.recipientParticipantId, invite])
   );
 
-  const onlineCount = friends.filter((f) => isFriendOnline(f.participantId)).length;
+  const checkIsFriendOnline = useCallback(
+    (participantId: string) => {
+      if (isFriendOnline(participantId)) return true;
+      const p = participants.find((part) => part.participantId === participantId);
+      return Boolean(p && !p.isSelf && p.status === 'online');
+    },
+    [isFriendOnline, participants]
+  );
+
+  const onlineCount = friends.filter((f) => checkIsFriendOnline(f.participantId)).length;
 
   const filteredFriends = friends.filter((f) => {
     const term = searchTerm.toLowerCase();
@@ -122,7 +131,7 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
 
   const handleViewDetails = (friend: Friend) => {
     const currentParticipant = participants.find((p) => p.participantId === friend.participantId);
-    const online = isFriendOnline(friend.participantId);
+    const online = checkIsFriendOnline(friend.participantId);
     setSelectedParticipant({
       participantId: friend.participantId,
       screenName: friend.screenName,
@@ -212,7 +221,7 @@ export const FriendsDialog: React.FC<FriendsDialogProps> = ({ open, onClose }) =
             <Grid container spacing={2}>
               {filteredFriends.map((f) => {
                 const isAlreadyIn = approvedIds.has(f.participantId);
-                const online = isFriendOnline(f.participantId);
+                const online = checkIsFriendOnline(f.participantId);
                 const pendingInvite = invitesByParticipant.get(f.participantId);
                 const isEditingNote = editingNoteFriendId === f.id;
 

@@ -1229,7 +1229,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const isFriendOnline = useCallback(
-    (participantId: string) => presenceService.isOnline(participantId),
+    (participantId: string) => {
+      if (presenceService.isOnline(participantId)) return true;
+      for (const session of sessionsRef.current.values()) {
+        const p = session.participantsMap.get(participantId);
+        if (p && !p.isSelf && p.status === 'online') return true;
+      }
+      return false;
+    },
     []
   );
 
