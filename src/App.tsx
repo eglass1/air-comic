@@ -36,6 +36,8 @@ import { NewRoomDialog } from './components/NewRoomDialog';
 import { QuickMessageDialog } from './components/QuickMessageDialog';
 import { IncomingQuickMessageOverlay } from './components/IncomingQuickMessageOverlay';
 import { InstallAppDialog } from './components/InstallAppDialog';
+import { CloudRestoreDialog } from './components/CloudRestoreDialog';
+import { parseCloudRestoreKeyFromUrl } from './services/cloudBackup';
 import { applyUpdate, usePwaStatus } from './services/pwa';
 
 const AppContent: React.FC = () => {
@@ -53,6 +55,26 @@ const AppContent: React.FC = () => {
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState<boolean>(false);
   const [installOpen, setInstallOpen] = useState<boolean>(false);
   const [updateDismissed, setUpdateDismissed] = useState<boolean>(false);
+
+  // Cloud Restore state
+  const [cloudRestoreKey, setCloudRestoreKey] = useState<string | null>(null);
+  const [cloudRestoreOpen, setCloudRestoreOpen] = useState<boolean>(false);
+  const [profileInitialTab, setProfileInitialTab] = useState<number>(0);
+  const [preloadedBackupJson, setPreloadedBackupJson] = useState<string | null>(null);
+
+  useEffect(() => {
+    const key = parseCloudRestoreKeyFromUrl();
+    if (key) {
+      setCloudRestoreKey(key);
+      setCloudRestoreOpen(true);
+    }
+  }, []);
+
+  const handleCloudRestoreReady = (decryptedJson: string) => {
+    setPreloadedBackupJson(decryptedJson);
+    setProfileInitialTab(2); // Tab 2: Backup & Restore
+    setProfileOpen(true);
+  };
 
   const { isApproved, pendingJoinRequests } = useChat();
   const { updateReady } = usePwaStatus();
@@ -179,7 +201,17 @@ const AppContent: React.FC = () => {
         </Box>
 
         {/* Modals & Dialogs */}
-        <ProfileDialog open={profileOpen} onClose={() => setProfileOpen(false)} />
+        <ProfileDialog
+          open={profileOpen}
+          onClose={() => {
+            setProfileOpen(false);
+            setPreloadedBackupJson(null);
+            setProfileInitialTab(0);
+          }}
+          initialTab={profileInitialTab}
+          initialImportedJson={preloadedBackupJson}
+          onClearInitialImport={() => setPreloadedBackupJson(null)}
+        />
         <FriendsDialog open={friendsOpen} onClose={() => setFriendsOpen(false)} />
 
         <FavoriteRoomsDialog open={favoritesOpen} onClose={() => setFavoritesOpen(false)} />
@@ -216,6 +248,15 @@ const AppContent: React.FC = () => {
         <IncomingInviteDialog />
         <QuickMessageDialog />
         <IncomingQuickMessageOverlay />
+        <CloudRestoreDialog
+          open={cloudRestoreOpen}
+          restoreKey={cloudRestoreKey}
+          onClose={() => {
+            setCloudRestoreOpen(false);
+            setCloudRestoreKey(null);
+          }}
+          onRestoreReady={handleCloudRestoreReady}
+        />
 
         {/* A newer build is cached and waiting; swapping it in is the user's
             call, and dismissing it must not leave the composer covered. */}

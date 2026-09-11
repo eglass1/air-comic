@@ -21,20 +21,37 @@ import {
   Select,
   FormControl,
   InputLabel,
+  CircularProgress,
+  InputAdornment,
+  IconButton,
 } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
 import SaveIcon from '@mui/icons-material/Save';
 import AccountCircleIcon from '@mui/icons-material/AccountCircle';
 import FaceRetouchingNaturalIcon from '@mui/icons-material/FaceRetouchingNatural';
+import CloudUploadIcon from '@mui/icons-material/CloudUpload';
+import CloudDoneIcon from '@mui/icons-material/CloudDone';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import LockIcon from '@mui/icons-material/Lock';
+import Visibility from '@mui/icons-material/Visibility';
+import VisibilityOff from '@mui/icons-material/VisibilityOff';
 import { useChat } from '../context/ChatContext';
 import { getParticipantId } from '../services/crypto';
+import {
+  encryptCloudBackup,
+  publishCloudBackupToRelays,
+  buildCloudRestoreUrl,
+} from '../services/cloudBackup';
 import { AvatarManager } from '../comic/avatarManager';
 import { AvatarData, BackdropData, EM_NEUTRAL } from '../comic/types';
 
-interface ProfileDialogProps {
+export interface ProfileDialogProps {
   open: boolean;
   onClose: () => void;
+  initialTab?: number;
+  initialImportedJson?: string | null;
+  onClearInitialImport?: () => void;
 }
 
 const AvatarCardItem: React.FC<{
@@ -270,7 +287,13 @@ const SelectedBackdropPreview: React.FC<{
   );
 };
 
-export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) => {
+export const ProfileDialog: React.FC<ProfileDialogProps> = ({
+  open,
+  onClose,
+  initialTab,
+  initialImportedJson,
+  onClearInitialImport,
+}) => {
   const {
     profile,
     updateProfile,
@@ -280,7 +303,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
 
   const avatarManager = useMemo(() => AvatarManager.getInstance(), []);
 
-  const [tabIndex, setTabIndex] = useState<number>(0);
+  const [tabIndex, setTabIndex] = useState<number>(initialTab ?? 0);
   const [selectedAvatar, setSelectedAvatar] = useState<string>('Armando');
   const [selectedBackdrop, setSelectedBackdrop] = useState<string>('room.bgb');
   const [screenName, setScreenName] = useState<string>('');
@@ -297,11 +320,90 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
   } | null>(null);
   const [snack, setSnack] = useState<{ message: string; severity: 'success' | 'error' } | null>(null);
 
+  // Cloud Export state
+  const [cloudExportPasswordOpen, setCloudExportPasswordOpen] = useState<boolean>(false);
+  const [cloudExportPassword, setCloudExportPassword] = useState<string>('');
+  const [showCloudExportPassword, setShowCloudExportPassword] = useState<boolean>(false);
+  const [cloudExportLoading, setCloudExportLoading] = useState<boolean>(false);
+  const [cloudExportResultOpen, setCloudExportResultOpen] = useState<boolean>(false);
+  const [cloudExportUrl, setCloudExportUrl] = useState<string>('');
+  const [copied, setCopied] = useState<boolean>(false);
+
+  const loadBackupFromJsonString = async (content: string): Promise<boolean> => {
+    try {
+      const parsed = JSON.parse(content);
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Invalid JSON file format');
+      }
+      const profileData =
+        parsed.profile && typeof parsed.profile === 'object' ? parsed.profile : parsed;
+      if (
+        !profileData.signingPublicKeyBase64 &&
+        !profileData.participantId &&
+        !parsed.participantId
+      ) {
+        throw new Error('Invalid backup: missing identity keys');
+      }
+      let pid = parsed.participantId || profileData.participantId || '';
+      if (!pid && profileData.signingPublicKeyBase64) {
+        try {
+          pid = await getParticipantId(profileData.signingPublicKeyBase64);
+        } catch {
+          pid = 'Unknown';
+        }
+      }
+      let createdStr = 'Unknown';
+      const timestamp = parsed.exportedAt || profileData.createdAt || parsed.createdAt;
+      if (timestamp) {
+        const d = new Date(timestamp);
+        createdStr = isNaN(d.getTime()) ? String(timestamp) : d.toLocaleString();
+      }
+      const scrName = parsed.screenName || profileData.screenName || 'Unknown';
+      const bioInfo =
+        parsed.info ?? parsed.contactInfo?.info ?? profileData.contactInfo?.info ?? '';
+      const favCount = (parsed.favoriteRooms || parsed.favorites || []).length;
+      const roomsCount = (parsed.currentRooms || parsed.rooms || parsed.tabs || []).length;
+      const friendsCount = (parsed.friends || []).length;
+
+      setImportedProfile({
+        screenName: scrName,
+        participantId: pid || 'Unknown',
+        info: bioInfo,
+        favoriteRoomsCount: favCount,
+        currentRoomsCount: roomsCount,
+        friendsCount,
+        created: createdStr,
+        rawJson: content,
+      });
+      setTabIndex(2);
+      setSnack({ message: 'Backup file loaded and ready to restore.', severity: 'success' });
+      return true;
+    } catch (err: any) {
+      setSnack({ message: err?.message || 'Invalid backup JSON file', severity: 'error' });
+      setImportedProfile(null);
+      return false;
+    }
+  };
+
   useEffect(() => {
     if (!open) {
       setImportedProfile(null);
+      setCloudExportPasswordOpen(false);
+      setCloudExportResultOpen(false);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (initialImportedJson) {
+      void loadBackupFromJsonString(initialImportedJson);
+    }
+  }, [initialImportedJson]);
+
+  useEffect(() => {
+    if (initialTab !== undefined && open) {
+      setTabIndex(initialTab);
+    }
+  }, [initialTab, open]);
 
   useEffect(() => {
     if (profile) {
@@ -372,6 +474,7 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
 
   const handleClearImport = () => {
     setImportedProfile(null);
+    onClearInitialImport?.();
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -381,61 +484,80 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
       reader.onload = async (event) => {
         const content = event.target?.result as string;
         if (content) {
-          try {
-            const parsed = JSON.parse(content);
-            if (!parsed || typeof parsed !== 'object') {
-              throw new Error('Invalid JSON file format');
-            }
-            const profileData =
-              parsed.profile && typeof parsed.profile === 'object' ? parsed.profile : parsed;
-            if (
-              !profileData.signingPublicKeyBase64 &&
-              !profileData.participantId &&
-              !parsed.participantId
-            ) {
-              throw new Error('Invalid backup: missing identity keys');
-            }
-            let pid = parsed.participantId || profileData.participantId || '';
-            if (!pid && profileData.signingPublicKeyBase64) {
-              try {
-                pid = await getParticipantId(profileData.signingPublicKeyBase64);
-              } catch {
-                pid = 'Unknown';
-              }
-            }
-            let createdStr = 'Unknown';
-            const timestamp = parsed.exportedAt || profileData.createdAt || parsed.createdAt;
-            if (timestamp) {
-              const d = new Date(timestamp);
-              createdStr = isNaN(d.getTime()) ? String(timestamp) : d.toLocaleString();
-            }
-            const scrName = parsed.screenName || profileData.screenName || 'Unknown';
-            const bioInfo =
-              parsed.info ?? parsed.contactInfo?.info ?? profileData.contactInfo?.info ?? '';
-            const favCount = (parsed.favoriteRooms || parsed.favorites || []).length;
-            const roomsCount = (parsed.currentRooms || parsed.rooms || parsed.tabs || []).length;
-            const friendsCount = (parsed.friends || []).length;
-
-            setImportedProfile({
-              screenName: scrName,
-              participantId: pid || 'Unknown',
-              info: bioInfo,
-              favoriteRoomsCount: favCount,
-              currentRoomsCount: roomsCount,
-              friendsCount,
-              created: createdStr,
-              rawJson: content,
-            });
-            setSnack({ message: 'Backup file loaded and ready to restore.', severity: 'success' });
-          } catch (err: any) {
-            setSnack({ message: err?.message || 'Invalid backup JSON file', severity: 'error' });
-            setImportedProfile(null);
-          }
+          await loadBackupFromJsonString(content);
         }
       };
       reader.readAsText(file);
     }
     e.target.value = '';
+  };
+
+  const handleOpenCloudExport = () => {
+    setCloudExportPassword('');
+    setShowCloudExportPassword(false);
+    setCloudExportPasswordOpen(true);
+  };
+
+  const handlePerformCloudExport = async () => {
+    if (!cloudExportPassword.trim()) {
+      setSnack({ message: 'Password is required for cloud export', severity: 'error' });
+      return;
+    }
+    setCloudExportLoading(true);
+
+    try {
+      if (screenName.trim()) {
+        await updateProfile({
+          screenName: screenName.trim(),
+          avatarName: selectedAvatar,
+          backdropName: selectedBackdrop,
+          contactInfo: {
+            info: info.trim(),
+          },
+        });
+      }
+
+      const jsonStr = await exportProfileAsJson();
+      if (!jsonStr) {
+        setSnack({ message: 'Failed to export profile data', severity: 'error' });
+        setCloudExportLoading(false);
+        return;
+      }
+
+      const envelope = await encryptCloudBackup(jsonStr, cloudExportPassword);
+      const uuid = crypto.randomUUID();
+      const res = await publishCloudBackupToRelays(uuid, envelope);
+
+      if (!res.success) {
+        setSnack({
+          message: res.error || 'Failed to post backup to Nostr relay',
+          severity: 'error',
+        });
+        setCloudExportLoading(false);
+        return;
+      }
+
+      const url = buildCloudRestoreUrl(uuid);
+      setCloudExportUrl(url);
+      setCloudExportPasswordOpen(false);
+      setCloudExportResultOpen(true);
+      setSnack({ message: 'Profile posted to cloud relay successfully!', severity: 'success' });
+    } catch (err: any) {
+      setSnack({ message: err?.message || 'Cloud export failed', severity: 'error' });
+    } finally {
+      setCloudExportLoading(false);
+    }
+  };
+
+  const handleCopyUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(cloudExportUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+      setSnack({ message: 'Restore URL copied to clipboard!', severity: 'success' });
+    } catch {
+      setSnack({ message: 'Failed to copy URL to clipboard', severity: 'error' });
+    }
   };
 
   return (
@@ -614,6 +736,14 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
               </Alert>
 
               <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+                <Button
+                  variant="contained"
+                  color="primary"
+                  startIcon={<CloudUploadIcon />}
+                  onClick={handleOpenCloudExport}
+                >
+                  Cloud Export
+                </Button>
                 <Button variant="contained" color="primary" startIcon={<DownloadIcon />} onClick={handleExportJson}>
                   Export File
                 </Button>
@@ -750,6 +880,134 @@ export const ProfileDialog: React.FC<ProfileDialogProps> = ({ open, onClose }) =
           {snack?.message}
         </Alert>
       </Snackbar>
+
+      {/* Password Prompt Dialog for Cloud Export */}
+      <Dialog
+        open={cloudExportPasswordOpen}
+        onClose={() => !cloudExportLoading && setCloudExportPasswordOpen(false)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <CloudUploadIcon color="primary" />
+          <Box component="span" sx={{ fontWeight: 800, fontSize: '1.25rem' }}>
+            Cloud Export
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          <Typography variant="body2" color="text.secondary">
+            Set a password to encrypt your profile backup before posting to Nostr relays. You will need this password to decrypt and restore your profile on another device.
+          </Typography>
+          <TextField
+            label="Encryption Password"
+            type={showCloudExportPassword ? 'text' : 'password'}
+            value={cloudExportPassword}
+            onChange={(e) => setCloudExportPassword(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && cloudExportPassword.trim() && !cloudExportLoading) {
+                handlePerformCloudExport();
+              }
+            }}
+            autoFocus
+            fullWidth
+            required
+            disabled={cloudExportLoading}
+            slotProps={{
+              input: {
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <LockIcon color="action" fontSize="small" />
+                  </InputAdornment>
+                ),
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      aria-label="toggle password visibility"
+                      onClick={() => setShowCloudExportPassword((p) => !p)}
+                      edge="end"
+                      size="small"
+                    >
+                      {showCloudExportPassword ? <VisibilityOff /> : <Visibility />}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              },
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button
+            onClick={() => setCloudExportPasswordOpen(false)}
+            variant="outlined"
+            color="inherit"
+            disabled={cloudExportLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={handlePerformCloudExport}
+            disabled={!cloudExportPassword.trim() || cloudExportLoading}
+            startIcon={cloudExportLoading ? <CircularProgress size={16} color="inherit" /> : <CloudUploadIcon />}
+          >
+            {cloudExportLoading ? 'Encrypting...' : 'OK'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Presentation Dialog with Generated URL */}
+      <Dialog
+        open={cloudExportResultOpen}
+        onClose={() => setCloudExportResultOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <CloudDoneIcon color="success" />
+          <Box component="span" sx={{ fontWeight: 800, fontSize: '1.25rem' }}>
+            Cloud Export Ready
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <Alert severity="success">
+            Your profile has been encrypted and posted to Nostr relays for temporary storage.
+          </Alert>
+          <Typography variant="body2" color="text.secondary">
+            Open the link below on your other device to decrypt and restore your profile:
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+            <TextField
+              value={cloudExportUrl}
+              fullWidth
+              size="small"
+              slotProps={{
+                input: {
+                  readOnly: true,
+                  sx: { fontFamily: 'monospace', fontSize: '0.85rem' },
+                },
+              }}
+            />
+            <Button
+              variant="contained"
+              color={copied ? 'success' : 'primary'}
+              startIcon={<ContentCopyIcon />}
+              onClick={handleCopyUrl}
+              sx={{ whiteSpace: 'nowrap' }}
+            >
+              {copied ? 'Copied!' : 'Copy Link'}
+            </Button>
+          </Box>
+          <Typography variant="caption" color="text.secondary">
+            Make sure to remember your password. You will be prompted to enter it when opening the link on the other device.
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button variant="outlined" onClick={() => setCloudExportResultOpen(false)}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   );
 };
